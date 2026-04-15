@@ -33,7 +33,6 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     parametrize,
     skipIfHpu,
-    skipIfXpu,
 )
 from torch.testing._internal.inductor_utils import HAS_GPU_AND_TRITON
 from torch.testing._internal.triton_utils import requires_gpu_and_triton
@@ -559,6 +558,7 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
             fw_compiler=nop, bw_compiler=nop, partition_fn=partition_fn
         )
         _ = torch.compile(fn, backend=backend)(x, y)
+
     @requires_gpu_and_triton
     @parametrize(
         "partition_fn",
