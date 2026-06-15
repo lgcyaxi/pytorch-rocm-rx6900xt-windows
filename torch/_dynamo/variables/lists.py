@@ -1383,6 +1383,19 @@ class DequeVariable(CommonListMethodsVariable):
 
         raise_type_error(tx, f"unhashable type: '{self.python_type_name()}'")
 
+    @staticmethod
+    def validate_maxlen(
+        tx: "InstructionTranslatorBase", maxlen: VariableTracker
+    ) -> None:
+        # deque_init: maxlenobj != Py_None is run through PyLong_AsSsize_t.
+        # https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1729-L1736
+        from .object_protocol import vt_as_ssize_t
+
+        if isinstance(maxlen, ConstantVariable) and maxlen.value is None:
+            return
+        if vt_as_ssize_t(tx, maxlen) < 0:
+            raise_observed_exception(ValueError, tx, args=["maxlen must be non-negative"])
+
     def __init__(
         self,
         items: list[VariableTracker],
@@ -1554,16 +1567,10 @@ class DequeVariable(CommonListMethodsVariable):
             )
             if len(args) > 2 or kwargs:
                 raise_args_mismatch(tx, name)
-            if not new_maxlen.is_python_constant():
-                raise_type_error(tx, "an integer is required")
-            new_maxlen_val = new_maxlen.as_python_constant()
-            if new_maxlen_val is not None and new_maxlen_val < 0:
-                raise_observed_exception(
-                    ValueError, tx, args=["maxlen must be non-negative"]
-                )
+            self.validate_maxlen(tx, new_maxlen)
             tx.output.side_effects.mutation(self)
             self.maxlen = new_maxlen
-            self.items[:] = []
+            self.items.clear()
             if iterable is not None:
                 self.call_method(tx, "extend", [iterable], {})
             return ConstantVariable.create(None)

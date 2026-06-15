@@ -291,6 +291,35 @@ class TestSqConcat(torch._dynamo.test_case.TestCase):
         with self.assertRaises(ValueError):
             d.__init__(range(3), -1)
 
+    @make_dynamo_test
+    def test_deque_reinit_float_maxlen(self):
+        d = collections.deque([1, 2])
+        with self.assertRaises(TypeError):
+            d.__init__(maxlen=2.0)
+
+    @make_dynamo_test
+    def test_deque_reinit_str_maxlen(self):
+        d = collections.deque([1, 2])
+        with self.assertRaises(TypeError):
+            d.__init__(maxlen="3")
+
+    @make_dynamo_test
+    def test_deque_ctor_float_maxlen(self):
+        with self.assertRaises(TypeError):
+            collections.deque([1, 2], maxlen=2.0)
+
+    @make_dynamo_test
+    def test_deque_reinit_overflow_maxlen(self):
+        d = collections.deque([1, 2])
+        with self.assertRaises(OverflowError):
+            d.__init__(maxlen=2**63)
+
+    @make_dynamo_test
+    def test_deque_ctor_bool_maxlen(self):
+        # bool is an int subclass; CPython accepts it.
+        d = collections.deque(range(5), maxlen=True)
+        self.assertEqual(list(d), [4])
+
     # --- torch.Size concatenation ---
 
     @make_dynamo_test

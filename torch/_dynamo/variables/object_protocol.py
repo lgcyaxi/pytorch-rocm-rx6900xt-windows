@@ -716,6 +716,24 @@ def generic_float(
     )
 
 
+def vt_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> int:
+    """Mirrors PyLong_AsSsize_t: requires an exact int (PyLong_Check).
+    values outside the Py_ssize_t range raise OverflowError.
+
+    https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L576
+    """
+    if obj.python_type() is not int:
+        raise_type_error(tx, "an integer is required")
+    val = obj.as_python_constant()
+    if not -sys.maxsize - 1 <= val <= sys.maxsize:
+        raise_observed_exception(
+            OverflowError,
+            tx,
+            args=["Python int too large to convert to C ssize_t"],
+        )
+    return val
+
+
 def generic_iternext(
     tx: "InstructionTranslatorBase", obj: VariableTracker
 ) -> "VariableTracker":
