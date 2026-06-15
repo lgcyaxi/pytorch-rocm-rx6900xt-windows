@@ -2492,6 +2492,45 @@ class TestMPS(TestCaseMPS):
         freq_mps = torch.fft.fftfreq(10**4, device='mps')
         self.assertEqual(freq_cpu, freq_mps)
 
+    def test_fft_transform_dims_outside_last_four(self):
+        # MPSGraph FFT only handles the last four dims; the backend transposes
+        # outer transform dims into that window. See https://github.com/pytorch/pytorch/issues/124096
+        def check(fn, x_cpu, **kwargs):
+            x_mps = x_cpu.detach().to("mps")
+            self.assertEqual(fn(x_cpu, **kwargs), fn(x_mps, **kwargs).cpu())
+
+        # Exact repro from the issue.
+        check(torch.fft.fftn, torch.randn(2, 1, 1, 1, 2, 2, dtype=torch.complex64), dim=(1, 2))
+
+        # complex-to-complex over outer dims
+        cdata = torch.randn(3, 4, 2, 1, 2, dtype=torch.complex64)
+        check(torch.fft.fftn, cdata, dim=(0, 1))
+        check(torch.fft.ifftn, cdata, dim=(0, 1))
+        check(torch.fft.fft, cdata, dim=0)
+
+        # real-to-complex over outer dims
+        rdata = torch.randn(3, 4, 2, 1, 4)
+        check(torch.fft.rfftn, rdata, dim=(0, 4))
+        check(torch.fft.rfftn, rdata, dim=(0, 1, 4))
+        check(torch.fft.rfft, torch.randn(3, 1, 1, 1, 1), dim=0)
+
+        # complex-to-real round trip
+        fwd = torch.fft.rfftn(rdata, dim=(0, 4))
+        check(lambda y: torch.fft.irfftn(y, s=(rdata.size(0), rdata.size(4)), dim=(0, 4)), fwd)
+
+        # Unsorted dims: dim.back() is an outer axis, exercising the inverse permutation.
+        check(torch.fft.fftn, cdata, dim=(2, 0))
+        check(torch.fft.ifftn, cdata, dim=(2, 0))
+        check(torch.fft.rfftn, rdata, dim=(3, 0))
+        rev = torch.fft.rfftn(rdata, dim=(3, 0))
+        check(lambda y: torch.fft.irfftn(y, s=(rdata.size(3), rdata.size(0)), dim=(3, 0)), rev)
+
+    def test_fftn_too_many_dims(self):
+        # MPSGraph cannot transform more than four dims.
+        x = torch.randn(2, 2, 2, 2, 2, device="mps", dtype=torch.complex64)
+        with self.assertRaisesRegex(RuntimeError, "up to 4 dimensions"):
+            torch.fft.fftn(x, dim=(0, 1, 2, 3, 4))
+
     def test_instance_norm(self):
         def helper(shape, eps=1, momentum=0.1, wts=False, channels_last=False, track_running_stats=True, test_module=False):
 
@@ -5456,6 +5495,46 @@ class TestMPS(TestCaseMPS):
         helper_dtype_float32(10, 10, 10)
         helper_dtype_float32(3, 3, 3)
         helper_dtype_float32(1, 1, 1)
+
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32, torch.int64])
+    @parametrize("op", ["median", "nanmedian"])
+    def test_median_comprehensive(self, dtype, op):
+        op = getattr(torch, op)
+
+        def check(cpu_x):
+            mps_x = cpu_x.to('mps')
+            self.assertEqual(op(cpu_x), op(mps_x))
+            dims = range(cpu_x.dim()) if cpu_x.dim() else [0]
+            for dim, keepdim in product(dims, [True, False]):
+                self.assertEqual(op(cpu_x, dim=dim, keepdim=keepdim), op(mps_x, dim=dim, keepdim=keepdim))
+
+        def make(shape):
+            if dtype.is_floating_point:
+                return torch.randn(shape, dtype=dtype)
+            return torch.randint(-50, 50, shape, dtype=dtype)
+
+        # contiguous shapes (rank-5 from issue #187017), then sizes crossing the
+        # single-block/multi-block/u16 sort path boundaries
+        shapes = [(), (5,), (10, 10, 10), (1, 2, 3), (2, 1, 3, 1, 2), (3, 4, 5, 6, 7),
+                  (4099,), (3, 4099), (70001,), (3, 70001)]
+        cases = [make(s) for s in shapes]
+        # strided / sliced / non-contiguous layouts
+        base = make((64, 97))
+        cases += [base.t(), base[::3, 1:], make((8, 6, 10, 4)).movedim(1, 2)[:, 2:7]]
+        if dtype.is_floating_point:
+            nanx = make((37, 53))
+            nanx[nanx > 1] = float('nan')
+            nanx[5] = float('nan')  # scattered NaNs plus an all-NaN row
+            cases += [nanx, torch.full((4, 5), float('nan'), dtype=dtype)]
+        for x in cases:
+            check(x)
+
+        if dtype.is_floating_point:
+            # empty: NaN global, empty outputs on non-zero dim, raise on zero dim
+            empty = torch.empty(0, 3, dtype=dtype)
+            self.assertTrue(op(empty.to('mps')).isnan())
+            self.assertEqual(op(empty, dim=1), op(empty.to('mps'), dim=1))
+            self.assertRaises(IndexError, lambda: op(empty.to('mps'), dim=0))
 
     def test_any(self):
         def helper(shape):

@@ -44,7 +44,7 @@ from torch.utils._sympy.functions import Max, Min
 from torch.utils._sympy.singleton_int import SingletonInt
 from torch.utils._sympy.symbol import symbol_is_type, SymT
 
-from .. import async_compile, config, ir
+from .. import async_compile, config, debug as inductor_debug, ir
 from ..codecache import output_code_log
 from ..ir import IRNode, ReinterpretView
 from ..runtime import triton_heuristics
@@ -1736,7 +1736,7 @@ class PythonWrapperCodegen(CodeGen):
 
         with self.prefix.indent(prefix_indent):
             if config.triton.debug_sync_graph:
-                self.prefix.writeline(V.graph.device_ops.synchronize())
+                self.generate_debug_sync(self.prefix)
             phase = V.graph.get_training_phase()
             if config.annotate_training:
                 self.prefix.writeline(
@@ -2037,11 +2037,18 @@ class PythonWrapperCodegen(CodeGen):
             # doesn't know the memory is still needed and might reuse it.
             ending = f".clone(){ending}"
 
+        if config.trace.provenance_tracking_to_timeline:
+            wrapper_name = self.define_extern_kernel_profile_wrapper(
+                kernel_name, self.next_kernel_suffix()
+            )
+        else:
+            wrapper_name = kernel_name
+
         if no_return:
-            self.writeline(f"{self.declare}{kernel_name}({', '.join(args)}){ending}")
+            self.writeline(f"{self.declare}{wrapper_name}({', '.join(args)}){ending}")
         else:
             self.writeline(
-                f"{self.declare}{output_name} = {kernel_name}({', '.join(args)}){ending}"
+                f"{self.declare}{output_name} = {wrapper_name}({', '.join(args)}){ending}"
             )
             if (
                 self.supports_intermediate_hooks
@@ -2072,9 +2079,15 @@ class PythonWrapperCodegen(CodeGen):
         # add debug printer code for triton kernel calls at (jit) inductor level
         debug_printer_manager = V.graph.wrapper_code.debug_printer
         debug_printer_manager.set_printer_args(args, kernel, None, None, "extern")
-        args.append(f"out={out_view if out_view else out}")
+        args.append(f"out={out_view or out}")
         with debug_printer_manager:
-            self.writeline(f"{kernel}({', '.join(args)})")
+            if config.trace.provenance_tracking_to_timeline:
+                wrapper_name = self.define_extern_kernel_profile_wrapper(
+                    kernel, self.next_kernel_suffix()
+                )
+            else:
+                wrapper_name = kernel
+            self.writeline(f"{wrapper_name}({', '.join(args)})")
 
     def _generate_tma_descriptor_call_experimental(self, desc, apply_size_hints=False):
         dims = desc.dims
@@ -2136,14 +2149,35 @@ class PythonWrapperCodegen(CodeGen):
         kwargs,
         device,
     ):
+        orig_python_kernel_name = python_kernel_name
+        if config.trace.provenance_tracking_to_timeline:
+            python_kernel_name = self.define_extern_kernel_profile_wrapper(
+                python_kernel_name, self.next_kernel_suffix()
+            )
         line = f"{python_kernel_name}({','.join(map(str, inputs))}"
-        if python_kernel_name.startswith("aten.scatter_reduce"):
+        if orig_python_kernel_name.startswith("aten.scatter_reduce"):
             line += ", ".join([""] + kwargs)
         else:
             if reduce:
                 line += f", reduce={repr(reduce)}"
         line += ")"
         self.writeline(line)
+
+    def define_extern_kernel_profile_wrapper(self, kernel_name: str, suffix: str):
+        """Wrap extern calls so profiler events use names with provenance metadata."""
+        wrapper_kernel_name = re.sub(
+            r"\W",
+            "_",
+            f"extern_kernels_{kernel_name}_{suffix}",
+        )
+        inductor_debug.alias_kernel_provenance(kernel_name, wrapper_kernel_name)
+        self.header.splice(f"def {wrapper_kernel_name}(*args, **kwargs):")
+        with self.header.indent():
+            self.header.splice(
+                "# Extra indirection is only enabled for profiler timeline provenance."
+            )
+            self.header.splice(f"return {kernel_name}(*args, **kwargs)")
+        return wrapper_kernel_name
 
     def generate_index_put_fallback(self, node: ir.IndexPutFallback) -> None:
         # Collect index tensors into a list.
@@ -2251,7 +2285,7 @@ class PythonWrapperCodegen(CodeGen):
             output_refs = self.get_output_refs()
             self.mark_output_type()
             if config.triton.debug_sync_graph:
-                self.wrapper_call.writeline(V.graph.device_ops.synchronize())
+                self.generate_debug_sync(self.wrapper_call)
 
             if config.profile_bandwidth:
                 self.generate_end_graph()
@@ -2436,24 +2470,33 @@ class PythonWrapperCodegen(CodeGen):
             return f"{name}_stride"
 
         def maybe_emit_replacement_aliases(sym: sympy.Symbol) -> None:
-            # Deferred runtime asserts reference pre-replacement backed
-            # symbols (e.g. s77) that were replaced to this canonical
-            # symbol (s31) during constraint solving. Emit aliases so
-            # the asserts compile. Skip unbacked symbols — they are
-            # defined separately by the unbacked symbol codegen path.
+            # Deferred runtime asserts and graph input metadata can reference
+            # either side of a backed-symbol replacement. Emit aliases so both
+            # the pre-replacement and canonical names are defined.
             from torch.utils._sympy.symbol import symbol_is_type, SymT
+
+            def is_backed_symbol(s: sympy.Symbol) -> bool:
+                return not symbol_is_type(s, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT))
 
             for src, tgt in V.graph.sizevars.shape_env.replacements.items():
                 if (
                     tgt == sym
                     and isinstance(src, sympy.Symbol)
                     and src not in bound_vars
-                    and not symbol_is_type(
-                        src, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT)
-                    )
+                    and is_backed_symbol(src)
+                    and is_backed_symbol(sym)
                 ):
                     code.writeline(f"{src} = {sym}")
                     bound_vars.add(src)
+                elif (
+                    src == sym
+                    and isinstance(tgt, sympy.Symbol)
+                    and tgt not in bound_vars
+                    and is_backed_symbol(sym)
+                    and is_backed_symbol(tgt)
+                ):
+                    code.writeline(f"{tgt} = {sym}")
+                    bound_vars.add(tgt)
 
         if isinstance(value, sympy.Expr):
             if not isinstance(value, sympy.Symbol) or value in bound_vars:
@@ -3347,6 +3390,9 @@ class PythonWrapperCodegen(CodeGen):
 
     def wrap_kernel_call(self, name, call_args):
         return f"{name}({', '.join(call_args)}){self.ending}"
+
+    def generate_debug_sync(self, buffer):
+        buffer.writeline(V.graph.device_ops.synchronize())
 
     def generate_profiler_mark_wrapper_call(self, stack):
         self.wrapper_call.writeline("from torch.profiler import record_function")
