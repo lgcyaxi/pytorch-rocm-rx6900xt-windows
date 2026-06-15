@@ -62,6 +62,7 @@ from .object_protocol import (
     pyindex_check,
     type_implements_nb_index,
     vt_is_iterable,
+    vt_as_ssize_t,
 )
 
 
@@ -1389,12 +1390,12 @@ class DequeVariable(CommonListMethodsVariable):
     ) -> None:
         # deque_init: maxlenobj != Py_None is run through PyLong_AsSsize_t.
         # https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1729-L1736
-        from .object_protocol import vt_as_ssize_t
-
         if isinstance(maxlen, ConstantVariable) and maxlen.value is None:
             return
         if vt_as_ssize_t(tx, maxlen) < 0:
-            raise_observed_exception(ValueError, tx, args=["maxlen must be non-negative"])
+            raise_observed_exception(
+                ValueError, tx, args=["maxlen must be non-negative"]
+            )
 
     def __init__(
         self,

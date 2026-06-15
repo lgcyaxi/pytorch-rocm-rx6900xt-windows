@@ -18,7 +18,7 @@ import torch
 from torch._dynamo.source import GetItemSource
 
 from .. import graph_break_hints, variables
-from ..exc import raise_observed_exception, unimplemented
+from ..exc import raise_observed_exception, raise_type_error, unimplemented
 from ..utils import (
     common_constant_types,
     istype,
@@ -170,24 +170,24 @@ class ConstantVariable(VariableTracker):
     def getitem_const(
         self, tx: InstructionTranslatorBase, arg: VariableTracker
     ) -> VariableTracker:
-        # unicode_subscript: https://github.com/python/cpython/blob/62a6e898e01/Objects/unicodeobject.c#L13822-L13845
-        # bytes_subscript:   https://github.com/python/cpython/blob/62a6e898e01/Objects/bytesobject.c#L1709-L1759
+        # bytes_subscript: https://github.com/python/cpython/blob/62a6e898e017c9878490544f6a227b8a187a949c/Objects/bytesobject.c#L1732
+        # unicode_subscript: https://github.com/python/cpython/blob/62a6e898e017c9878490544f6a227b8a187a949c/Objects/unicodeobject.c#L13738
         if isinstance(self.value, (str, bytes)):
             from .lists import SliceVariable
             from .object_protocol import maybe_get_python_type, pyindex_check
 
-            if isinstance(arg, SliceVariable):
+            # _PyIndex_Check first, then slice, mirroring unicode_subscript /
+            # bytes_subscript.
+            if pyindex_check(maybe_get_python_type(arg)):
+                arg = arg.nb_index_impl(tx)
+            elif isinstance(arg, SliceVariable):
                 return ConstantVariable.create(self.value[arg.as_index_slice(tx)])
-            if not pyindex_check(maybe_get_python_type(arg)):
-                from ..exc import raise_type_error
-
-                container_name = "string" if isinstance(self.value, str) else "byte"
+            else:
                 raise_type_error(
                     tx,
-                    f"{container_name} indices must be integers, "
+                    f"{self.python_type_name()} indices must be integers, "
                     f"not {arg.python_type_name()}",
                 )
-            arg = arg.nb_index_impl(tx)
         return ConstantVariable.create(
             self.value[arg.as_python_constant()],
         )

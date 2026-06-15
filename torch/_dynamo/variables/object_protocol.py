@@ -722,7 +722,7 @@ def vt_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> int:
 
     https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L576
     """
-    if obj.python_type() is not int:
+    if not issubclass(obj.python_type(), int):
         raise_type_error(tx, "an integer is required")
     val = obj.as_python_constant()
     if not -sys.maxsize - 1 <= val <= sys.maxsize:
