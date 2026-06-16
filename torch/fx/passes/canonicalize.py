@@ -13,7 +13,6 @@ import collections
 import heapq
 import itertools
 from collections.abc import Callable
-from typing import Any
 
 import torch.fx as fx
 
@@ -40,7 +39,7 @@ def rename_nodes_to_canonical(graph: fx.Graph) -> None:
 
 def canonicalize_graph(
     graph: fx.Graph,
-    canonical_key_fn: Callable[[fx.Node, dict[fx.Node, int]], tuple[Any, ...]],
+    canonical_key_fn: Callable[[fx.Node, dict[fx.Node, int]], object],
     is_safe_to_reorder: Callable[[fx.Node], bool],
 ) -> fx.Graph:
     """Reorder graph nodes into a canonical topological order and rename them.
@@ -100,13 +99,12 @@ def canonicalize_graph(
     # (same target, same input indices). Those are CSE candidates and
     # genuinely interchangeable, so any ordering between them is canonical.
     counter = 0
-    ready: list[tuple[tuple[Any, ...], int, fx.Node]] = []
+    ready: list[tuple[object, int, fx.Node]] = []
     for node in graph.nodes:
         if indeg[node] == 0:
-            heapq.heappush(
-                ready, (canonical_key_fn(node, canonical_idx), counter, node)
-            )
+            ready.append((canonical_key_fn(node, canonical_idx), counter, node))
             counter += 1
+    heapq.heapify(ready)
 
     canonical_order: list[fx.Node] = []
 
@@ -124,11 +122,11 @@ def canonicalize_graph(
                 )
                 counter += 1
 
-    if len(canonical_order) != len(list(graph.nodes)):
+    if len(canonical_order) != len(graph.nodes):
         remaining = [n for n in indeg if indeg[n] != 0]
         raise RuntimeError(
             f"Canonicalization failed: processed {len(canonical_order)} of "
-            f"{len(list(graph.nodes))} nodes. Remaining: {remaining}"
+            f"{len(graph.nodes)} nodes. Remaining: {remaining}"
         )
 
     # Reorder nodes in-place to preserve node object identity.

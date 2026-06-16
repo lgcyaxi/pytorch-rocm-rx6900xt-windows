@@ -571,6 +571,8 @@ def _is_safe_to_reorder(node: fx.Node) -> bool:
     """
     if node.op == "call_method":
         return not node.target.endswith("_")  # pyrefly: ignore[missing-attribute]
+    if node.op == "call_module":
+        return not node.is_impure()
     if node.op != "call_function":
         return True
     if node.is_impure():
@@ -601,11 +603,10 @@ def _is_safe_to_reorder(node: fx.Node) -> bool:
         # functorch batch dim ops modify the vmap interpreter stack.
         if name in ("_add_batch_dim", "_remove_batch_dim"):
             return False
-        return True
     return True
 
 
-def _canonical_key(node: fx.Node, canonical_idx: dict[fx.Node, int]) -> tuple[Any, ...]:
+def _canonical_key(node: fx.Node, canonical_idx: dict[fx.Node, int]) -> object:
     """Canonical heap key for Dynamo output graph nodes.
 
     - Placeholders sorted by grapharg source name
@@ -625,7 +626,7 @@ def _canonical_key(node: fx.Node, canonical_idx: dict[fx.Node, int]) -> tuple[An
         return (3,)
     else:
         input_indices = tuple(canonical_idx[n] for n in node.all_input_nodes)
-        return (2, str(node.target), input_indices)
+        return (2, node.graph._target_to_str(node.target), input_indices)
 
 
 def _canonicalize_graph(graph: fx.Graph) -> fx.Graph:
@@ -2888,6 +2889,9 @@ class OutputGraph(OutputGraphCommon):
             # free a bit of memory
             self.real_value_cache.clear()
 
+            # CA backward graphs have side-effecting ops (call_accumulate_grad,
+            # call_hook) that is_impure() doesn't flag, and a fixed positional
+            # placeholder layout that must not be reordered.
             if (
                 config.canonicalize_output_graph_node_order
                 and not self.export
