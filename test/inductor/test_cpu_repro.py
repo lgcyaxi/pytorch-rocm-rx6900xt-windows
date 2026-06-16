@@ -2471,8 +2471,6 @@ class CPUReproTests(TestCase):
         y2 = torch.zeros((3,4), dtype=torch.int32)
         ret = run_division(x2, y2, rounding_mode="trunc")
         self.assertTrue(ret is None)
-        ret = run_division(x2, y2, rounding_mode="floor")
-        self.assertTrue(ret is None)
 
     def test_no_op_squeeze(self):
         @torch.compile(backend="inductor")

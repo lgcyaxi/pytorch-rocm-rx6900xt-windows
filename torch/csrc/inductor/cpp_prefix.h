@@ -842,6 +842,21 @@ inline std::common_type_t<T, U> floor_divide_integral(T a, U b) {
   return c10::div_floor_integer(a_c, b_c);
 }
 
+template <typename T, typename U>
+inline std::common_type_t<T, U> trunc_divide_integral(T a, U b) {
+  using C = std::common_type_t<T, U>;
+  static_assert(
+      std::is_integral_v<C>,
+      "trunc_divide_integral expects integral scalar operands");
+  const C a_c = static_cast<C>(a);
+  const C b_c = static_cast<C>(b);
+  if (C10_UNLIKELY_OR_CONST(b_c == 0)) {
+    inductor_cpu_note_integer_div_by_zero();
+    return C(0);
+  }
+  return a_c / b_c;
+}
+
 #if INDUCTOR_USE_VECTOR_TYPES()
 template <typename T>
 inline at::vec::Vectorized<T> floor_divide_integral(

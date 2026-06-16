@@ -855,9 +855,6 @@ class CppOverrides(OpOverrides):
     @staticmethod
     def floordiv(a, b):
         # a and b are integer type
-        V.kernel.compute.writeline(
-            f'TORCH_CHECK({b} != 0, "ZeroDivisionError: integer division or modulo by zero");'
-        )
         return f"floor_divide_integral({a}, {b})"
 
     @staticmethod
@@ -874,10 +871,7 @@ class CppOverrides(OpOverrides):
     # pyrefly: ignore [bad-override]
     def truncdiv(a, b):
         # a and b are integer type
-        V.kernel.compute.writeline(
-            f'TORCH_CHECK({b} != 0, "ZeroDivisionError: integer division or modulo by zero");'
-        )
-        return f"{a} / {b}"
+        return f"trunc_divide_integral({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
