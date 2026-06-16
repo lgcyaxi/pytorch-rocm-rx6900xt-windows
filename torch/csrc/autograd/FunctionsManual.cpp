@@ -666,18 +666,18 @@ Tensor masked_fill_backward(const Tensor& grad, const Tensor& mask) {
 template <typename T>
 Tensor mul_tensor_backward(
     const Tensor& grad,
-    T other, // NOLINT[performance-unnecessary-value-param]
+    const T& other,
     ScalarType self_st) {
   auto out = grad * other.conj();
   return handle_r_to_c(self_st, std::move(out));
 }
-template Tensor mul_tensor_backward(const Tensor&, Tensor, ScalarType);
-template Tensor mul_tensor_backward(const Tensor&, Scalar, ScalarType);
+template Tensor mul_tensor_backward(const Tensor&, const Tensor&, ScalarType);
+template Tensor mul_tensor_backward(const Tensor&, const Scalar&, ScalarType);
 
 template <typename T>
 Tensor div_tensor_self_backward(
     const Tensor& grad,
-    T other, // NOLINT[performance-unnecessary-value-param]
+    const T& other,
     ScalarType self_st,
     const std::optional<std::string_view>& rounding_mode) {
   if (rounding_mode.has_value()) {
@@ -689,12 +689,12 @@ Tensor div_tensor_self_backward(
 }
 template Tensor div_tensor_self_backward(
     const Tensor&,
-    Tensor,
+    const Tensor&,
     ScalarType,
     const std::optional<std::string_view>&);
 template Tensor div_tensor_self_backward(
     const Tensor&,
-    Scalar,
+    const Scalar&,
     ScalarType,
     const std::optional<std::string_view>&);
 
@@ -5228,22 +5228,22 @@ infinitely_differentiable_native_group_norm_backward(
     const c10::SymInt& HxW,
     int64_t group,
     std::array<bool, 3> grad_input_mask) {
-  int64_t G = group;
-  auto D = C / G;
+  const int64_t G = group;
+  const auto D = C / G;
   c10::SymFloat s = c10::SymFloat(1.0) / c10::SymFloat(D * HxW);
   Tensor dX;
   Tensor dgamma;
   Tensor dbeta;
-  Tensor X_tensor = X.reshape_symint({N, G, D, HxW});
-  Tensor mean_tensor = mean.reshape_symint({N, G, 1, 1});
-  Tensor rstd_tensor = rstd.reshape_symint({N, G, 1, 1});
+  const Tensor X_tensor = X.reshape_symint({N, G, D, HxW});
+  const Tensor mean_tensor = mean.reshape_symint({N, G, 1, 1});
+  const Tensor rstd_tensor = rstd.reshape_symint({N, G, 1, 1});
   Tensor dY_tensor;
   Tensor ds;
   Tensor db;
   if (dY.defined()) {
     dY_tensor = dY.reshape_symint({N, G, D, HxW});
-    ds = (dY_tensor * X_tensor).sum(3, true);
-    db = dY_tensor.sum(3, true);
+    ds = (dY_tensor * X_tensor).sum(3, /* keepdim */ true);
+    db = dY_tensor.sum(3, /* keepdim */ true);
   }
   if (grad_input_mask[0]) {
     Tensor gamma_tensor;
@@ -5257,11 +5257,14 @@ infinitely_differentiable_native_group_norm_backward(
       dvar = -0.5 * rstd_cube * drstd.view_symint({N, G, 1, 1});
     }
     if (dY.defined()) {
-      Tensor a = isDefined(gamma) ? rstd_tensor * gamma_tensor : rstd_tensor;
-      Tensor b = (isDefined(gamma) ? (ds * gamma_tensor) : ds).sum(2, true);
-      Tensor c = (isDefined(gamma) ? (db * gamma_tensor) : db).sum(2, true);
+      const Tensor a =
+          isDefined(gamma) ? rstd_tensor * gamma_tensor : rstd_tensor;
+      Tensor b = (isDefined(gamma) ? (ds * gamma_tensor) : ds)
+                     .sum(2, /* keepdim */ true);
+      Tensor c = (isDefined(gamma) ? (db * gamma_tensor) : db)
+                     .sum(2, /* keepdim */ true);
       b = (c * mean_tensor - b) * rstd_cube * s;
-      c = -b * mean_tensor - c * rstd_tensor * s;
+      c = -b * mean_tensor - c * rstd_tensor * std::move(s);
       dX = a * dY_tensor + b * X_tensor + c;
       if (dmean.defined() && drstd.defined()) {
         dX = dX +

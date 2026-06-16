@@ -3416,6 +3416,8 @@ def native_group_norm(
             weight_acc, (1, num_groups, num_channels // num_groups, 1)
         )
         w = w * weight_reshaped
+    else:
+        w = w.broadcast_to(batch_size, num_groups, num_channels // num_groups, 1)
 
     b = -_unsqueeze_multiple(mean, reduction_dims) * w
     if bias_acc is not None:
@@ -3424,11 +3426,13 @@ def native_group_norm(
         )
         b = b + bias_reshaped
 
-    w = w.contiguous()
-    b = b.contiguous()
+    w = w.contiguous().as_strided((batch_size, num_channels), (num_channels, 1))
+    b = b.contiguous().as_strided((batch_size, num_channels), (num_channels, 1))
 
-    out = w * input_reshaped + b
-    out = out.reshape(input.shape)
+    broadcast_dims = list(range(2, input.ndim))
+    unsqueeze_w = _unsqueeze_multiple(w, broadcast_dims)
+    unsqueeze_b = _unsqueeze_multiple(b, broadcast_dims)
+    out = unsqueeze_w * input_acc + unsqueeze_b
 
     return (
         _maybe_convert_to_dtype(out, input.dtype),

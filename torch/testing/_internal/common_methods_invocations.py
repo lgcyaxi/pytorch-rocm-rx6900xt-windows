@@ -26885,7 +26885,6 @@ python_ref_db = [
             DecorateInfo(unittest.expectedFailure, "TestCommon", "test_python_ref", device_type="mps", dtypes=(torch.float32,)),
         ),
         torch_opinfo_name="native_group_norm",
-        # One returned tensor is a view, but not a view of an input, so it's OK.
         validate_view_consistency=False,
     ),
     PythonRefInfo(
