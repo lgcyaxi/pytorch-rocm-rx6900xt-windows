@@ -29,6 +29,7 @@ from torch._dynamo.variables import (
     UserFunctionVariable,
 )
 from torch.testing._internal.common_utils import skipIfWindows
+from torch.testing._internal.inductor_utils import GPU_TYPE
 
 
 try:
@@ -340,12 +341,12 @@ class TraceRuleTests(torch._dynamo.test_case.TestCase):
                     "is not a python module, please check and correct it.",
                 )
 
-    def test_cuda_manual_seed_functions_graph_break(self):
+    def test_gpu_manual_seed_functions_graph_break(self):
         for name in (
-            "torch.cuda.manual_seed",
-            "torch.cuda.manual_seed_all",
-            "torch.cuda.random.manual_seed",
-            "torch.cuda.random.manual_seed_all",
+            f"torch.{GPU_TYPE}.manual_seed",
+            f"torch.{GPU_TYPE}.manual_seed_all",
+            f"torch.{GPU_TYPE}.random.manual_seed",
+            f"torch.{GPU_TYPE}.random.manual_seed_all",
         ):
             self.assertIs(
                 torch._dynamo.trace_rules.lookup(load_object(name)),
