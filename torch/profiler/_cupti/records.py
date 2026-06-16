@@ -45,15 +45,25 @@ class Kernel:
     """CUpti_ActivityKernel (CONCURRENT_KERNEL)."""
 
     KIND = Field(0)
+    REGISTERS_PER_THREAD = Field(4)
     START = Field(7)
     END = Field(8)
     DEVICE_ID = Field(10)
     CONTEXT_ID = Field(11)
     STREAM_ID = Field(12)
+    GRID_X = Field(13)
+    GRID_Y = Field(14)
+    GRID_Z = Field(15)
+    BLOCK_X = Field(16)
+    BLOCK_Y = Field(17)
+    BLOCK_Z = Field(18)
+    STATIC_SHARED_MEMORY = Field(19)
+    DYNAMIC_SHARED_MEMORY = Field(20)
     CORRELATION_ID = Field(22)
     NAME = Field(24, string=True)  # const char* (mangled symbol)
     GRAPH_NODE_ID = Field(31)
     GRAPH_ID = Field(33)
+    LAUNCH_PRIORITY = Field(45)
 
 
 class Memcpy:

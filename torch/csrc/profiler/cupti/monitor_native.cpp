@@ -1,6 +1,9 @@
 #include <torch/csrc/profiler/cupti/monitor_native.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 
 namespace torch::profiler::impl {
 
@@ -29,6 +32,28 @@ struct AbiBufferCompleteInfo {
   AbiRecordLayout** ppRecordLayouts;
   size_t numRecordLayouts;
 };
+
+// A stable signature of a record layout's field set ("fid:size," for each
+// field, sorted). Records sharing a signature share an identical column layout,
+// so they can be accumulated together; records with a different signature (a
+// mid-session field-selection change) go to a separate group, keeping every
+// group's columns length-aligned.
+std::string layoutSignature(const CuptiRecordLayout& layout) {
+  std::vector<std::pair<int, size_t>> fields;
+  fields.reserve(layout.fields.size());
+  for (const auto& f : layout.fields) {
+    fields.emplace_back(f.field_id, f.size);
+  }
+  std::sort(fields.begin(), fields.end());
+  std::string sig;
+  for (const auto& [fid, size] : fields) {
+    sig += std::to_string(fid);
+    sig += ':';
+    sig += std::to_string(size);
+    sig += ',';
+  }
+  return sig;
+}
 
 } // namespace
 
@@ -165,6 +190,268 @@ void CuptiMonitorBuffers::reset() {
   all_.clear();
   allocated_ = 0;
   shutdown_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// Native decode worker.
+
+CuptiMonitorDecoder& CuptiMonitorDecoder::get() {
+  static CuptiMonitorDecoder instance;
+  return instance;
+}
+
+CuptiMonitorDecoder::~CuptiMonitorDecoder() {
+  // The clean path is stop(), which joins the worker. If we reach destruction
+  // with it still running (process exiting without stop()), wake it out of
+  // get_completed() and join: leaving it parked on the pool's condvar would
+  // both std::terminate (~thread on a joinable thread) and hang teardown when
+  // the pool condvar is destroyed with a waiter. The pool outlives the decoder
+  // (constructed first), so this is safe; the join is bounded -- the worker
+  // drains and exits.
+  running_.store(false);
+  CuptiMonitorBuffers::get().shutdown();
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
+
+void CuptiMonitorDecoder::configure(
+    uintptr_t subscriber,
+    uintptr_t get_next_record_fn,
+    uint32_t fence_kind,
+    int fence_end_field) {
+  subscriber_ = subscriber;
+  get_next_record_fn_ = get_next_record_fn;
+  fence_kind_ = fence_kind;
+  fence_end_field_ = fence_end_field;
+  max_sync_ns_.store(0);
+  buffers_decoded_.store(0);
+  valid_bytes_.store(0);
+}
+
+void CuptiMonitorDecoder::start() {
+  if (running_.exchange(true)) {
+    return; // already running
+  }
+  thread_ = std::thread(&CuptiMonitorDecoder::worker_loop, this);
+}
+
+void CuptiMonitorDecoder::stop() {
+  if (!running_.exchange(false)) {
+    return; // not running
+  }
+  // Wake the worker if it is blocked in get_completed().
+  CuptiMonitorBuffers::get().shutdown();
+  if (thread_.joinable()) {
+    thread_.join();
+  }
+}
+
+void CuptiMonitorDecoder::worker_loop() {
+  // get_completed() blocks until a buffer is ready and returns nullopt only
+  // once the pool is shut down AND drained, so on stop() the worker decodes
+  // every already-completed buffer (incl. the fence's trailing flush) before
+  // exiting.
+  while (true) {
+    std::optional<CompletedCuptiBuffer> buf =
+        CuptiMonitorBuffers::get().get_completed();
+    if (!buf.has_value()) {
+      break; // shut down and drained
+    }
+    decode_buffer(*buf);
+    CuptiMonitorBuffers::get().return_buffer(buf->ptr);
+  }
+}
+
+void CuptiMonitorDecoder::decode_buffer(const CompletedCuptiBuffer& buf) {
+  if (get_next_record_fn_ == 0 || buf.valid_size == 0) {
+    return;
+  }
+  buffers_decoded_.fetch_add(1);
+  valid_bytes_.fetch_add(buf.valid_size);
+  // cuptiActivityGetNextRecord_v2(subscriber, buffer, validSize, &record).
+  // Called via the address Python passed (libcupti is loaded Python-side), so
+  // this TU needs no CUPTI header/link. CUPTI_SUCCESS == 0; any other status
+  // (MAX_LIMIT_REACHED at end-of-buffer, INVALID_KIND, real errors) ends the
+  // buffer.
+  using GetNextRecordFn = int (*)(void*, uint8_t*, size_t, void**);
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  auto get_next = reinterpret_cast<GetNextRecordFn>(get_next_record_fn_);
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  auto* subscriber = reinterpret_cast<void*>(subscriber_);
+
+  // Accumulate locally (no lock during the record walk), then merge once.
+  // Grouped by kind -> layout signature so records sharing a layout stay
+  // together and fields never end up mismatched in length. Within this buffer a
+  // kind has a single layout (ppRecordLayouts is per kind), so cache its
+  // signature + layout.
+  std::map<uint32_t, std::map<std::string, std::map<int, CuptiColumn>>> local;
+  std::map<uint32_t, const CuptiRecordLayout*> layout_by_kind;
+  std::map<uint32_t, std::string> sig_by_kind;
+  uint64_t local_max_sync = 0;
+  void* record = nullptr;
+  while (get_next(subscriber, buf.ptr, buf.valid_size, &record) == 0) {
+    const auto* rec = static_cast<const uint8_t*>(record);
+    uint32_t kind = *reinterpret_cast<const uint32_t*>(rec); // KIND @ offset 0
+    auto cached = layout_by_kind.find(kind);
+    const CuptiRecordLayout* layout = nullptr;
+    if (cached == layout_by_kind.end()) {
+      for (const auto& cand : buf.layouts) {
+        if (cand.kind == kind) {
+          layout = &cand;
+          break;
+        }
+      }
+      layout_by_kind[kind] = layout;
+      sig_by_kind[kind] = (layout != nullptr) ? layoutSignature(*layout) : "";
+    } else {
+      layout = cached->second;
+    }
+    if (layout == nullptr) {
+      continue; // no captured layout for this kind; skip
+    }
+    auto& kind_cols = local[kind][sig_by_kind[kind]];
+    for (const auto& field : layout->fields) {
+      CuptiColumn& col = kind_cols[field.field_id];
+      col.field_size = field.size;
+      const uint8_t* src = rec + field.offset;
+      col.bytes.insert(col.bytes.end(), src, src + field.size);
+      // Track the fence (SYNCHRONIZATION-END) timestamp for flush(sync).
+      if (kind == fence_kind_ && field.field_id == fence_end_field_ &&
+          field.size == sizeof(uint64_t)) {
+        uint64_t end_ns = 0;
+        std::memcpy(&end_ns, src, sizeof(uint64_t));
+        if (end_ns > local_max_sync) {
+          local_max_sync = end_ns;
+        }
+      }
+    }
+  }
+
+  if (local_max_sync > 0) {
+    uint64_t prev = max_sync_ns_.load();
+    while (local_max_sync > prev &&
+           !max_sync_ns_.compare_exchange_weak(prev, local_max_sync)) {
+    }
+  }
+
+  std::lock_guard<std::mutex> guard(mutex_);
+  for (auto& [kind, by_sig] : local) {
+    auto& dst_kind = columns_[kind];
+    for (auto& [sig, kind_cols] : by_sig) {
+      auto& dst = dst_kind[sig];
+      for (auto& [field_id, col] : kind_cols) {
+        CuptiColumn& d = dst[field_id];
+        d.field_size = col.field_size;
+        d.bytes.insert(d.bytes.end(), col.bytes.begin(), col.bytes.end());
+      }
+    }
+  }
+}
+
+std::vector<std::pair<uint32_t, std::map<int, CuptiColumn>>>
+CuptiMonitorDecoder::drain() {
+  std::lock_guard<std::mutex> guard(mutex_);
+  std::vector<std::pair<uint32_t, std::map<int, CuptiColumn>>> out;
+  for (auto& [kind, by_sig] : columns_) {
+    for (auto& [sig, kind_cols] : by_sig) {
+      out.emplace_back(kind, std::move(kind_cols));
+    }
+  }
+  columns_.clear();
+  return out;
+}
+
+double cuptiMonitorBenchDecode(
+    uintptr_t buffer_addr,
+    size_t valid_size,
+    const std::vector<CuptiRecordLayout>& layouts,
+    size_t iters) {
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  const auto* base = reinterpret_cast<const uint8_t*>(buffer_addr);
+  std::map<uint32_t, const CuptiRecordLayout*> by_kind;
+  for (const auto& l : layouts) {
+    by_kind[l.kind] = &l;
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  for (size_t it = 0; it < iters; ++it) {
+    // Fresh columns each iter, matching decode_buffer's per-buffer `local`.
+    std::map<uint32_t, std::map<int, CuptiColumn>> cols;
+    size_t pos = 0;
+    while (pos + sizeof(uint32_t) <= valid_size) {
+      uint32_t kind = *reinterpret_cast<const uint32_t*>(base + pos);
+      auto found = by_kind.find(kind);
+      if (found == by_kind.end()) {
+        break; // unknown kind: can't size it, stop (matches the Python walk)
+      }
+      const CuptiRecordLayout* layout = found->second;
+      if (pos + layout->record_size > valid_size) {
+        break; // trailing partial record
+      }
+      auto& kind_cols = cols[kind];
+      for (const auto& field : layout->fields) {
+        CuptiColumn& col = kind_cols[field.field_id];
+        col.field_size = field.size;
+        const uint8_t* src = base + pos + field.offset;
+        col.bytes.insert(col.bytes.end(), src, src + field.size);
+      }
+      pos += layout->record_size;
+    }
+  }
+  auto t1 = std::chrono::steady_clock::now();
+  return std::chrono::duration<double>(t1 - t0).count();
+}
+
+namespace {
+// Per-thread mirror of CUPTI's external-correlation id stack (CUPTI has no
+// peek).
+thread_local std::vector<uint64_t> g_external_id_stack;
+} // namespace
+
+void cuptiMonitorNoteExternalPush(uint64_t external_id) {
+  g_external_id_stack.push_back(external_id);
+}
+
+uint64_t cuptiMonitorNoteExternalPop() {
+  if (g_external_id_stack.empty()) {
+    return 0;
+  }
+  uint64_t id = g_external_id_stack.back();
+  g_external_id_stack.pop_back();
+  return id;
+}
+
+uint64_t cuptiMonitorCurrentExternalId() {
+  return g_external_id_stack.empty() ? 0 : g_external_id_stack.back();
+}
+
+CuptiMetadataStore& CuptiMetadataStore::get() {
+  static CuptiMetadataStore instance;
+  return instance;
+}
+
+void CuptiMetadataStore::put_external(
+    nlohmann::json blob,
+    uint64_t external_id) {
+  if (external_id == 0) {
+    return; // no id to key it by (caller resolves which collective)
+  }
+  std::lock_guard<std::mutex> guard(mutex_);
+  auto it = by_external_.find(external_id);
+  if (it == by_external_.end()) {
+    by_external_.emplace(external_id, std::move(blob));
+  } else {
+    // Recursive merge so several producers can each contribute fields (incl.
+    // nested objects) for one op; on a leaf conflict, the later put wins.
+    it->second.update(blob, /*merge_objects=*/true);
+  }
+}
+
+std::map<uint64_t, nlohmann::json> CuptiMetadataStore::drain_external() {
+  std::lock_guard<std::mutex> guard(mutex_);
+  std::map<uint64_t, nlohmann::json> out;
+  out.swap(by_external_);
+  return out;
 }
 
 void cuptiMonitorBufferRequested(

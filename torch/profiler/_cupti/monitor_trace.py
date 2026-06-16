@@ -12,11 +12,7 @@ from typing import cast, TYPE_CHECKING
 if TYPE_CHECKING:
     import os
 
-from .cupti_python import (
-    Driver_api_trace_cbid,
-    ExternalCorrelationKind,
-    Runtime_api_trace_cbid,
-)
+from .cupti_python import Driver_api_trace_cbid, Runtime_api_trace_cbid
 
 
 # Matches the value Kineto uses to round the trace base time down to a ~3-month
@@ -459,6 +455,17 @@ def _trace_window_entries(
                 args["value"] = _as_int(event["value"])
                 args["memory kind"] = _as_int(event["memory_kind"])
                 args["flags"] = _as_int(event["flags"])
+            elif kind == "kernel":
+                # Launch config, kineto-compatible arg names.
+                args["grid"] = event.get("grid")
+                args["block"] = event.get("block")
+                args["registers per thread"] = _as_int(
+                    event.get("registers_per_thread", 0)
+                )
+                args["shared memory"] = _as_int(
+                    event.get("static_shared_memory", 0)
+                ) + _as_int(event.get("dynamic_shared_memory", 0))
+                args["priority"] = _as_int(event.get("priority", 0))
 
         ts_us = max((_as_int(event["start_ns"]) - base_ns) / 1000.0, 0.0)
         dur_us = max(
@@ -507,19 +514,22 @@ def _gpu_user_annotation_events(
     *,
     base_ns: int,
 ) -> list[dict[str, object]]:
-    user_external_kind = ExternalCorrelationKind.CUSTOM1
     user_annotations = trace_window.get("user_annotations", {})
     if not isinstance(user_annotations, dict) or not user_annotations:
         return []
     trace_window_events = cast(list[dict[str, object]], trace_window["events"])
 
+    # The monitor is the sole external-correlation pusher, so every record is ours;
+    # the `external_id in user_annotations` check below already scopes to the ids we
+    # pushed for named regions -- no kind filtering needed. `user_external_id` is the
+    # innermost ENCLOSING named-region id resolved at decode via the monitor's
+    # active-id chain (so a kernel nested below a region -- e.g. a collective -- maps
+    # to that region); it falls back to the raw innermost external_id when not nested.
     correlation_to_user_external: dict[int, int] = {}
     for event in trace_window_events:
         if event.get("kind") != "external_correlation":
             continue
-        if _as_int(event.get("external_kind", 0)) != user_external_kind:
-            continue
-        external_id = _as_int(event.get("external_id", 0))
+        external_id = _as_int(event.get("user_external_id", event.get("external_id", 0)))
         correlation_id = _as_int(event.get("correlation_id", 0))
         if external_id in user_annotations and correlation_id != 0:
             correlation_to_user_external[correlation_id] = external_id

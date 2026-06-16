@@ -129,6 +129,8 @@ class NodeTimerObserver(CuptiMonitorObserver):
                 eid = cols.get(int(ExternalCorrelation.EXTERNAL_ID))
                 corr = cols.get(int(ExternalCorrelation.CORRELATION_ID))
                 if eid is not None and corr is not None:
+                    if self._eager:
+                        eid = self._resolve_named_ancestor(eid)
                     exts.append((eid, corr))
                 continue
             spec = _TIMED_FIELDS.get(k)
@@ -144,6 +146,27 @@ class NodeTimerObserver(CuptiMonitorObserver):
             with self._lock:
                 self._chunks.extend(spans)
                 self._ext_chunks.extend(exts)
+
+    def _resolve_named_ancestor(self, eid_col):
+        """Map each (innermost) external id to the innermost ENCLOSING id that names a
+        region, via the monitor's active-id chain -- so a kernel nested below a named
+        region (e.g. a collective inside it) still resolves to that region. Resolved
+        at dispatch, while the chain is live (it is dropped shortly after the pop). The
+        innermost id is returned as-is when no named region encloses it (incl. the
+        common non-nested case) or no monitor is available."""
+        names = set(self.annotation_names())
+        if not names or self._monitor is None:
+            return eid_col
+        import numpy as np
+
+        chain = self._monitor.external_id_chain
+        return np.asarray(
+            [
+                next((c for c in reversed(chain(int(e))) if c in names), int(e))
+                for e in eid_col.tolist()
+            ],
+            dtype=eid_col.dtype,
+        )
 
     def _take(self) -> tuple[list, list]:
         with self._lock:
@@ -165,7 +188,7 @@ class NodeTimerObserver(CuptiMonitorObserver):
         so it must NOT force a synchronous flush on every call (records still
         buffered are picked up on the next drain). Pass ``flush=True`` to nudge
         CUPTI to hand over completed buffers first -- a plain ``cuptiActivityFlushAll``,
-        not a forced/sync fence (the timer is a rolling consumer; stragglers are
+        not a sync fence (the timer is a rolling consumer; stragglers are
         picked up on the next drain)."""
         import numpy as np
 
@@ -217,14 +240,18 @@ class NodeTimerObserver(CuptiMonitorObserver):
             span_names = g_names[inv_g]
 
         # Eager fallback for spans the graph resolver didn't name: correlation_id ->
-        # external_id -> name. corr_to_ext is built from this window's
-        # EXTERNAL_CORRELATION records (few -- one per annotate push).
+        # external_id -> name. The external ids were resolved at dispatch through the
+        # monitor's active-id chain to the innermost ENCLOSING named region (so a
+        # collective nested in a region maps to the region, not its own untracked id);
+        # here we just keep those that name a region (in `names`) and map their
+        # correlation ids.
         if self._eager and names:
             corr = np.concatenate([c[3] for c in chunks]).astype("<u8", copy=False)
             corr_to_ext: dict[int, int] = {}
             for eid_col, corr_col in ext_chunks:
                 for eid, c in zip(eid_col.tolist(), corr_col.tolist()):
-                    corr_to_ext[int(c)] = int(eid)
+                    if int(eid) in names:
+                        corr_to_ext[int(c)] = int(eid)
             if corr_to_ext:
                 uniq_c, inv_c = np.unique(corr, return_inverse=True)
                 c_names = np.array(

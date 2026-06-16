@@ -13,9 +13,11 @@ annotation join, and windowing around it.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import threading
+import time
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -25,6 +27,7 @@ from torch.profiler._cupti.observers.base import (
     CuptiMonitorObserver,
     ObserverAnnotationSettings,
 )
+from torch.profiler._cupti.observers.windowing import WindowFinalizerMixin
 from torch.profiler._cupti.records import (
     Api,
     ExternalCorrelation,
@@ -73,6 +76,18 @@ PROFILER_FIELDS: dict[ActivityKind, set[Field]] = {
         Kernel.GRAPH_NODE_ID,
         Kernel.GRAPH_ID,
         Kernel.NAME,
+        # Launch config (kineto reports these; for eager kernels this is the only
+        # source -- graphs can also recover grid/block from kernel annotations).
+        Kernel.GRID_X,
+        Kernel.GRID_Y,
+        Kernel.GRID_Z,
+        Kernel.BLOCK_X,
+        Kernel.BLOCK_Y,
+        Kernel.BLOCK_Z,
+        Kernel.REGISTERS_PER_THREAD,
+        Kernel.STATIC_SHARED_MEMORY,
+        Kernel.DYNAMIC_SHARED_MEMORY,
+        Kernel.LAUNCH_PRIORITY,
     },
     ActivityKind.MEMCPY: {
         Memcpy.START,
@@ -133,24 +148,59 @@ PROFILER_FIELDS: dict[ActivityKind, set[Field]] = {
 }
 
 
-class ProfilerObserver(CuptiMonitorObserver):
-    """Accumulates decoded activity records into a trace window for chrome-trace
-    export. Construct it to start collecting, optionally bracket regions with
-    ``annotate(name)``, then ``build_chrome_trace()`` (or ``drain()``) to
-    emit/snapshot it. The observer keeps collecting after a drain, so it can be
-    drained repeatedly (one window per drain).
+class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
+    """Accumulates decoded activity records and exports them as chrome-trace windows
+    *asynchronously*. A window is opened at trace start (:meth:`open_window`) and
+    closed at trace stop (:meth:`close_window`), but the merge + file write is
+    deferred until the records the window covers have been NATURALLY delivered -- no
+    device sync on the measured timeline (see :class:`WindowFinalizerMixin`). The
+    caller supplies the output path via :meth:`set_export`; :meth:`join` blocks until
+    every pending window is written (for teardown / ``wait_for_exports``).
 
     It requests the chrome-trace field selection (``PROFILER_FIELDS``) -- GPU work
     plus the CPU-side runtime/driver/overhead records and external correlation for
     the annotation join -- and the monitor hands it those fields as columns.
-    """
 
-    def __init__(self, annotation_resolver: AnnotationResolver | None = None) -> None:
+    Bucketing is in the converted (unix) clock to match the events' ``start_ns``; the
+    boundary is ``convert_time(native)`` so the comparison stays order-equivalent
+    (convert_time is monotonic)."""
+
+    def __init__(
+        self,
+        annotation_resolver: AnnotationResolver | None = None,
+        metadata_resolver: Callable[[int], str | None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
+        # Timestamped events (have "start_ns"), bucketed into windows by start time.
         self._events: list[dict[str, Any]] = []
+        # Untimestamped events -- EXTERNAL_CORRELATION, the correlation_id ->
+        # external_id metadata for the eager annotation join. They carry no time to
+        # bucket by, so every finalized window includes whatever is currently buffered
+        # (a harmless superset for the join) and clears them.
+        self._ext_events: list[dict[str, Any]] = []
+        # {external_id: opaque blob} drained from the metadata store alongside the
+        # records (see CuptiMonitor.take_external_metadata). Joined onto events by
+        # correlation_id -> external_id -> blob at finalize, the same chain as the
+        # name join. Consumed per window like _ext_events. (Single-consumer: the
+        # store is process-global, so the first observer to take() drains it.)
+        self._ext_metadata: dict[int, str] = {}
+        # graph_node_id -> blob for CUDA-graph-captured collectives, whose replay
+        # kernels have no external-correlation link. Resolved the same way as
+        # graph-node annotation names (a registry keyed by the stable exec-graph node
+        # id); None when no graph metadata is wired. NOTE: like the kernel-annotation
+        # registry it mirrors, the backing store is NOT reclaimed per graph -- entries
+        # for a destroyed graph persist until a wholesale clear (acceptable: bounded
+        # by distinct captured graph nodes; reset per session). A CUDA user-object
+        # destructor could reclaim per graph if this ever grows unbounded.
+        self._metadata_resolver = metadata_resolver
         # pid -> {opaque_tid: system_tid}, for naming GPU/CPU lanes in the trace.
         self._thread_resource_map: dict[int, dict[int, int]] = {}
-        self._window_start_ns = 0
+        # Start boundary of the currently-open window (None when no window is open).
+        self._open_start: int | None = None
+        # window_id -> pending state: start, captured annotations/thread map, the
+        # cpu-trace + output paths (set via set_export), and the built window dict
+        # (set on coverage). Written + dropped once built AND paths are present.
+        self._windows: dict[int, dict[str, Any]] = {}
         # Graph-node naming via the base resolver (self._resolver; custom or default).
         # PROFILER_FIELDS already selects RUNTIME + EXTERNAL_CORRELATION + correlation
         # ids and the eager join happens in monitor_trace, so this doesn't opt into the
@@ -162,15 +212,29 @@ class ProfilerObserver(CuptiMonitorObserver):
             ),
         )
         if self.available:
-            self._window_start_ns = self.now_ns()
+            self._init_windowing(
+                poll_interval_ms=20, thread_name="cupti-profiler-export"
+            )
+
+    def _boundary_clock_ns(self) -> int:
+        # Events carry convert_time(native) start_ns, so stamp the boundary the same
+        # way: convert_time is monotonic, so comparing in the converted clock is
+        # order-equivalent to comparing the raw native timestamps.
+        return self.convert_time(self.now_native_ns())
 
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
-        # Worker thread: the monitor has already demuxed the buffer to the columns
-        # we selected; turn each kind's columns into chrome-trace event dicts and
-        # accumulate them.
-        new_events: list[dict[str, Any]] = []
+        # Worker thread: build chrome-trace event dicts and accumulate them. Only while
+        # a window is open or still pending export -- otherwise drop the columns rather
+        # than pay the O(records) build for activity no window will ever consume.
+        if not columns:
+            return
+        with self._lock:
+            active = self._open_start is not None or bool(self._windows)
+        if not active:
+            return
+        events: list[dict[str, Any]] = []
         for kind, cols in columns.items():
-            new_events.extend(
+            events.extend(
                 events_from_columns(
                     int(kind),
                     cols,
@@ -178,9 +242,43 @@ class ProfilerObserver(CuptiMonitorObserver):
                     annotation_resolver=self._resolver,
                 )
             )
-        if new_events:
-            with self._lock:
-                self._events.extend(new_events)
+        if not events:
+            return
+        timed = [e for e in events if "start_ns" in e]
+        ext = [e for e in events if "start_ns" not in e]
+        self._annotate_user_external_ids(ext)
+        meta = (
+            self._monitor.take_external_metadata()
+            if self._monitor is not None
+            else {}
+        )
+        with self._lock:
+            self._events.extend(timed)
+            self._ext_events.extend(ext)
+            if meta:
+                self._ext_metadata.update(meta)
+
+    def _annotate_user_external_ids(self, ext_events: list[dict[str, Any]]) -> None:
+        """Stamp each EXTERNAL_CORRELATION event with ``user_external_id``: the
+        innermost ENCLOSING id that names a region, via the monitor's active-id chain,
+        so a kernel nested below a named region (e.g. a collective inside it) still
+        gets that region's name in the trace -- the single-kind record only carries
+        the innermost id. Resolved here at dispatch while the chain is live; the
+        metadata join keeps using the raw innermost ``external_id`` (a collective's id
+        keys its blob). No-op without a monitor or any named region active."""
+        if self._monitor is None:
+            return
+        names = set(self.annotation_names())
+        if not names:
+            return
+        chain = self._monitor.external_id_chain
+        for e in ext_events:
+            if e.get("kind") != "external_correlation":
+                continue
+            eid = e["external_id"]
+            e["user_external_id"] = next(
+                (c for c in reversed(chain(eid)) if c in names), eid
+            )
 
     def push_annotation(self, name: str) -> int | None:
         # Record the calling thread (for trace-lane naming) on top of the base
@@ -193,45 +291,150 @@ class ProfilerObserver(CuptiMonitorObserver):
         with self._lock:
             self._thread_resource_map.setdefault(pid, {})[opaque_tid] = sys_tid
 
-    def drain(self) -> dict[str, Any]:
-        """Return the collected records + annotation/thread metadata as a
-        trace-window dict and reset, so the next drain covers only what arrives
-        after this call. Synchronously flushes CUPTI and waits for the worker to
-        process all outstanding records first, so the window is complete."""
-        if self._monitor is not None:
-            self._monitor.flush(forced=True, sync=True)
-        now = self.now_ns()
-        user_annotations = self.annotation_names(reset=True)
+    # --- async window API (the cupti_monitor profiler backend drives these) ----
+
+    def open_window(self) -> None:
+        """Mark the start of a trace window. Records before this point are excluded
+        from it (so prepare-phase activity doesn't leak into the trace)."""
         with self._lock:
-            events = self._events
-            self._events = []
-            thread_resource_map = {
+            self._open_start = self._boundary_clock_ns()
+
+    def close_window(self) -> int | None:
+        """Mark the end of the open window and queue it for deferred export. Snapshots
+        the window's annotations + thread map now; pair with :meth:`set_export` to
+        supply the paths. Returns the window id (None when unavailable)."""
+        if not self.available:
+            return None
+        with self._lock:
+            start = self._open_start if self._open_start is not None else 0
+            self._open_start = None
+            annotations = self.annotation_names(reset=True)
+            thread_map = {
                 pid: dict(mapping) for pid, mapping in self._thread_resource_map.items()
             }
-            start_ns = self._window_start_ns
-            self._window_start_ns = now
-        return {
-            "events": events,
-            "user_annotations": user_annotations,
-            "thread_resource_map": thread_resource_map,
-            "start_ns": start_ns,
-        }
+        window_id = self.mark_boundary()
+        with self._lock:
+            self._windows[window_id] = {
+                "start": start,
+                "annotations": annotations,
+                "thread_map": thread_map,
+                "cpu": None,
+                "out": None,
+                "built": None,
+            }
+        return window_id
 
-    def build_chrome_trace(
+    def set_export(
         self,
+        window_id: int,
         cpu_trace_path: str | os.PathLike[str],
         output_path: str | os.PathLike[str],
-        *,
-        trace_name: str | None = None,
     ) -> None:
-        """Splice the drained CUPTI activity into the stock Kineto chrome trace
-        at ``cpu_trace_path``, writing the merged trace to ``output_path``."""
-        merge_trace_window_into_chrome_trace(
-            cpu_trace_path,
-            output_path,
-            self.drain(),
-            trace_name=trace_name,
-        )
+        """Supply the (already-captured) Kineto CPU trace and the desired output path
+        for a closed window. The merged file is written once the window's records are
+        covered -- now if they already are, else by the background poller."""
+        with self._lock:
+            w = self._windows.get(window_id)
+            if w is None:
+                return
+            w["cpu"] = os.fspath(cpu_trace_path)
+            # CUPTI monitor traces are always written gzipped; ensure the .gz suffix so
+            # the file is both compressed (the writer keys gzip off it) and named
+            # correctly, regardless of what the caller passed.
+            out = os.fspath(output_path)
+            w["out"] = out if out.endswith(".gz") else out + ".gz"
+        self._maybe_write(window_id)
+
+    def join(self, *, force: bool = True, timeout_s: float = 30.0) -> None:
+        """Finalize + write every pending window, then unregister. Idempotent.
+
+        ``force`` (default) sync-flushes CUPTI to deliver the tail immediately -- use
+        on the training thread (where it serializes with any other monitor flusher)
+        when the file is needed now. ``force=False`` is for an off-thread finalize
+        while collection continues: it must NOT flush (that would race the monitor /
+        the SubgraphTimer's flushing), so it waits up to ``timeout_s`` for the poll
+        thread to cover the windows from naturally-delivered records, then finalizes
+        whatever is in hand (force-draining only if coverage stalled past the
+        deadline)."""
+        if getattr(self, "_boundaries", None) is not None:
+            sync = force
+            if not force:
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    with self._win_lock:
+                        if not self._boundaries:
+                            break
+                    time.sleep(self._poll_interval_s)
+                with self._win_lock:
+                    sync = bool(self._boundaries)  # stalled -> fall back to a forced drain
+            self._stop_windowing(sync=sync)
+        # Write every window whose output path was set. Writing happens here (and in
+        # set_export) on the foreground -- never the poll thread -- so it stays inside
+        # the caller's temp-dir lifetime.
+        for window_id in list(self._windows):
+            self._maybe_write(window_id)
+        super().close()
+
+    # --- WindowFinalizerMixin hooks -------------------------------------------
+
+    def _collect_delivered(self, *, sync: bool) -> None:
+        # Events are built in _on_activities as buffers arrive; only nudge a flush at
+        # teardown (sync) to deliver the tail. The periodic cycle never flushes.
+        if sync and self._monitor is not None:
+            self._monitor.flush(sync=True)
+
+    def _window_watermark_ns(self) -> int:
+        with self._lock:
+            return max((e["start_ns"] for e in self._events), default=-1)
+
+    def _finalize_window(self, window_id: int, boundary_ns: int) -> None:
+        # Runs on the poll thread: the window's records are all in hand, so BUILD its
+        # trace-window dict (events in [start, boundary)) in memory and drop the
+        # consumed events. Does NOT write -- writing is a foreground concern
+        # (set_export / join), so a deferred write can never outlive the caller's
+        # (temporary) output directory.
+        with self._lock:
+            w = self._windows.get(window_id)
+            if w is None:
+                return
+            start = w["start"]
+            timed = [e for e in self._events if start <= e["start_ns"] < boundary_ns]
+            self._events = [e for e in self._events if e["start_ns"] >= boundary_ns]
+            # Untimestamped external-correlation events ride along (the join needs
+            # them); consume the buffered ones with this window.
+            ext, self._ext_events = self._ext_events, []
+            meta, self._ext_metadata = self._ext_metadata, {}
+        # Attach the opaque metadata blob onto the events it annotates (no lock: the
+        # timed/ext lists are this thread's now). correlation_id -> external_id (from
+        # the window's EXTERNAL_CORRELATION records) -> blob.
+        _attach_metadata(timed, ext, meta, self._metadata_resolver)
+        with self._lock:
+            w = self._windows.get(window_id)
+            if w is None:
+                return
+            w["built"] = {
+                "events": timed + ext,
+                "user_annotations": w["annotations"],
+                "thread_resource_map": w["thread_map"],
+                "start_ns": start,
+            }
+
+    def _maybe_write(self, window_id: int) -> None:
+        # Write once the window is both built (covered) and has its paths (set_export).
+        # Only ever called on the foreground (set_export / join), never the poll thread.
+        # The del-under-lock makes the writer single.
+        with self._lock:
+            w = self._windows.get(window_id)
+            if w is None or w["built"] is None or w["out"] is None:
+                return
+            built, cpu, out = w["built"], w["cpu"], w["out"]
+            del self._windows[window_id]
+        try:
+            merge_trace_window_into_chrome_trace(cpu, out, built, trace_name=out)
+        finally:
+            # The CPU trace is a throwaway snapshot the caller handed us; drop it.
+            with contextlib.suppress(OSError):
+                os.remove(cpu)
 
 
 # --- columns -> chrome-trace event dicts -------------------------------------
@@ -262,6 +465,62 @@ def _col_len(cols: dict[int, Any]) -> int:
     return len(next(iter(cols.values()))) if cols else 0
 
 
+def _attach_metadata(
+    timed: list[dict[str, Any]],
+    ext_events: list[dict[str, Any]],
+    external_metadata: dict[int, str],
+    metadata_resolver: Callable[[int], str | None] | None,
+) -> None:
+    """Attach the opaque per-annotation blob onto each timed event, by two routes:
+
+    1. Eager: ``correlation_id -> external_id`` (from the window's
+       EXTERNAL_CORRELATION records) ``-> blob``, the same chain the eager name
+       join uses. This is the path for eager (non-graph) collectives, where the
+       push produced an EXTERNAL_CORRELATION record linking the id to the launched
+       kernel. (The monitor is the sole CUPTI subscriber and sole external-
+       correlation pusher, so every such record is ours -- no kind filtering.)
+    2. Graph: a CUDA-graph-captured collective has no external-correlation link on
+       replay -- the kernel runs with fresh correlation ids and no host push -- so
+       it is resolved by ``graph_node_id`` through ``metadata_resolver``. That is
+       the same mechanism (and stack-managed registry) that resolves graph-node
+       annotation NAMES: it already carries the stable executable-graph node ids
+       across replays and owns their lifecycle, so no separate cache or reclamation
+       is needed here.
+
+    The blob rides as ``event["metadata"]`` (the producer's opaque string -- the
+    consumer parses it); events without a match are left untouched. No-op when
+    neither route is available, so the non-collective path pays nothing."""
+    if not external_metadata and metadata_resolver is None:
+        return
+    # Scope to ids we actually have a blob for: an op may carry one
+    # EXTERNAL_CORRELATION record per active kind (e.g. a tracer region annotation
+    # too), and only the comms collective ids are in external_metadata -- so this
+    # both picks the right record and avoids a region id shadowing the collective.
+    corr_to_ext = (
+        {
+            e["correlation_id"]: e["external_id"]
+            for e in ext_events
+            if e["external_id"] in external_metadata
+        }
+        if external_metadata
+        else {}
+    )
+    for ev in timed:
+        if external_metadata:
+            ext_id = corr_to_ext.get(ev.get("correlation_id"))
+            if ext_id is not None:
+                blob = external_metadata.get(ext_id)
+                if blob is not None:
+                    ev["metadata"] = blob
+                    continue  # eager hit; don't also consult the graph resolver
+        if metadata_resolver is not None:
+            node = ev.get("graph_node_id") or 0
+            if node:
+                blob = metadata_resolver(node)
+                if blob is not None:
+                    ev["metadata"] = blob
+
+
 def _kernel_events(cols, convert_time, resolver):
     events = []
     for i in range(_col_len(cols)):
@@ -282,6 +541,22 @@ def _kernel_events(cols, convert_time, resolver):
                     graph_node_id, ActivityKind.CONCURRENT_KERNEL, correlation_id
                 ),
                 "name": _demangle_symbol(cols[Kernel.NAME.id][i]),
+                # Launch config (kineto-parity fields): grid/block dims, registers, shared
+                # memory and priority -- per-kernel info not recoverable elsewhere for eager.
+                "grid": [
+                    int(cols[Kernel.GRID_X.id][i]),
+                    int(cols[Kernel.GRID_Y.id][i]),
+                    int(cols[Kernel.GRID_Z.id][i]),
+                ],
+                "block": [
+                    int(cols[Kernel.BLOCK_X.id][i]),
+                    int(cols[Kernel.BLOCK_Y.id][i]),
+                    int(cols[Kernel.BLOCK_Z.id][i]),
+                ],
+                "registers_per_thread": int(cols[Kernel.REGISTERS_PER_THREAD.id][i]),
+                "static_shared_memory": int(cols[Kernel.STATIC_SHARED_MEMORY.id][i]),
+                "dynamic_shared_memory": int(cols[Kernel.DYNAMIC_SHARED_MEMORY.id][i]),
+                "priority": int(cols[Kernel.LAUNCH_PRIORITY.id][i]),
             }
         )
     return events

@@ -217,6 +217,12 @@ class CuptiMonitorObserver:
         passthrough to the monitor."""
         return self._monitor.now_unix_ns() if self._monitor is not None else 0
 
+    def now_native_ns(self) -> int:
+        """Current value of CUPTI's native record clock -- the unconverted timebase of
+        decoded record START/END. Use this to stamp a window boundary compared against
+        raw record timestamps (see NodeTimerObserver bucketing). 0 if unavailable."""
+        return self._monitor.now_native_ns() if self._monitor is not None else 0
+
     def convert_time(self, value: int) -> int:
         """Convert a CUPTI-clock timestamp to unix-epoch ns -- passthrough to the
         monitor (identity if clock alignment is unavailable)."""

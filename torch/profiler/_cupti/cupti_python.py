@@ -37,7 +37,6 @@ LIBCUPTI_PATH_ENV = "TORCH_CUPTI_MONITOR_LIBCUPTI_PATH"
 # CUPTI C-API result/flag constants (cupti_result.h / cupti_activity.h). These
 # are stable ABI values, so they are spelled out rather than resolved.
 CUPTI_SUCCESS = 0
-CUPTI_ACTIVITY_FLAG_FLUSH_FORCED = 1
 
 # CUpti_ActivityAttribute::CUPTI_ACTIVITY_ATTR_USER_DEFINED_RECORDS (not surfaced
 # by cupti-python); set on the subscription to turn on the v2 user-defined-record
@@ -221,6 +220,21 @@ def _configure_ctypes(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_uint64),
         ]
         lib.cuptiActivityPopExternalCorrelationId_v2.restype = ctypes.c_int
+    # Collection-time noise filter: cuptiActivityEnableRuntimeApi(cbid, 0) stops CUPTI
+    # generating RUNTIME records for that cbid (kineto disables cudaGetDevice/etc. this way
+    # to shrink buffers). The subscriber-scoped _v2 form is required on the UDR path (the
+    # global one returns CUPTI_ERROR_NOT_COMPATIBLE while a UDR subscriber is active, like
+    # the timestamp / ext-correlation APIs); the global form is kept as a fallback.
+    if hasattr(lib, "cuptiActivityEnableRuntimeApi_v2"):
+        lib.cuptiActivityEnableRuntimeApi_v2.argtypes = [
+            ctypes.c_void_p,  # CUpti_SubscriberHandle subscriber
+            ctypes.c_uint32,  # CUpti_runtime_api_trace_cbid
+            ctypes.c_uint8,  # enable
+        ]
+        lib.cuptiActivityEnableRuntimeApi_v2.restype = ctypes.c_int
+    if hasattr(lib, "cuptiActivityEnableRuntimeApi"):
+        lib.cuptiActivityEnableRuntimeApi.argtypes = [ctypes.c_uint32, ctypes.c_uint8]
+        lib.cuptiActivityEnableRuntimeApi.restype = ctypes.c_int
 
 
 # --- v2 user-defined-record ctypes structs --------------------------------
@@ -268,6 +282,28 @@ def _noop_callback(*_args: object) -> None:
 _NOOP_CB = _CB_FUNC(_noop_callback)
 
 
+# Runtime-API cbids that are pure noise (no observer needs them); disabled at collection
+# time when libcupti supports it so their RUNTIME records never reach the buffers. Matches
+# the set kineto filters (see also the post-decode _RUNTIME_BLOCKLIST in monitor_trace).
+_NOISY_RUNTIME_API_NAMES = ("cudaGetDevice", "cudaSetDevice", "cudaGetLastError")
+
+
+def _noisy_runtime_cbids() -> list[int]:
+    """The cbid values for :data:`_NOISY_RUNTIME_API_NAMES`, resolved from the cupti enum
+    (``_vNNNN`` version suffix stripped). Empty when the enum is unavailable."""
+    try:
+        members = _cupti().Runtime_api_trace_cbid.__members__
+    except Exception:
+        return []
+    out: list[int] = []
+    for name, member in members.items():
+        prefix, _, ver = name.rpartition("_v")
+        base = prefix if prefix and ver.isdigit() else name
+        if base in _NOISY_RUNTIME_API_NAMES:
+            out.append(int(member.value))
+    return out
+
+
 class CuptiError(RuntimeError):
     pass
 
@@ -298,6 +334,20 @@ class _PyLibCupti:
         self._check(self._lib.cuptiGetVersion(ctypes.byref(version)), "cuptiGetVersion")
         return version.value
 
+    def get_next_record_fn_address(self) -> int:
+        """Raw address of ``cuptiActivityGetNextRecord_v2`` (the v2 record
+        iterator), for the native decode worker to call directly -- so the native
+        module needs no libcupti link, and every consumer shares the one libcupti
+        loaded here. Returns 0 if the symbol is absent (libcupti < 13.2)."""
+        if not hasattr(self._lib, "cuptiActivityGetNextRecord_v2"):
+            return 0
+        return (
+            ctypes.cast(
+                self._lib.cuptiActivityGetNextRecord_v2, ctypes.c_void_p
+            ).value
+            or 0
+        )
+
     def get_timestamp(self, sub_handle: int) -> int:
         """CUPTI's normalized nanosecond clock for a subscriber -- the same timebase
         as activity record START/END timestamps, so a value captured here is directly
@@ -314,9 +364,13 @@ class _PyLibCupti:
         )
         return ts.value
 
-    def activity_flush_all(self, forced: bool) -> None:
-        flag = CUPTI_ACTIVITY_FLAG_FLUSH_FORCED if forced else 0
-        self._check(self._lib.cuptiActivityFlushAll(flag), "cuptiActivityFlushAll")
+    def activity_flush_all(self) -> None:
+        """Hand over COMPLETED buffers only (``cuptiActivityFlushAll(0)``). The monitor
+        never forces in-progress buffers (``CUPTI_ACTIVITY_FLAG_FLUSH_FORCED``): a
+        forced flush consumes a still-running kernel's record (its real completion is
+        then never re-delivered) and racing it against concurrent host activity is the
+        flush race that corrupts the HES heap and freezes the decode worker."""
+        self._check(self._lib.cuptiActivityFlushAll(0), "cuptiActivityFlushAll")
 
     def activity_get_num_dropped_records(self, ctx: int, stream_id: int) -> int:
         dropped = ctypes.c_size_t()
@@ -435,6 +489,29 @@ class _PyLibCupti:
             ),
             "cuptiActivityEnable_v2",
         )
+        if getattr(kind, "name", None) == "RUNTIME":
+            self.disable_noisy_runtime_apis(sub_handle)
+
+    def disable_noisy_runtime_apis(self, sub_handle: int) -> None:
+        """Best-effort: stop CUPTI emitting RUNTIME records for the noise-only cbids
+        (cudaGetDevice/SetDevice/GetLastError) so they don't fill the UDR buffers. Prefers
+        the subscriber-scoped _v2 entry (required on the UDR path) and falls back to the
+        global one; a no-op if neither is present (the post-decode blocklist still keeps
+        them out of the chrome trace)."""
+        cbids = _noisy_runtime_cbids()
+        if not cbids:
+            return
+        fn_v2 = getattr(self._lib, "cuptiActivityEnableRuntimeApi_v2", None)
+        fn = getattr(self._lib, "cuptiActivityEnableRuntimeApi", None)
+        for cbid in cbids:
+            if fn_v2 is not None:
+                fn_v2(
+                    ctypes.c_void_p(sub_handle),
+                    ctypes.c_uint32(cbid),
+                    ctypes.c_uint8(0),
+                )
+            elif fn is not None:
+                fn(ctypes.c_uint32(cbid), ctypes.c_uint8(0))
 
     def activity_disable(self, sub_handle: int, kind: ActivityKind) -> None:
         self._check(

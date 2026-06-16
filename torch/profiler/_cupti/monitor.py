@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -40,8 +42,8 @@ _DEFAULT_FLUSH_PERIOD_S = 1.0
 
 # flush(sync=True) fences at a SYNC point: it enables SYNCHRONIZATION, captures
 # CUPTI's clock, device-syncs (which produces a SYNCHRONIZATION record at a
-# timestamp past that point), waits until the worker decodes a sync record that
-# recent, then disables SYNCHRONIZATION again. CUPTI delivers buffers in fill
+# timestamp past that point), waits until the native decoder reports a sync record
+# that recent, then disables SYNCHRONIZATION again. CUPTI delivers buffers in fill
 # order, so seeing the sync record means everything before it is delivered too. A
 # device sync -- unlike a tracer kernel -- adds no kernel, no cudaLaunchKernel, and
 # no dispatcher op to the trace; and enabling SYNCHRONIZATION only for the fence
@@ -197,9 +199,8 @@ class CuptiMonitorBuffer:
 class _Observer:
     """A registered consumer of the monitor's records: the activity kinds it
     requested, its per-kind field selection (``{kind: frozenset(field_ids)}``), and
-    its ``callback(columns)`` -- invoked on the worker thread once per completed
-    buffer with the demuxed columns sliced to its selection (see
-    ``CuptiMonitor.register``)."""
+    its ``callback(columns)`` -- invoked once per drain (at flush time) with the
+    demuxed columns sliced to its selection (see ``CuptiMonitor.register``)."""
 
     def __init__(
         self,
@@ -217,18 +218,49 @@ class CuptiMonitor:
     def __init__(
         self,
         *,
-        buffer_size: int = _DEFAULT_BUFFER_SIZE,
-        flush_period_s: float = _DEFAULT_FLUSH_PERIOD_S,
+        buffer_size: int | None = None,
+        flush_period_s: float | None = None,
     ) -> None:
         # The monitor is the engine and the multiplexer: it owns the single CUPTI
-        # subscription + buffer pool + decode worker, demuxes each completed buffer
-        # into columns, and hands every observer the columns it selected. It reaches
-        # CUPTI only through the self._cupti.activity_* wrappers -- no ctypes here.
+        # subscription + buffer pool + native decode worker, which demuxes each
+        # completed buffer into columns; the monitor drains those columns at flush
+        # time and hands every observer the columns it selected. It reaches CUPTI
+        # only through the self._cupti.activity_* wrappers -- no ctypes here.
         #
         # It uses CUPTI's v2 user-defined-record API: a subscriber + per-field
         # selection, decoded columnar against a record layout computed from the
         # field-size spec (no captured layout needed). This requires libcupti >= 13.2.
+        #
+        # Per-buffer pool size (bytes). An explicit arg wins; otherwise it comes from
+        # TORCH_CUPTI_MONITOR_BUFFER_SIZE (default 4 MiB). Bigger buffers complete less
+        # often (fewer worker wakeups, lower overhead) at the cost of more pinned host
+        # memory and coarser delivery.
+        if buffer_size is None:
+            buffer_size = int(
+                os.environ.get("TORCH_CUPTI_MONITOR_BUFFER_SIZE", _DEFAULT_BUFFER_SIZE)
+            )
         self.buffer_size = buffer_size
+        # Background-drain flush period (seconds). An explicit arg wins; otherwise it
+        # comes from TORCH_CUPTI_MONITOR_FLUSH_PERIOD_S (default 1.0). Sign-encoded:
+        #   > 0  -> background flush thread drains every flush_period_s.
+        #    0   -> background flush thread drains continuously (no wait between flushes).
+        #   < 0  -> NO background flush thread; the caller must drive flush() itself
+        #           (e.g. at end of step). flush() semantics are unchanged -- the caller
+        #           chooses sync=. This is the escape hatch for a libcupti/libnvperf HES
+        #           thread-safety bug: cuptiActivityFlushAll drives CUPTI's HW-trace
+        #           processing against live collection state and can wild-write the host
+        #           heap when it overlaps concurrent host activity (e.g. NCCL collective
+        #           setup). The racy op is the flush, NOT the decode -- the native
+        #           decoder keeps decoding delivered buffers off-thread in this mode (it
+        #           only reads buffers CUPTI already handed over), and that this still
+        #           avoids the corruption is what confirms it. Driving flush() only from
+        #           the quiescent foreground avoids the race.
+        if flush_period_s is None:
+            flush_period_s = float(
+                os.environ.get(
+                    "TORCH_CUPTI_MONITOR_FLUSH_PERIOD_S", _DEFAULT_FLUSH_PERIOD_S
+                )
+            )
         self.flush_period_s = flush_period_s
         self._cupti = cupti_python.pylibcupti()
         # The CUPTI subscriber handle.
@@ -243,32 +275,44 @@ class CuptiMonitor:
         self._lock = threading.Lock()
         self._started = False
         self._callbacks_registered = False
-        self._worker_stop = threading.Event()
         self._flush_stop = threading.Event()
-        self._worker_thread: threading.Thread | None = None
         self._flush_thread: threading.Thread | None = None
-        self._worker_error: BaseException | None = None
+        # Serializes _drain_and_dispatch: the native decoder accumulates columns
+        # GIL-free; Python drains them here. Only ever one driver at a time (the
+        # foreground caller OR the background flush loop, never both), but the lock
+        # keeps a stray concurrent drain from interleaving dispatch.
+        self._drain_lock = threading.Lock()
         self._observers: list[_Observer] = []
+        # {external_id: metadata blob} drained alongside the decoded records (see
+        # drain_decoded). Accumulated here until an observer's external-correlation
+        # join consumes it via take_external_metadata(); the blob is attached onto
+        # the kernel event keyed by the same external id. Guarded by _lock.
+        self._external_metadata: dict[int, str] = {}
         self._next_external_id = 1
+        # All subsystems push external-correlation ids on ONE CUPTI kind, so CUPTI
+        # inserts a single EXTERNAL_CORRELATION record (that kind's stack top) per op
+        # -- i.e. it tags a kernel with only the *innermost* active id; the enclosing
+        # ids are recovered from our own bookkeeping here. _id_chains[id] is the full
+        # active stack (outermost..id) captured when `id` was pushed, so a consumer
+        # maps a kernel's innermost id to every context active for that op (see
+        # external_id_chain) and picks the one it owns (by membership in its own
+        # name/metadata map). The live LIFO is per-thread (CUPTI's external-correlation
+        # stacks are per-thread) in _push_tls.stack. A popped id's chain is kept a
+        # couple of dispatch cycles -- its activity records arrive after the pop -- then
+        # dropped via the _chains_gc_* generations. _id_chains/_chains_gc_* are guarded
+        # by _lock; the per-thread stack needs no lock.
+        self._push_tls = threading.local()
+        self._id_chains: dict[int, tuple[int, ...]] = {}
+        self._chains_gc_pending: list[int] = []
+        self._chains_gc_ready: list[int] = []
         self._time_converter = None
         self._session_start_unix_ns = 0
         self._session_start_approx_ns = 0
         self._session_start_calibrated_unix_ns = 0
 
-        self._buffers_completed = 0
-        # Max END timestamp (CUPTI clock) the worker has decoded; flush(sync=True)
-        # waits on this condition until it reaches a fence point. Monotonic,
-        # worker-written, fence-read.
-        self._max_decoded_ns = 0
-        self._decoded_cv = threading.Condition()
-        # Number of flush(sync=True) calls currently waiting for a sync point. The
-        # worker only advances the decoded clock while this is non-zero, so normal
-        # buffers skip the scan when no one is fencing.
-        self._fence_waiters = 0
         # Snapshot of the native pool size taken before stop() frees it, so
         # stats() stays meaningful after the monitor has been stopped.
         self._final_allocated_buffers = 0
-        self._valid_bytes = 0
         self._outstanding_warned = False
         self._dropped_records = 0
 
@@ -312,16 +356,26 @@ class CuptiMonitor:
         self._session_start_calibrated_unix_ns = self._convert_time(
             self._session_start_approx_ns
         )
-        self._worker_stop.clear()
         self._flush_stop.clear()
-        self._worker_error = None
-        self._worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="torch-cupti-monitor-worker",
-            daemon=True,
+        # Hand the native decode worker the subscriber + cuptiActivityGetNextRecord_v2
+        # address (so it iterates records without a libcupti link) plus the fence
+        # kind/field so it tracks the SYNCHRONIZATION-END clock for flush(sync). It
+        # then pulls completed buffers and decodes them GIL-free; Python drains the
+        # accumulated columns at flush time, so per-buffer decode never contends with
+        # the training thread.
+        fn_addr = self._cupti.get_next_record_fn_address()
+        if not fn_addr:
+            raise RuntimeError(
+                "libcupti is missing cuptiActivityGetNextRecord_v2 (need >= 13.2); "
+                f"loaded {cupti_python.find_cupti_library()}"
+            )
+        _cupti_monitor_native.configure_decoder(
+            self._subscriber, fn_addr, int(_FENCE_KIND), _FENCE_END_FIELD
         )
-        self._worker_thread.start()
-        if self.flush_period_s > 0:
+        _cupti_monitor_native.start_decoder()
+        # Background drain when flush_period_s >= 0 (0 = drain continuously, no wait);
+        # < 0 means no background thread -- the caller drives flush() itself.
+        if self.flush_period_s >= 0:
             self._flush_thread = threading.Thread(
                 target=self._flush_loop,
                 name="torch-cupti-monitor-flush",
@@ -334,9 +388,23 @@ class CuptiMonitor:
     def stop(self) -> None:
         if not self._started:
             return
-        # Drain everything in flight (incl. CUPTI's async deliveries) before we
-        # disable kinds and tear the worker down, so the final window is complete.
-        self.flush(forced=True, sync=True)
+        # Stop the background flush loop first so nothing drives flush() (which
+        # touches the subscriber + drains) concurrently with teardown.
+        self._flush_stop.set()
+        if self._flush_thread is not None:
+            self._flush_thread.join(timeout=5.0)
+            if self._flush_thread.is_alive():
+                logger.warning("CUPTI monitor flush thread did not stop within 5s")
+            self._flush_thread = None
+        # Drain everything in flight (incl. CUPTI's async deliveries) before we tear
+        # the decoder down, so the final window is complete. Then stop the native
+        # decode worker while the subscriber is STILL valid -- it may still decode a
+        # few buffers the fence's trailing flush delivered, and it iterates records
+        # via the subscriber, so it must not outlive the unsubscribe -- and dispatch
+        # the residue.
+        self.flush(sync=True)
+        _cupti_monitor_native.stop_decoder()
+        self._drain_and_dispatch()
         # Disable everything we enabled, then tear down the subscription.
         self._disable(self._enabled.keys())
         self._enabled = {}
@@ -357,81 +425,73 @@ class CuptiMonitor:
         # Force a fresh subscribe on a subsequent start().
         self._callbacks_registered = False
         self._started = False
-        self._flush_stop.set()
-        if self._flush_thread is not None:
-            self._flush_thread.join(timeout=5.0)
-            if self._flush_thread.is_alive():
-                logger.warning("CUPTI monitor flush thread did not stop within 5s")
-            self._flush_thread = None
-        self._worker_stop.set()
-        # Unblock the decode thread waiting in get_completed().
-        _cupti_monitor_native.shutdown_buffers()
-        if self._worker_thread is not None:
-            self._worker_thread.join(timeout=5.0)
-            if self._worker_thread.is_alive():
-                logger.warning("CUPTI monitor worker thread did not stop within 5s")
-            self._worker_thread = None
-        if self._worker_error is not None:
-            raise RuntimeError("CUPTI monitor worker failed") from self._worker_error
         self._final_allocated_buffers = _cupti_monitor_native.allocated_buffers()
         _cupti_monitor_native.reset_buffers()
         self._time_converter = None
 
-    def flush(
-        self, *, forced: bool = False, sync: bool = False, timeout_s: float = 5.0
-    ) -> None:
+    def flush(self, *, sync: bool = False, timeout_s: float = 5.0) -> None:
         """Flush CUPTI's activity buffers to the processing worker.
 
-        Plain (``sync=False``) just issues cuptiActivityFlushAll -- used by the
-        background flush loop. With ``sync=True`` it blocks until the worker has
-        processed every record up to the call, so the caller (drain, reconfigure,
-        stop) sees a complete window.
+        Both paths issue ``cuptiActivityFlushAll(0)`` -- which hands over COMPLETED
+        records, never in-progress ones -- and end by draining the native decoder's
+        accumulated columns and dispatching them to the observers. The monitor never
+        FORCE-flushes (``CUPTI_ACTIVITY_FLAG_FLUSH_FORCED``): a forced flush hands back
+        a still-running kernel's record with a zero end timestamp and consumes it, so
+        CUPTI never re-delivers the real completion (it would strand a slow-but-healthy
+        collective as a false hang in the comm watchdog), and forcing in-progress
+        buffers over concurrent host activity is the flush race that corrupts the HES
+        heap and freezes the decode worker.
+
+        Plain (``sync=False``) flushes then drains -- the background flush loop and the
+        per-step foreground driver. With ``sync=True`` it first blocks until the native
+        decoder has processed every record up to the call, so the caller (drain,
+        reconfigure, stop) sees a complete window.
 
         CUPTI invokes our buffer-complete callback on its own thread a beat *after*
         cuptiActivityFlushAll returns, so a single flush + idle-wait can race ahead
         of that async delivery and miss a just-flushed buffer. To fence
         deterministically we enable SYNCHRONIZATION just for this call, device-sync
-        (which produces a SYNCHRONIZATION record past a captured CUPTI timestamp),
-        then flush/drain until the worker decodes a sync record that recent. CUPTI
-        delivers buffers in fill order, so seeing it means everything before is
-        delivered too -- no timing guess, and concurrent activity only helps.
+        (which both completes outstanding GPU work -- so a plain flush now delivers
+        everything -- and produces a SYNCHRONIZATION record past a captured CUPTI
+        timestamp), then flush/poll until the native decoder reports a sync record that
+        recent. CUPTI delivers buffers in fill order, so seeing it means everything
+        before is delivered too -- no timing guess, and concurrent activity only helps.
         SYNCHRONIZATION is enabled only for the fence so the session doesn't pay to
         record every sync between flushes."""
         if not sync:
-            self._cupti.activity_flush_all(forced=forced)
+            self._cupti.activity_flush_all()
+            self._account_dropped_records(0, 0)
+            self._drain_and_dispatch()
             return
         added = self._begin_fence_kind()
         try:
-            # _fence_sync_point marks a fence active (so the worker advances the
-            # clock) BEFORE producing the sync record, then returns its timestamp.
             target = self._fence_sync_point()
             if target is None:
                 # No CUDA available -> no GPU activity to fence; just flush.
-                self._cupti.activity_flush_all(forced=True)
+                self._cupti.activity_flush_all()
                 return
-            # Flush to deliver the sync-point's buffer, then block until the worker
-            # decodes a sync record at/after it (the decoded clock reaching target).
-            # The condition wakes the instant the worker advances the clock; the
-            # short wait just re-drives a flush if CUPTI hasn't delivered the buffer
-            # yet. The sync record is guaranteed to exist and be deliverable, so this
+            # Flush to deliver the sync-point's buffer, then poll until the native
+            # decoder has processed a sync record at/after it (its max-sync clock
+            # reaching target). CUPTI delivers buffers in fill order, so seeing that
+            # sync record means everything before it is delivered and decoded too.
+            # The sync record is guaranteed to exist and be deliverable, so this
             # terminates; the deadline is only a backstop against an unexpected stall.
             deadline = time.time() + timeout_s
-            while self._max_decoded_ns < target:
-                self._cupti.activity_flush_all(forced=True)
-                with self._decoded_cv:
-                    if self._max_decoded_ns >= target:
-                        return
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        logger.warning(
-                            "CUPTI monitor flush(sync) did not reach its fence"
-                        )
-                        return
-                    self._decoded_cv.wait(timeout=min(0.05, remaining))
+            while _cupti_monitor_native.decoder_max_sync_ns() < target:
+                self._cupti.activity_flush_all()
+                if _cupti_monitor_native.decoder_max_sync_ns() >= target:
+                    break
+                if time.time() >= deadline:
+                    logger.warning(
+                        "CUPTI monitor flush(sync) did not reach its fence"
+                    )
+                    break
+                time.sleep(0.005)
         finally:
-            with self._decoded_cv:
-                self._fence_waiters -= 1
             self._end_fence_kind(added)
+            # The fence guarantees everything up to the sync point is decoded; hand
+            # the accumulated window to the observers now.
+            self._drain_and_dispatch()
 
     def _begin_fence_kind(self) -> bool:
         """Enable + make decodable the SYNCHRONIZATION sync-point kind for the
@@ -442,7 +502,7 @@ class CuptiMonitor:
         # Deliver records pending under the current selection before changing it:
         # without this, enabling the fence kind drops the still-buffered records
         # (e.g. kernels/launches) that the fence is about to flush for.
-        self._cupti.activity_flush_all(forced=True)
+        self._cupti.activity_flush_all()
         self._cupti.activity_enable(self._subscriber, _FENCE_KIND, _FENCE_FIELDS)
         self._enabled = {**self._enabled, _FENCE_KIND: _FENCE_FIELDS}
         return True
@@ -455,26 +515,23 @@ class CuptiMonitor:
             # Flush before disabling so the records pending under the current
             # selection (incl. the fence's own sync record) are delivered rather
             # than dropped when the kind goes away.
-            self._cupti.activity_flush_all(forced=True)
+            self._cupti.activity_flush_all()
             self._cupti.activity_disable(self._subscriber, _FENCE_KIND)
         self._enabled = {k: v for k, v in self._enabled.items() if k != _FENCE_KIND}
 
     def _fence_sync_point(self) -> int | None:
-        """Establish a deterministic fence point for ``flush(sync=True)``. Marks a
-        fence active (so the worker advances the decoded clock, even if the
-        background flush thread delivers the sync record first), captures CUPTI's
-        clock, then device-syncs. The sync both drains outstanding GPU work and
-        produces a SYNCHRONIZATION record with a timestamp past the captured point;
-        the fence waits until that record is decoded. Unlike a tracer kernel, a sync
-        adds no kernel, no cudaLaunchKernel, and no dispatcher op to the trace.
-        Returns the timestamp, or None if no CUDA device is available -- in which
-        case the caller must still balance the matching decrement."""
-        with self._decoded_cv:
-            self._fence_waiters += 1
+        """Establish a deterministic fence point for ``flush(sync=True)``: capture
+        CUPTI's clock, then device-sync. The sync both drains outstanding GPU work
+        and produces a SYNCHRONIZATION record with a timestamp past the captured
+        point; the fence waits until the native decoder reports that record. Unlike a
+        tracer kernel, a sync adds no kernel, no cudaLaunchKernel, and no dispatcher
+        op to the trace. Returns the timestamp, or None if no CUDA device is
+        available. SYNCHRONIZATION is enabled only during the fence, so the decoder's
+        max-sync clock only ever moves for an active fence."""
+        sub = self._subscriber
+        if sub is None:
+            return None
         try:
-            sub = self._subscriber
-            if sub is None:
-                return None
             # The subscriber-aware _v2 timestamp is required here: plain
             # cuptiGetTimestamp is CUPTI_ERROR_NOT_COMPATIBLE while the UDR subscriber
             # is active (13.3), which silently turned this fence into a no-op.
@@ -502,6 +559,16 @@ class CuptiMonitor:
         timestamps -- the approximate clock run through convert_time."""
         return self._convert_time(_PY_PROFILER._get_approximate_time())
 
+    def now_native_ns(self) -> int:
+        """Current value of CUPTI's native record clock (cuptiGetTimestamp_v2) -- the
+        SAME, unconverted timebase as the START/END in decoded records. Use this (not
+        now_unix_ns) to stamp a window boundary that is compared against raw record
+        timestamps. Returns 0 when no subscriber is active. The subscriber-aware _v2
+        timestamp is required: plain cuptiGetTimestamp is CUPTI_ERROR_NOT_COMPATIBLE
+        while the UDR subscriber is active."""
+        sub = self._subscriber
+        return self._cupti.get_timestamp(sub) if sub is not None else 0
+
     # --- observer registry (this monitor is the multiplexer) ---------------
 
     def register(
@@ -513,10 +580,10 @@ class CuptiMonitor:
         ``ActivityKind`` (meaning "all fields") or a field map ``{ActivityKind:
         iterable of field ids | "all"}`` selecting the fields per kind.
 
-        ``callback(columns)`` fires from the worker thread once per completed
-        buffer, with ``columns`` = ``{ActivityKind: {field_id: column}}`` -- the
-        monitor demuxes every buffer to columns and slices them to this observer's
-        selection (the observer never sees raw bytes or the decode strategy).
+        ``callback(columns)`` fires once per drain (at flush time), with ``columns``
+        = ``{ActivityKind: {field_id: column}}`` -- the native decoder demuxes every
+        buffer to columns and the drain slices them to this observer's selection (the
+        observer never sees raw bytes or the decode strategy).
 
         Recomputes the enabled selection and starts the monitor on first
         registration."""
@@ -587,28 +654,42 @@ class CuptiMonitor:
         CUPTI's own captured layout (ppRecordLayouts), so this only sets which fields
         are enabled on the subscriber."""
         target = {int(k): frozenset(v) for k, v in self._field_union().items()}
+        # A fence (flush(sync=True)) transiently enables SYNCHRONIZATION outside the
+        # observer union; keep it in the target so a register/deregister mid-fence
+        # doesn't strip it -- otherwise the fence never sees its sync record and
+        # flush(sync) spins until it times out.
+        fence = int(_FENCE_KIND)
+        if fence in self._enabled:
+            target[fence] = self._enabled[fence]
         if target != self._enabled:
             self._reconfigure(target)
             self._enabled = target
 
     def _reconfigure(self, target: dict[int, frozenset[int]]) -> None:
-        # Swap the per-field selection on the subscriber. No drain needed: each
-        # completed buffer carries CUPTI's own captured layout, so buffers recorded
-        # under the old selection still decode correctly against their own layout
-        # even after the switch.
+        # Reconcile the per-field selection to ``target`` with a minimal diff: only
+        # touch kinds that are being removed or whose field selection changed. Kinds
+        # whose selection is unchanged stay enabled -- toggling them off/on is needless
+        # churn and, for RUNTIME/DRIVER, breaks CUPTI's CUDA-graph kernel tracing (a
+        # graph captured while those kinds were enabled stops emitting per-node kernel
+        # records once they're disabled+re-enabled). Each completed buffer carries
+        # CUPTI's own captured layout, so buffers from before a switch still decode.
         sub = self._subscriber
         if sub is None:
             return
-        for kind in self._enabled:
+        removed = [k for k in self._enabled if k not in target]
+        changed = [k for k in target if k in self._enabled and self._enabled[k] != target[k]]
+        added = [k for k in target if k not in self._enabled]
+        for kind in (*removed, *changed):
             self._cupti.activity_disable(sub, kind)
-        # CUPTI requires a flush between disabling and (re-)enabling activities: a
-        # kind re-enabled with a new field selection otherwise loses the records
-        # pending under the old selection. Flush only when something was actually
-        # disabled (nothing pending to lose on the first, empty-set configure).
-        if self._enabled:
-            self._cupti.activity_flush_all(forced=True)
-        for kind, fields in target.items():
-            self._cupti.activity_enable(sub, kind, fields)
+        # Flush between disabling and (re-)enabling a kind with a new field selection
+        # so records pending under the old selection aren't lost. NON-forced: we only
+        # force-flush while syncing (the fence). Forcing here would push in-progress
+        # buffers concurrently with host activity -- the flush race that freezes the
+        # decode worker.
+        if removed or changed:
+            self._cupti.activity_flush_all()
+        for kind in (*added, *changed):
+            self._cupti.activity_enable(sub, kind, target[kind])
 
     def _disable(self, kinds: Iterable[int]) -> None:
         sub = self._subscriber
@@ -623,6 +704,12 @@ class CuptiMonitor:
             for obs in self._observers:
                 for kind, fset in obs.fields.items():
                     union[kind] = union.get(kind, frozenset()) | fset
+        # CUPTI only emits CUDA_EVENT records when SYNCHRONIZATION is also enabled
+        # (the two are joined via cudaEventSyncId), so couple it on whenever any
+        # observer wants CUDA_EVENT. Enable the fence fields (KIND + END) so a
+        # concurrent flush(sync) still finds its decodable sync-point record.
+        if ActivityKind.CUDA_EVENT in union:
+            union[_FENCE_KIND] = union.get(_FENCE_KIND, frozenset()) | _FENCE_FIELDS
         return union
 
     def stats(self) -> dict[str, Any]:
@@ -630,24 +717,44 @@ class CuptiMonitor:
             return {
                 "started": self._started,
                 "activities": list(self._enabled),
-                "buffers_completed": self._buffers_completed,
+                "buffers_completed": _cupti_monitor_native.decoder_buffers_decoded(),
                 "buffers_allocated": _cupti_monitor_native.allocated_buffers()
                 if self._started
                 else self._final_allocated_buffers,
                 "buffers_pending": _cupti_monitor_native.pending_buffers(),
-                "valid_total_mb": self._valid_bytes / (1024 * 1024),
+                "valid_total_mb": _cupti_monitor_native.decoder_valid_bytes()
+                / (1024 * 1024),
                 "dropped_records": self._dropped_records,
                 "observers": len(self._observers),
             }
 
+    def _thread_push_stack(self) -> list[tuple[int, bool]]:
+        """This thread's live LIFO of active external-correlation frames --
+        ``(id, cupti_ok)``, where cupti_ok records whether CUPTI accepted that push --
+        so pop unwinds CUPTI + the native mirror only for frames that actually took.
+        CUPTI's external-correlation stacks are per-thread, so ours is too."""
+        stack = getattr(self._push_tls, "stack", None)
+        if stack is None:
+            stack = self._push_tls.stack = []
+        return stack
+
     def push_external_correlation_id(self) -> int | None:
-        """Allocate a process-unique external-correlation id and push it onto
-        CUPTI's external-correlation stack. The stack is global (it spans all
-        observers), so the monitor owns it; every CUDA activity recorded until the
-        matching pop gets an EXTERNAL_CORRELATION record linking its
-        correlation_id to this id. Returns the id, or None if not started. What
-        the id *means* (e.g. a region name) is the caller's per-observer metadata,
-        not the monitor's concern."""
+        """Allocate a process-unique external-correlation id, record it as this
+        thread's new innermost active context, and push it onto CUPTI's external-
+        correlation stack. Every CUDA activity recorded until the matching pop gets an
+        EXTERNAL_CORRELATION record linking its correlation_id to this id.
+
+        All subsystems share ONE CUPTI kind, so CUPTI tags each kernel with only the
+        innermost active id; we snapshot the full active stack here (``_id_chains``)
+        so a consumer recovers every context active for an op from that innermost id
+        (see :meth:`external_id_chain`) -- no per-subsystem kind, no shadowing, no
+        kind-pool ceiling. Returns the id, or None if not started.
+
+        The frame is recorded even when CUPTI rejects the push, so a matching (and
+        possibly unconditional) pop stays balanced; the frame's cupti_ok flag tells
+        pop not to unwind CUPTI/the mirror for it. A rejected push just leaves CUPTI
+        tagging records with the prior id, so this id's chain goes unreferenced and is
+        GC'd -- never an off-by-one unwind of the enclosing context."""
         if not self._started or self._subscriber is None:
             return None
         with self._lock:
@@ -655,19 +762,99 @@ class CuptiMonitor:
             self._next_external_id += 1
         # Pass the subscriber: the plain push returns NOT_COMPATIBLE under the UDR
         # subscriber, so the wrapper uses the subscriber-aware _v2 variant.
-        pushed = self._cupti.activity_push_external_correlation_id(
+        cupti_ok = self._cupti.activity_push_external_correlation_id(
             external_id, sub_handle=self._subscriber
         )
-        return external_id if pushed else None
+        stack = self._thread_push_stack()
+        stack.append((external_id, cupti_ok))
+        chain = tuple(fid for fid, _ in stack)
+        with self._lock:
+            self._id_chains[external_id] = chain
+        if cupti_ok:
+            # Mirror into the native per-thread stack so the current (innermost) id is
+            # readable without a CUPTI peek -- see current_external_correlation_id.
+            _cupti_monitor_native.note_external_push(external_id)
+        return external_id
 
     def pop_external_correlation_id(self) -> int | None:
-        """Pop the most recent external-correlation id off CUPTI's global stack.
-        Returns the popped id, or None if not started/failed."""
+        """Pop this thread's innermost active external-correlation frame (balances a
+        push). Unwinds CUPTI + the native mirror only when that push was accepted by
+        CUPTI, so a rejected push -- or an over-pop, which no-ops -- never unwinds the
+        enclosing frame. Returns the popped id, or None if not started / nothing
+        active. The id's chain snapshot is retired by a later drain (see
+        :meth:`_gc_external_chains`)."""
         if not self._started or self._subscriber is None:
             return None
-        return self._cupti.activity_pop_external_correlation_id(
-            sub_handle=self._subscriber
-        )
+        stack = self._thread_push_stack()
+        if not stack:
+            return None
+        external_id, cupti_ok = stack.pop()
+        with self._lock:
+            self._chains_gc_pending.append(external_id)
+        if cupti_ok:
+            self._cupti.activity_pop_external_correlation_id(sub_handle=self._subscriber)
+            _cupti_monitor_native.note_external_pop()  # keep the mirror in sync
+        return external_id
+
+    def external_id_chain(self, innermost_id: int) -> tuple[int, ...]:
+        """The full active-id stack (outermost..innermost) captured when
+        ``innermost_id`` was pushed -- every external-correlation context active for
+        an op CUPTI tagged with ``innermost_id``. A consumer maps a kernel's
+        (innermost) external id through this and picks the id it owns (by membership
+        in its own name/metadata map), recovering enclosing contexts the single-kind
+        records don't carry. Resolve at parse/dispatch time: the snapshot is dropped a
+        couple of drains after the id is popped. Falls back to ``(innermost_id,)``
+        when there is no snapshot (already dropped, or an id we didn't push)."""
+        with self._lock:
+            return self._id_chains.get(innermost_id, (innermost_id,))
+
+    def _gc_external_chains(self) -> None:
+        """Advance the popped-chain GC one generation: drop chains popped two drains
+        ago (their records are delivered + dispatched by now) and promote this cycle's
+        popped ids to be dropped next. Called once per drain, so a popped id's chain
+        survives the drains that dispatch its trailing records."""
+        with self._lock:
+            if not (self._chains_gc_ready or self._chains_gc_pending):
+                return
+            for retired in self._chains_gc_ready:
+                self._id_chains.pop(retired, None)
+            self._chains_gc_ready = self._chains_gc_pending
+            self._chains_gc_pending = []
+
+    def current_external_correlation_id(self) -> int | None:
+        """The external-correlation id on top of THIS thread's stack (last pushed,
+        not yet popped), or None. Reads the native host-side mirror of CUPTI's
+        stack (CUPTI exposes push/pop but no peek). Lets a consumer on the same
+        thread -- e.g. an in-process NCCL profiler plugin -- associate metadata with
+        the annotation the caller already pushed, instead of pushing its own id."""
+        cur = _cupti_monitor_native.current_external_id()
+        return cur if cur else None
+
+    def take_external_metadata(self) -> dict[int, str]:
+        """Move out the {external_id: metadata blob} accumulated from drains since
+        the last call. An observer's external-correlation join consumes this to
+        attach the blob onto its kernel events (keyed by the same external id a
+        producer pushed). Drained-and-reset so blobs aren't re-attached."""
+        with self._lock:
+            meta = self._external_metadata
+            self._external_metadata = {}
+            return meta
+
+    def add_collective_metadata(self, **fields: Any) -> None:
+        """Merge extra metadata into the CURRENT collective's entry (the most-recently-
+        pushed external-correlation id on this thread), recursively (nested dicts
+        combine; on a leaf conflict the later value wins). The seam for a backend to
+        contribute schema fields the NCCL profiler plugin doesn't emit (e.g.
+        ``process_group``, ``process_group_ranks``, ``input_sizes``) so the serializer
+        plugins (FlightRecorder/clog) can fill them; the fields ride the same per-
+        collective metadata as the plugin's descriptor.
+
+        Call inside the comms wrapper's push/pop window (or after
+        :meth:`push_external_correlation_id`). To attach metadata to a specific
+        collective from outside its window, use the native
+        ``metadata_put_external(blob, external_id)`` directly."""
+        if fields:
+            _cupti_monitor_native.metadata_put_external(json.dumps(fields))
 
     def session_info(self) -> dict[str, Any]:
         """Monitor/session metadata for consumers that need to describe the
@@ -690,42 +877,70 @@ class CuptiMonitor:
         try:
             while not self._flush_stop.wait(self.flush_period_s):
                 if self._started:
-                    self.flush(forced=False)
-        except BaseException as exc:
-            self._worker_error = exc
-            self._worker_stop.set()
+                    self.flush()
+        except BaseException:
+            logger.exception("CUPTI monitor flush thread died")
 
-    def _worker_loop(self) -> None:
-        try:
-            while True:
-                # Blocks with the GIL released until a buffer is ready; returns
-                # None once stop() calls _cupti_monitor.shutdown_buffers().
-                item = _cupti_monitor_native.get_completed()
-                if item is None:
-                    break
-                buf = CuptiMonitorBuffer(item)
-                try:
-                    # decode() copies every field into fresh arrays / strs, so the
-                    # returned columns hold no reference to the buffer's memory.
-                    columns = buf.decode()
-                    ctx, stream, valid_size = buf.ctx, buf.stream, buf.valid_size
-                finally:
-                    # Return the buffer to the pool now -- deterministically (not via
-                    # GC) and before dispatch, so nothing references it and it never
-                    # lingers in an exception traceback past stop()/reset_buffers().
-                    del buf
+    def _drain_and_dispatch(self) -> None:
+        """Drain the column groups the native decoder accumulated and fan them out
+        to the observers. The native worker does the per-buffer decode GIL-free;
+        this only views the drained bytes as their dtype and dispatches, so it is
+        cheap and runs on whichever thread drives flush() (foreground or the flush
+        loop).
+
+        Native returns a LIST of ``(kind, {field_id: (size, bytes)})`` groups --
+        one per distinct record layout, so within a group every field column is the
+        same length. Groups are packed into frames (each frame holds at most one
+        group per kind) so a dispatched ``{kind: cols}`` chunk always has
+        length-consistent columns; at steady state every kind has a single layout,
+        so this collapses to one frame -- the same multi-kind chunk as before."""
+        with self._drain_lock:
+            groups, ext_meta = _cupti_monitor_native.drain_decoded()
+            if ext_meta:
                 with self._lock:
-                    self._buffers_completed += 1
-                    self._valid_bytes += valid_size
+                    self._external_metadata.update(ext_meta)
+            if groups:
+                frames: list[dict[int, dict[int, Any]]] = []
+                for kind, fields in groups:
+                    cols = self._columns_from_native(kind, fields)
+                    if not cols:
+                        continue
+                    frame = next((f for f in frames if kind not in f), None)
+                    if frame is None:
+                        frame = {}
+                        frames.append(frame)
+                    frame[kind] = cols
+                with self._lock:
                     observers = list(self._observers)
-                if self._fence_waiters:
-                    self._advance_decoded_clock(columns)
-                self._dispatch_observers(columns, observers)
-                self._account_dropped_records(ctx, stream)
-                self._maybe_warn_backpressure()
-        except BaseException as exc:
-            self._worker_error = exc
-            self._worker_stop.set()
+                for frame in frames:
+                    self._dispatch_observers(frame, observers)
+            # GC popped chains AFTER dispatch: a popped id's chain must survive the
+            # drains that dispatch its trailing records (resolution reads it during
+            # dispatch), so retire it a generation later, never before.
+            self._gc_external_chains()
+        self._maybe_warn_backpressure()
+
+    def _columns_from_native(
+        self, kind: int, fields: Mapping[int, tuple[int, bytes]]
+    ) -> dict[int, Any]:
+        """Turn one native group's ``{field_id: (field_size, bytes)}`` into
+        ``{field_id: column}``: numeric fields are viewed as ``<u{size}``; const
+        char* (string) fields are dereferenced to str. Mirrors the strategy in
+        ``CuptiMonitorBuffer.decode`` (the Python reference decoder)."""
+        str_fields = STRING_FIELDS.get(kind, frozenset())
+        cols: dict[int, Any] = {}
+        for fid, (size, raw) in fields.items():
+            if fid in str_fields and size == 8:
+                ptrs = np.frombuffer(raw, dtype="<u8")
+                cols[fid] = np.array(
+                    [_deref_cstr(int(p)) for p in ptrs], dtype=object
+                )
+            elif size in (1, 2, 4, 8):
+                # .copy() so the column is writable and owns its memory (the
+                # frombuffer view is read-only over the transient bytes), matching
+                # CuptiMonitorBuffer.decode's contract.
+                cols[fid] = np.frombuffer(raw, dtype=f"<u{size}").copy()
+        return cols
 
     def _maybe_warn_backpressure(self) -> None:
         if self._outstanding_warned:
@@ -739,22 +954,6 @@ class CuptiMonitor:
                 "Reduce traced activity or buffer size.",
                 allocated,
             )
-
-    def _advance_decoded_clock(self, decoded: dict[int, dict[int, Any]]) -> None:
-        """Advance the decoded clock at sync points: track the max SYNCHRONIZATION
-        END decoded so far (CUPTI clock) and wake any flush(sync=True) waiting for
-        delivery to reach its fence point."""
-        cols = decoded.get(_FENCE_KIND)
-        if cols is None:
-            return
-        col = cols.get(_FENCE_END_FIELD)
-        if col is None or not len(col):
-            return
-        newest = int(col.max())
-        if newest > self._max_decoded_ns:
-            with self._decoded_cv:
-                self._max_decoded_ns = newest
-                self._decoded_cv.notify_all()
 
     def _dispatch_observers(
         self, decoded: dict[int, dict[int, Any]], observers: list[_Observer]
@@ -770,9 +969,14 @@ class CuptiMonitor:
                 kind_cols = decoded.get(int(kind))
                 if not kind_cols:
                     continue
-                sub = {f: kind_cols[f] for f in fields if f in kind_cols}
-                if sub:
-                    chunk[kind] = sub
+                # A buffer missing any field this observer requested was recorded
+                # before the observer's selection was enabled on the subscriber, so
+                # skip the kind rather than hand over a partial chunk. A correctly
+                # synced reconfigure makes this rare, but an in-flight buffer can
+                # still straddle the field-selection change.
+                if any(f not in kind_cols for f in fields):
+                    continue
+                chunk[kind] = {f: kind_cols[f] for f in fields}
             if chunk:
                 obs.callback(chunk)
 
@@ -813,6 +1017,47 @@ def enable_hes_early() -> None:
 
 def is_hes_enabled() -> bool:
     return _hes_enabled
+
+
+def enable_nccl_metadata_plugin() -> None:
+    """Enable the in-process NCCL profiler plugin (``ncclProfiler_v6``, compiled into
+    torch_cpu) that feeds the metadata store. NCCL resolves the plugin by dlsym'ing
+    the symbol from the program image (``dlopen(NULL)``) when
+    ``NCCL_PROFILER_PLUGIN=STATIC_PLUGIN``.
+
+    For that lookup to find the symbol, libtorch_cpu must be in the global symbol
+    scope -- but Python loads the torch extension RTLD_LOCAL, so we first re-open
+    libtorch_cpu with ``RTLD_GLOBAL | RTLD_NOLOAD`` to promote the already-loaded
+    library's symbols to global scope (no reload), then set the env var.
+
+    Call BEFORE the first ``init_process_group`` / ``ncclCommInitRank`` -- NCCL reads
+    the env and binds the plugin at comm init. The monitor must also be started by
+    then, and the comms hook registered (see
+    :class:`torch.profiler._cupti.comms.CommMonitorHook`), so the plugin sees a pushed
+    external id to key each blob. NCCL_PROFILER_PLUGIN is a
+    single slot: if it is already set to something else (e.g. another plugin), this
+    leaves it and warns -- our plugin won't load."""
+    existing = os.environ.get("NCCL_PROFILER_PLUGIN")
+    if existing and existing != "STATIC_PLUGIN":
+        logger.warning(
+            "NCCL_PROFILER_PLUGIN already set to %r; the torch CUPTI metadata "
+            "plugin (STATIC_PLUGIN) will not load (single plugin slot).",
+            existing,
+        )
+        return
+    import ctypes
+
+    so = os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so")
+    try:
+        ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL | os.RTLD_NOLOAD)
+    except OSError as e:
+        logger.warning(
+            "could not promote %s to global symbol scope (%s); NCCL's STATIC_PLUGIN "
+            "lookup may not find ncclProfiler_v6",
+            so,
+            e,
+        )
+    os.environ["NCCL_PROFILER_PLUGIN"] = "STATIC_PLUGIN"
 
 
 def get_monitor() -> CuptiMonitor | None:
