@@ -2775,7 +2775,7 @@ torch.cuda.synchronize()
                     first_started.set()
                     second_started.wait(timeout=30)
                     g0.capture_end()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(exc)
             finally:
                 first_started.set()
@@ -2790,7 +2790,7 @@ torch.cuda.synchronize()
                     first_done.wait(timeout=30)
                     buf1.uniform_()
                     g1.capture_end()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(exc)
             finally:
                 second_started.set()
