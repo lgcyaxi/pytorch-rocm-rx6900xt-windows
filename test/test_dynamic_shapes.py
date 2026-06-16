@@ -6279,6 +6279,40 @@ class TestMaybeFastEvalComparison(TestCase):
         result = shape_env._maybe_fast_eval_comparison(expr)
         self.assertIsNone(result)
 
+    def test_sympy_interp_min_max_are_symbol_safe(self):
+        from torch._dynamo.source import LocalSource
+        from torch.fx.experimental.symbolic_shapes import ShapeGuardPythonPrinter
+        from torch.utils._sympy.functions import Max, Min
+
+        shape_env = ShapeEnv()
+        u0 = shape_env.create_unbacked_symint()
+        sym = u0.node.expr
+        source = LocalSource("u0")
+        printer = ShapeGuardPythonPrinter(
+            {sym: [source]}, lambda source: source.name, {sym: [source]}
+        )
+
+        max_expr = printer.doprint(sympy.Max(1, sym))
+        min_expr = printer.doprint(sympy.Min(1, sym))
+        self.assertEqual(max_expr, "max(1, L['u0'])")
+        self.assertEqual(min_expr, "min(1, L['u0'])")
+
+        locals_ = {"L": {"u0": u0}}
+        max_result = eval(max_expr, SYMPY_INTERP, locals_).node.expr  # noqa: P204
+        min_result = eval(min_expr, SYMPY_INTERP, locals_).node.expr  # noqa: P204
+        self.assertEqual(max_result, Max(1, sym))
+        self.assertEqual(min_result, Min(1, sym))
+
+        locals_["s1"] = sympy.Integer(2)
+        max_result = eval("max(L['u0'], s1)", SYMPY_INTERP, locals_).node.expr  # noqa: P204
+        min_result = eval("min(L['u0'], s1)", SYMPY_INTERP, locals_).node.expr  # noqa: P204
+        self.assertEqual(max_result, Max(2, sym))
+        self.assertEqual(min_result, Min(2, sym))
+
+        locals_["s2"] = sympy.Integer(3)
+        self.assertEqual(eval("max(s1, s2)", SYMPY_INTERP, locals_), 3)  # noqa: P204
+        self.assertEqual(eval("min(s1, s2)", SYMPY_INTERP, locals_), 2)  # noqa: P204
+
     def test_non_zero_rhs_returns_none(self):
         """Test that comparison with non-zero RHS returns None."""
         shape_env = ShapeEnv()
@@ -6621,6 +6655,142 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertIs(new_sizes[2].node.shape_env, local_env)
         self.assertFalse(local_env.has_guarding_hint(new_sizes[2].node.expr))
         self.assertEqual(local_env.var_to_hint_override[new_sizes[2].node.expr], 99)
+
+    def test_raw_unbacked_symint_transfer_shares_tensor_symbol(self):
+        """Tensor dims and raw SymInts from one foreign ShapeEnv share transfer."""
+        foreign_env = ShapeEnv()
+        u0 = foreign_env.create_unbacked_symint()
+        foreign_env.var_to_hint_override[u0.node.expr] = 32
+
+        local_env = ShapeEnv()
+        new_sizes, _, _ = local_env.transfer_symbols_from_foreign_shape_env(
+            (u0,),
+            (1,),
+            0,
+            source=self._make_source("tensor"),
+        )
+        raw_u0 = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            u0, source=self._make_source("raw")
+        )
+        raw_u0_plus_1 = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            u0 + 1, source=self._make_source("raw_plus_1")
+        )
+
+        tensor_symbol = new_sizes[0].node.expr
+        self.assertEqual(raw_u0.node.expr, tensor_symbol)
+        self.assertEqual(raw_u0_plus_1.node.expr, tensor_symbol + 1)
+        self.assertEqual(local_env.var_to_hint_override[tensor_symbol], 32)
+
+    def test_raw_unbacked_symint_transfer_preserves_multi_symbol_expr(self):
+        """Derived raw SymInts are rebuilt from transferred base symbols."""
+        foreign_env = ShapeEnv()
+        u0 = foreign_env.create_unbacked_symint()
+        u1 = foreign_env.create_unbacked_symint()
+        foreign_env.var_to_hint_override[u0.node.expr] = 32
+        foreign_env.var_to_hint_override[u1.node.expr] = 16
+
+        local_env = ShapeEnv()
+        new_sizes, _, _ = local_env.transfer_symbols_from_foreign_shape_env(
+            (u0, u1, u0 + u1),
+            (1, 1, 1),
+            0,
+            source=self._make_source("tensor"),
+        )
+        raw_sum = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            u0 + u1, source=self._make_source("raw_sum")
+        )
+
+        new_u0 = new_sizes[0].node.expr
+        new_u1 = new_sizes[1].node.expr
+        self.assertEqual(new_sizes[2].node.expr, new_u0 + new_u1)
+        self.assertEqual(raw_sum.node.expr, new_u0 + new_u1)
+        self.assertEqual(local_env.var_to_hint_override[new_u0], 32)
+        self.assertEqual(local_env.var_to_hint_override[new_u1], 16)
+
+    def test_foreign_unbacked_transfer_preserves_derived_tensor_expr(self):
+        """Tensor and raw SymInt derived expressions share transferred symbols."""
+        foreign_env = ShapeEnv()
+        global_tokens = foreign_env.create_unbacked_symint()
+        hidden = foreign_env.create_unbacked_symint()
+        foreign_env.var_to_hint_override[global_tokens.node.expr] = 64
+        foreign_env.var_to_hint_override[hidden.node.expr] = 128
+
+        derived_tokens = global_tokens // 2
+        local_env = ShapeEnv()
+        new_sizes, new_strides, _ = local_env.transfer_symbols_from_foreign_shape_env(
+            (derived_tokens, hidden),
+            (hidden, 1),
+            0,
+            source=self._make_source("derived_tensor"),
+        )
+        raw_derived_tokens = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            derived_tokens, source=self._make_source("raw_derived_tokens")
+        )
+
+        self.assertEqual(raw_derived_tokens.node.expr, new_sizes[0].node.expr)
+        self.assertEqual(new_strides[0].node.expr, new_sizes[1].node.expr)
+        self.assertEqual(len(raw_derived_tokens.node.expr.free_symbols), 1)
+        derived_global_tokens = next(iter(raw_derived_tokens.node.expr.free_symbols))
+        self.assertEqual(local_env.var_to_hint_override[derived_global_tokens], 64)
+        self.assertEqual(local_env.var_to_hint_override[new_sizes[1].node.expr], 128)
+
+    def test_foreign_unbacked_transfer_preserves_shared_token_grid(self):
+        """Separate tensor transfers preserve shared token-grid symbols."""
+        foreign_env = ShapeEnv()
+        batch = foreign_env.create_unbacked_symint()
+        seq = foreign_env.create_unbacked_symint()
+        hidden = foreign_env.create_unbacked_symint()
+        foreign_env.var_to_hint_override[batch.node.expr] = 4
+        foreign_env.var_to_hint_override[seq.node.expr] = 128
+        foreign_env.var_to_hint_override[hidden.node.expr] = 64
+
+        derived_seq = seq // 2
+        local_env = ShapeEnv()
+        token_grid_sizes, token_grid_strides, _ = (
+            local_env.transfer_symbols_from_foreign_shape_env(
+                (batch, seq),
+                (seq, 1),
+                0,
+                source=self._make_source("token_grid"),
+            )
+        )
+        label_sizes, label_strides, _ = (
+            local_env.transfer_symbols_from_foreign_shape_env(
+                (batch, seq),
+                (seq, 1),
+                0,
+                source=self._make_source("labels"),
+            )
+        )
+        derived_sizes, derived_strides, _ = (
+            local_env.transfer_symbols_from_foreign_shape_env(
+                (batch, derived_seq, hidden),
+                (derived_seq * hidden, hidden, 1),
+                0,
+                source=self._make_source("derived_activation"),
+            )
+        )
+        raw_derived_seq = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            derived_seq, source=self._make_source("raw_derived_seq")
+        )
+        raw_seq_plus_hidden = local_env.transfer_unbacked_symint_from_foreign_shape_env(
+            seq + hidden, source=self._make_source("raw_seq_plus_hidden")
+        )
+
+        self.assertEqual(token_grid_sizes[0].node.expr, label_sizes[0].node.expr)
+        self.assertEqual(token_grid_sizes[0].node.expr, derived_sizes[0].node.expr)
+        self.assertEqual(token_grid_sizes[1].node.expr, label_sizes[1].node.expr)
+        self.assertEqual(token_grid_strides[0].node.expr, token_grid_sizes[1].node.expr)
+        self.assertEqual(label_strides[0].node.expr, label_sizes[1].node.expr)
+        self.assertEqual(raw_derived_seq.node.expr, derived_sizes[1].node.expr)
+        self.assertEqual(
+            derived_strides[0].node.expr,
+            derived_sizes[1].node.expr * derived_sizes[2].node.expr,
+        )
+        self.assertEqual(
+            raw_seq_plus_hidden.node.expr,
+            token_grid_sizes[1].node.expr + derived_sizes[2].node.expr,
+        )
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_flex_attention_foreign_fake_e2e(self):
