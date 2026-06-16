@@ -603,13 +603,17 @@ class TestControlDeps(InductorTestCase):
 
         # First call for device 0: should setup
         codegen.codegen_device_guard_enter(
-            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
         )
         self.assertTrue(lines[0].setup_stream_cache)
 
         # Same config again: should NOT setup
         codegen.codegen_device_guard_enter(
-            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
         )
         self.assertFalse(
             lines[1].setup_stream_cache,
@@ -618,7 +622,9 @@ class TestControlDeps(InductorTestCase):
 
         # Different device: should setup
         codegen.codegen_device_guard_enter(
-            device_idx=1, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+            device_idx=1,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
         )
         self.assertTrue(
             lines[2].setup_stream_cache,
@@ -628,7 +634,9 @@ class TestControlDeps(InductorTestCase):
         # Re-enter device 0 after device 1: must re-setup because the flat
         # DEFAULT_STREAM / stream1 variables now hold device 1's values.
         codegen.codegen_device_guard_enter(
-            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx=stream_map,
         )
         self.assertTrue(
             lines[3].setup_stream_cache,
@@ -637,7 +645,9 @@ class TestControlDeps(InductorTestCase):
 
         # Same device, different stream map: must re-setup
         codegen.codegen_device_guard_enter(
-            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx={1: 20},
+            device_idx=0,
+            num_streams=2,
+            stream_idx_to_user_obj_idx={1: 20},
         )
         self.assertTrue(
             lines[4].setup_stream_cache,
@@ -646,7 +656,8 @@ class TestControlDeps(InductorTestCase):
 
         # Same device, more streams: must re-setup
         codegen.codegen_device_guard_enter(
-            device_idx=0, num_streams=3,
+            device_idx=0,
+            num_streams=3,
             stream_idx_to_user_obj_idx={1: 20, 2: 30},
         )
         self.assertTrue(

@@ -3195,7 +3195,7 @@ class SIMDScheduling(BaseScheduling):
         if config.cpp.enable_kernel_profile:
             V.graph.wrapper_code.write_kernel_context_guard_end()
 
-        if config.nan_asserts:
+        if config.nan_asserts or config.runtime_triton_nan_asserts:
             kernel.codegen_nan_check()
         if config.warn_mix_layout:
             kernel.warn_mix_layout(kernel.kernel_name)
