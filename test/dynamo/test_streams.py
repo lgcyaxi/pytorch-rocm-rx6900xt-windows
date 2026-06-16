@@ -2088,7 +2088,7 @@ class <lambda>(torch.nn.Module):
         triton_kernel_wrapper_functional returns a dict.  If the dict node is
         threaded through control_deps as a pass-through value,
         decompose_triton_kernel_wrapper_functional later replaces it with a
-        raw Python dict (via replace_with_graph → replace_all_uses_with),
+        raw Python dict (via replace_with_graph -> replace_all_uses_with),
         corrupting the graph and causing KeyError during lowering.
 
         _expand_dict_returning_deps should insert per-key getitem nodes
@@ -2123,7 +2123,7 @@ class <lambda>(torch.nn.Module):
             args=(0, 0),
         )
 
-        # getitem user AFTER the sync — this is the problematic pattern
+        # getitem user AFTER the sync -- this is the problematic pattern
         getitem_out = graph.call_function(
             operator.getitem,
             args=(triton_func, "Out"),
