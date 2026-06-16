@@ -1023,7 +1023,10 @@ def error_inputs_linspace(op, device, **kwargs):
         error_regex="received an invalid combination of arguments - got \\(int, int, float",
     )
     yield ErrorInput(
-        SampleInput(torch.tensor([1, 1], device=device), args=(torch.tensor([3, 3], device=device), 1)),
+        SampleInput(
+            torch.tensor([[1, 1], [1, 1]], device=device),
+            args=(torch.tensor([[3, 3], [3, 3]], device=device), 1),
+        ),
         error_type=RuntimeError,
         error_regex="only supports 0-dimensional start and end tensors"
     )
@@ -13357,12 +13360,6 @@ op_db: list[OpInfo] = [
                DecorateInfo(unittest.skip("Skipped!"), 'TestCommon', 'test_dtypes', device_type='cuda', active_if=not SM53OrLater),
                DecorateInfo(toleranceOverride({torch.float32: tol(atol=1e-5, rtol=1e-5)}),
                             "TestCommon", "test_out"),
-               # AssertionError: Tensor-likes are not close!
-               DecorateInfo(
-                   unittest.expectedFailure, 'TestCommon', 'test_out',
-                   device_type='mps', dtypes=(torch.float32,),
-                   active_if=MACOS_VERSION < 26.0,
-               ),
            ),
            sample_inputs_func=sample_inputs_bmm),
     OpInfo('mv',
@@ -15211,9 +15208,6 @@ op_db: list[OpInfo] = [
                                     dtypes=all_types_and_complex_and(torch.half, torch.bfloat16)),
                        DecorateInfo(unittest.skip("Skipped!"), 'TestCommon', 'test_variant_consistency_eager',
                                     dtypes=all_types_and_complex_and(torch.half, torch.bfloat16)),
-                       # AssertionError: RuntimeError not raised : Expected RuntimeError when calling with
-                       # input.device=mps:0 and out.device=cpu.
-                       DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_out', device_type='mps'),
                    )),
     BinaryUfuncInfo('lt',
                     ref=np.less,
@@ -18471,7 +18465,13 @@ op_db: list[OpInfo] = [
     OpInfo(
         "to",
         op=lambda x, *args, **kwargs: x.to(*args, **kwargs),
-        dtypes=all_types_and_complex_and(torch.bfloat16, torch.float16, torch.bool),
+        dtypes=all_types_and_complex_and(
+            torch.bfloat16,
+            torch.float16,
+            torch.bool,
+            torch.complex32,
+            torch.bcomplex32,
+        ),
         supports_forward_ad=True,
         supports_fwgrad_bwgrad=True,
         supports_out=False,
@@ -18761,12 +18761,6 @@ op_db: list[OpInfo] = [
                    'TestSchemaCheckModeOpInfo',
                    'test_schema_correctness',
                    dtypes=(torch.complex64, torch.complex128)),
-               # AssertionError: Tensor-likes are not close!
-               DecorateInfo(
-                   unittest.expectedFailure, 'TestCommon', 'test_out',
-                   device_type='mps', dtypes=(torch.float32,),
-                   active_if=MACOS_VERSION < 26.0,
-               ),
            )),
     OpInfo('mode',
            op=torch.mode,

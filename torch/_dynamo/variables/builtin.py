@@ -114,6 +114,7 @@ from .object_protocol import (
     generic_getiter,
     generic_inplace_multiply,
     generic_int,
+    generic_invert,
     generic_len,
     generic_multiply,
     generic_neg,
@@ -1738,6 +1739,11 @@ class BuiltinVariable(BaseBuiltinVariable):
             # e.g., int.__abs__(-4) → abs(-4)
             return generic_abs(tx, args[0])
 
+        if name == "__invert__" and len(args) == 1 and not kwargs:
+            # type.__invert__(instance) → ~instance
+            # e.g., int.__invert__(4) → ~4
+            return generic_invert(tx, args[0])
+
         return super().call_method(tx, name, args, kwargs)
 
     def call_int(
@@ -2565,6 +2571,11 @@ class BuiltinVariable(BaseBuiltinVariable):
     ) -> VariableTracker:
         return generic_neg(tx, a)
 
+    def call_invert(
+        self, tx: "InstructionTranslatorBase", a: VariableTracker
+    ) -> VariableTracker:
+        return generic_invert(tx, a)
+
     def call_format(
         self,
         tx: "InstructionTranslatorBase",
@@ -3297,7 +3308,7 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
             try:
                 return obj.var_getattr(tx, name)
             except AsPythonConstantNotImplementedError:
-                # dont fallback on as_python_constant error because this leads
+                # don't fallback on as_python_constant error because this leads
                 # to a failure later on, and leads to a wrong stacktrace
                 raise
             except NotImplementedError:

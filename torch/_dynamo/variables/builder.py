@@ -110,6 +110,7 @@ from torch.utils._python_dispatch import (
     is_traceable_wrapper_subclass_type,
 )
 from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._typing_utils import not_none
 from torch.utils.weak import TensorWeakRef
 
 from .. import config, graph_break_hints, mutation_guard, replay_record, trace_rules
@@ -1368,7 +1369,7 @@ class VariableBuilder:
             if not np:
                 raise AssertionError("numpy must be available for numpy tracing")
             if istype(value, types.MethodType):
-                # Dont guard on cython functions as they dont change ids
+                # Don't guard on cython functions as they don't change ids
                 if inspect.isfunction(value.__func__):
                     install_guard(
                         AttrSource(self.source, "__func__").make_guard(
@@ -1655,7 +1656,7 @@ class VariableBuilder:
             if value.node.has_hint():
                 new_symint = (
                     self.tx.output.shape_env.create_unspecified_symint_and_symbol(
-                        int(value.node.hint),
+                        int(value.node.hint),  # type: ignore[bad-argument-type]
                         source,
                         dynamic_dim=DimDynamic.DYNAMIC,
                     )
@@ -2960,7 +2961,7 @@ class VariableBuilder:
             value, torch.distributed.tensor.DTensor
         )
         if not is_dtensor:
-            # We guard on the _local_tensor and the _spec, and therefore we dont
+            # We guard on the _local_tensor and the _spec, and therefore we don't
             # have to guard on the outer DTensor.
             self.install_guards(
                 functools.partial(
@@ -4428,7 +4429,7 @@ def _wire_spec_slot(
     """
     from torch.fx.experimental.dynamic_spec import IntVar as _IntVar
 
-    shape_env = size_sym.node.shape_env
+    shape_env = not_none(size_sym.node.shape_env)
 
     if isinstance(spec, _IntVar):
         # Bare IntVar — first occurrence binds the spec sym to this input;
@@ -5151,7 +5152,14 @@ class SourcelessBuilder:
             value,
             (enum.Enum, torch.DispatchKey, torch._C._functorch.TransformType),
         ) or is_pybind11_enum_member(value):
-            return UserDefinedObjectVariable(value)
+            existing = tx.output.side_effects.id_to_variable.get(id(value))
+            if existing is not None:
+                return existing
+            return tx.output.side_effects.track_mutable(
+                value,
+                UserDefinedObjectVariable(value),
+                AttributeMutationNew,
+            )
         elif isinstance(value, (type, abc.ABCMeta)):
             if issubclass(type(value), type) and issubclass(value, BaseException):
                 return UserDefinedExceptionClassVariable(value)
