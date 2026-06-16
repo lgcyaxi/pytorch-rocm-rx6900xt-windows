@@ -19,13 +19,19 @@
 // only the registration call gains a subscriber handle.
 
 #include <c10/macros/Macros.h>
+#include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace torch::profiler::impl {
@@ -103,12 +109,162 @@ class TORCH_API CuptiMonitorBuffers {
   bool shutdown_ = false;
 };
 
+// One accumulated column: the raw little-endian bytes of a single record field
+// concatenated across all decoded records of its kind. field_size is the per-
+// record width, so count == bytes.size() / field_size; Python views the bytes
+// as the field's dtype at drain (the native side stays dtype-agnostic).
+struct CuptiColumn {
+  size_t field_size = 0;
+  std::vector<uint8_t> bytes;
+};
+
+// Native decode worker for the CUPTI monitor. Runs its own thread that pulls
+// completed buffers from CuptiMonitorBuffers, iterates their records with
+// CUPTI's own v2 record iterator (cuptiActivityGetNextRecord_v2, passed in as a
+// function pointer so this file needs no libcupti link), and accumulates every
+// field in each buffer's captured layout into per-(kind, field) columns -- all
+// GIL-free. Python drains the accumulated columns periodically (one GIL touch),
+// so the per-buffer decode never contends with the training thread.
+//
+// NUMERIC fields only for now (the timer's start/end/graph_node_id): each field
+// is copied as raw bytes. const char* (string) fields would need a deref during
+// decode and are a follow-up (the profiler's NAME field).
+class TORCH_API CuptiMonitorDecoder {
+ public:
+  static CuptiMonitorDecoder& get();
+
+  // The CUPTI subscriber handle and the address of
+  // cuptiActivityGetNextRecord_v2 (both as integers from the Python side, which
+  // owns the libcupti handle). fence_kind / fence_end_field identify the
+  // SYNCHRONIZATION record + its END field so the decoder can track the max
+  // sync timestamp for flush(sync) (the native analog of the old Python
+  // _advance_decoded_clock); 0 disables it.
+  void configure(
+      uintptr_t subscriber,
+      uintptr_t get_next_record_fn,
+      uint32_t fence_kind,
+      int fence_end_field);
+  void start();
+  void stop();
+
+  // Move out the accumulated column groups and reset, so the next drain covers
+  // only records decoded after this call. Each group is one (kind,
+  // field-layout): records are accumulated per layout signature, so a kind
+  // whose record layout changed mid-session (e.g. a field-selection
+  // reconfigure, or buffers in flight from before an observer enabled a field)
+  // yields SEPARATE groups rather than a single set of mismatched-length
+  // columns. Within a group every field column is length-aligned (one entry per
+  // record), which the columnar consumers require.
+  std::vector<std::pair<uint32_t, std::map<int, CuptiColumn>>> drain();
+
+  // Max SYNCHRONIZATION-END timestamp decoded so far (CUPTI native clock);
+  // flush(sync) waits on this reaching its fence point.
+  uint64_t max_sync_ns() const {
+    return max_sync_ns_.load();
+  }
+
+  // Cumulative buffers decoded and valid bytes processed since configure() (for
+  // stats()).
+  uint64_t buffers_decoded() const {
+    return buffers_decoded_.load();
+  }
+  uint64_t valid_bytes() const {
+    return valid_bytes_.load();
+  }
+
+ private:
+  CuptiMonitorDecoder() = default;
+  ~CuptiMonitorDecoder();
+  void worker_loop();
+  void decode_buffer(const CompletedCuptiBuffer& buf);
+
+  std::mutex mutex_; // guards columns_
+  // kind -> layout-signature -> {field_id -> column}. Grouping by signature
+  // keeps records decoded against different layouts in separate, internally
+  // length-consistent groups (see drain()).
+  std::map<uint32_t, std::map<std::string, std::map<int, CuptiColumn>>>
+      columns_;
+  std::thread thread_;
+  std::atomic<bool> running_{false};
+  std::atomic<uint64_t> max_sync_ns_{0};
+  std::atomic<uint64_t> buffers_decoded_{0};
+  std::atomic<uint64_t> valid_bytes_{0};
+  uintptr_t subscriber_ = 0;
+  uintptr_t get_next_record_fn_ = 0;
+  uint32_t fence_kind_ = 0;
+  int fence_end_field_ = -1;
+};
+
+// Process-global store of per-annotation metadata. A producer on the training
+// thread -- e.g. an in-process NCCL profiler plugin -- puts a JSON object; it
+// is keyed by the current external-correlation id on this thread's stack
+// (cuptiMonitorCurrentExternalId), which the producer/caller pushed around the
+// op
+// -- so the producer never passes an id. Repeated puts under the same id MERGE
+// (recursive object merge), so several producers can each contribute fields
+// (including nested objects) for one op. The Python side drains it (folded into
+// drain_decoded's return) and
+// joins the metadata onto the monitor's kernel-timing records by id. Keyed only
+// by external id -- graph_node_ids surface only retroactively in replayed
+// kernel records, so node-id keying is a consumer-side cache the resolver
+// builds at first replay. Mutex-guarded; put per op on the training thread,
+// drain on the flushing thread. See the colltrace-replacement design.
+class TORCH_API CuptiMetadataStore {
+ public:
+  static CuptiMetadataStore& get();
+
+  // Recursively merge a JSON object into the metadata entry for external_id
+  // (nested objects combine; on a leaf conflict the later put wins). No-op when
+  // external_id is 0. Callers resolve which collective: the NCCL plugin passes
+  // the id it read; the Python binding defaults a 0 to the most-recently-pushed
+  // id. Several producers can each contribute fields to the same id (e.g. the
+  // plugin's descriptor plus a backend's extra schema fields).
+  void put_external(nlohmann::json blob, uint64_t external_id);
+
+  // Move out the accumulated (merged) objects and reset, so the next drain
+  // covers only ops recorded after this call (mirrors the decoder's drain).
+  std::map<uint64_t, nlohmann::json> drain_external();
+
+ private:
+  CuptiMetadataStore() = default;
+
+  std::mutex mutex_;
+  std::map<uint64_t, nlohmann::json> by_external_;
+};
+
 // Parse a CUpti_BufferCallbackCompleteInfo* (taken as void*) into per-kind
 // record layouts. ppRecordLayouts is indexed by activity kind, null for kinds
 // without a user-defined layout. Returns empty if complete_info /
 // ppRecordLayouts is null.
 std::vector<CuptiRecordLayout> cuptiMonitorParseRecordLayouts(
     void* complete_info);
+
+// Benchmark helper (benchmarks/profiler_benchmark/bench_decode.py): run the
+// native per-buffer decode -- stride-walk the records and accumulate every
+// field into per-(kind, field_id) byte columns, exactly as the decode worker
+// does, but with a stride iterator instead of CUPTI's record iterator (so it
+// runs on a synthetic buffer, no GPU/CUPTI) -- `iters` times over
+// `buffer_addr`, returning the total wall-clock seconds. The columns are
+// discarded each iter.
+TORCH_API double cuptiMonitorBenchDecode(
+    uintptr_t buffer_addr,
+    size_t valid_size,
+    const std::vector<CuptiRecordLayout>& layouts,
+    size_t iters);
+
+// Host-side mirror of CUPTI's per-thread external-correlation id stack. CUPTI
+// offers push/pop but no peek, so the monitor records each push/pop here (next
+// to the CUPTI call) to make the CURRENT id readable. An in-process consumer on
+// the same thread -- e.g. an NCCL profiler plugin tagging a collective's
+// metadata with the annotation the Python side pushed -- reads it via
+// cuptiMonitorCurrentExternalId instead of managing its own ids. Thread-local:
+// only valid on the pushing thread (collectives launch on the training thread,
+// the same one that pushes). Ids are monotonic from 1, so 0 means "no id on
+// this thread's stack".
+TORCH_API void cuptiMonitorNoteExternalPush(uint64_t external_id);
+TORCH_API uint64_t
+cuptiMonitorNoteExternalPop(); // returns popped id, 0 if empty
+TORCH_API uint64_t cuptiMonitorCurrentExternalId(); // top of stack, 0 if empty
 
 // Free functions matching the CUPTI subscriber-scoped (user-defined record)
 // buffer-callback signatures, registered via cuptiActivityRegisterCallbacks_v2.
