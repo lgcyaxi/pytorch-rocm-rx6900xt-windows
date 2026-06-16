@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 
+import unittest
+
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
@@ -8,9 +10,13 @@ from torch.testing import FileCheck
 from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
+    HAS_CUDA_AND_TRITON,
     HAS_GPU_AND_TRITON,
     requires_gpu,
 )
+
+
+requires_cuda_triton = unittest.skipUnless(HAS_CUDA_AND_TRITON, "requires CUDA")
 
 
 class TestControlDeps(InductorTestCase):
@@ -342,6 +348,92 @@ class TestControlDeps(InductorTestCase):
             torch.testing.assert_close(result, expected)
 
     @requires_gpu()
+    def test_wait_event_threads_record_event_passthroughs(self):
+        """wait_event must thread record_event's passthroughs to consumers.
+
+        Regression test for the backward reload pattern:
+          reload [side stream] → record_event → ... → wait_event [default] → consumer
+
+        Without threading, the consumer depends only on record_event's getitem
+        (wrong stream), so the inductor scheduler can place the consumer kernel
+        before wait_event fires.
+        """
+        import operator
+
+        from torch._functorch._aot_autograd.streams import (
+            wrap_all_sync_nodes_with_control_deps,
+        )
+        from torch._inductor.fx_passes.control_dependencies import control_deps
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
+        g = gm.graph
+        val = torch.randn(4, device=GPU_TYPE)
+
+        x = g.placeholder("x")
+        x.meta["val"] = val
+
+        # Simulated reloaded activation on side stream 19
+        reload = g.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        reload.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 19},
+            }
+        )
+
+        # record_event on side stream after reload completes
+        record = g.call_function(torch.ops.streams.record_event.default, args=(42, 19))
+        record.meta["partitioner_tag"] = "must_be_in_backward"
+
+        # Other backward compute on default stream (between record and wait)
+        other = g.call_function(torch.ops.aten.mul.Tensor, args=(x, x))
+        other.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 0},
+            }
+        )
+
+        # wait_event on default stream
+        wait = g.call_function(torch.ops.streams.wait_event.default, args=(42, 0))
+        wait.meta["partitioner_tag"] = "must_be_in_backward"
+
+        # Consumer reads reload result + other compute on default stream
+        consumer = g.call_function(torch.ops.aten.add.Tensor, args=(reload, other))
+        consumer.meta.update(
+            {
+                "val": val,
+                "partitioner_tag": "is_backward",
+                "custom": {"stream": 0},
+            }
+        )
+
+        g.output((consumer,))
+        gm.recompile()
+
+        wrap_all_sync_nodes_with_control_deps(gm)
+
+        # The consumer's reload arg must flow through wait_event's control_deps,
+        # NOT record_event's.
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        final_consumer = output_node.args[0][0]
+        reload_arg = final_consumer.args[0]
+
+        self.assertEqual(reload_arg.target, operator.getitem)
+        ctrl_node = reload_arg.args[0]
+        self.assertIs(ctrl_node.target, control_deps)
+
+        # The control_deps wraps wait_event, not record_event
+        subgraph = getattr(gm, ctrl_node.args[1].target)
+        subgraph_targets = {
+            n.target for n in subgraph.graph.nodes if n.op == "call_function"
+        }
+        self.assertIn(torch.ops.streams.wait_event.default, subgraph_targets)
+        self.assertNotIn(torch.ops.streams.record_event.default, subgraph_targets)
+
+    @requires_gpu()
     def test_control_deps_orders_void_op_across_nested_calls(self):
         """record_event's void op must be named as an additional_buffer_dep
         of the subsequent wait_event's operations after Inductor lowering.
@@ -409,6 +501,207 @@ class TestControlDeps(InductorTestCase):
             "no record_event void op appears as an additional_buffer_dep; "
             f"void_names={void_names}, referenced={referenced}",
         )
+
+    def test_reinplace_not_blocked_by_control_deps_ordering_dep(self):
+        """Views in control_deps' ordering-only deps should not block reinplacing.
+
+        When a tensor appears only in control_deps' additional_deps (args[0])
+        and NOT in the pass-through args (args[2:]), it is an ordering-only
+        dependency.  The reinplace pass must not treat this as a real data use.
+        """
+        from torch._inductor.fx_passes.control_dependencies import control_deps
+        from torch._inductor.fx_passes.reinplace import (
+            _is_control_deps_ordering_only_use,
+        )
+
+        g = torch.fx.Graph()
+        view = g.placeholder("view")
+        other = g.placeholder("other")
+        subgraph = g.placeholder("subgraph")
+
+        # view only in ordering deps (args[0]) -> ordering only, not a real use
+        ctrl = g.call_function(control_deps, args=((view,), subgraph, other))
+        self.assertTrue(_is_control_deps_ordering_only_use(ctrl, view))
+
+        # view in both ordering deps AND pass-through -> real data use
+        ctrl2 = g.call_function(control_deps, args=((view,), subgraph, view))
+        self.assertFalse(_is_control_deps_ordering_only_use(ctrl2, view))
+
+        # view only in pass-through, not in ordering deps -> real data use
+        ctrl3 = g.call_function(control_deps, args=((other,), subgraph, view))
+        self.assertFalse(_is_control_deps_ordering_only_use(ctrl3, view))
+
+        # non-control_deps node -> not ordering only
+        add = g.call_function(torch.ops.aten.add.Tensor, args=(view, other))
+        self.assertFalse(_is_control_deps_ordering_only_use(add, view))
+
+    @requires_gpu()
+    def test_control_deps_passthrough_creates_mutation_output(self):
+        """Pass-through values in control_deps must create MutationOutput.
+
+        When an input passes through control_deps unchanged, the subgraph
+        operations add MutationOutput entries so the scheduler's mutation
+        rename chain forces consumers after the subgraph boundary.
+        """
+        from torch._inductor.virtualized import V
+
+        captured: list[dict] = []
+
+        def capture(nodes):
+            mutation_count = 0
+            for op in V.graph.operations:
+                if hasattr(op, "mutation_outputs"):
+                    mutation_count += len(op.mutation_outputs)
+            captured.append({"mutation_count": mutation_count})
+            return nodes
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            e = torch.Event()
+            with s:
+                y = x + 1
+                e.record()
+            e.wait()
+            return y * 2
+
+        torch._dynamo.reset()
+        with config.patch(_pre_fusion_custom_pass=capture):
+            x = torch.ones(4, device=GPU_TYPE)
+            result = torch.compile(fn)(x)
+
+        expected = fn(torch.ones(4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
+
+        self.assertTrue(captured, "expected at least one Inductor compile")
+        total_mutations = sum(c["mutation_count"] for c in captured)
+        self.assertGreater(
+            total_mutations,
+            0,
+            "expected MutationOutput entries for pass-through values in control_deps",
+        )
+
+    def test_stream_cache_setup_only_once_per_config(self):
+        """When codegen_device_guard_enter is called multiple times with the
+        same (device, num_streams, stream_map) config (e.g., forward + backward
+        sharing a wrapper), only the first call should set
+        setup_stream_cache=True.  A different config re-runs setup."""
+        from torch._inductor.codegen.wrapper import (
+            EnterDeviceContextManagerWithStreamInfoLine,
+            PythonWrapperCodegen,
+        )
+
+        codegen = PythonWrapperCodegen()
+        stream_map = {1: 10}
+        lines: list[EnterDeviceContextManagerWithStreamInfoLine] = []
+
+        def capture_writeline(line):
+            if isinstance(line, EnterDeviceContextManagerWithStreamInfoLine):
+                lines.append(line)
+
+        orig_writeline = codegen.writeline
+        codegen.writeline = capture_writeline
+
+        # First call for device 0: should setup
+        codegen.codegen_device_guard_enter(
+            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+        )
+        self.assertTrue(lines[0].setup_stream_cache)
+
+        # Same config again: should NOT setup
+        codegen.codegen_device_guard_enter(
+            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+        )
+        self.assertFalse(
+            lines[1].setup_stream_cache,
+            "Second entry with same config should skip stream cache setup",
+        )
+
+        # Different device: should setup
+        codegen.codegen_device_guard_enter(
+            device_idx=1, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+        )
+        self.assertTrue(
+            lines[2].setup_stream_cache,
+            "Different device should setup stream cache",
+        )
+
+        # Re-enter device 0 after device 1: must re-setup because the flat
+        # DEFAULT_STREAM / stream1 variables now hold device 1's values.
+        codegen.codegen_device_guard_enter(
+            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx=stream_map,
+        )
+        self.assertTrue(
+            lines[3].setup_stream_cache,
+            "Re-entering device 0 after device 1 must re-setup stream cache",
+        )
+
+        # Same device, different stream map: must re-setup
+        codegen.codegen_device_guard_enter(
+            device_idx=0, num_streams=2, stream_idx_to_user_obj_idx={1: 20},
+        )
+        self.assertTrue(
+            lines[4].setup_stream_cache,
+            "Same device with different stream map must re-setup",
+        )
+
+        # Same device, more streams: must re-setup
+        codegen.codegen_device_guard_enter(
+            device_idx=0, num_streams=3,
+            stream_idx_to_user_obj_idx={1: 20, 2: 30},
+        )
+        self.assertTrue(
+            lines[5].setup_stream_cache,
+            "Same device with more streams must re-setup",
+        )
+
+        codegen.writeline = orig_writeline
+
+    @requires_gpu()
+    def test_generated_code_uses_get_stream_by_index(self):
+        """Generated inductor code should use _get_stream_by_index to
+        retrieve user streams from the external object registry."""
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            with s:
+                return x + 1
+
+        x = torch.ones(4, 4, device=GPU_TYPE)
+        result, code = run_and_get_code(torch.compile(fn), x)
+        FileCheck().check("_get_stream_by_index").run(code[0])
+
+        expected = fn(torch.ones(4, 4, device=GPU_TYPE))
+        torch.testing.assert_close(result, expected)
+
+    @requires_cuda_triton
+    def test_restore_external_objects_before_backward(self):
+        """The forward epilogue snapshots the external object registry into
+        ctx._external_objects, and backward restores it before calling the
+        compiled backward. This protects against another torch.compile frame's
+        store_user_object_weakrefs clobbering the registry.
+
+        We compile a multi-stream function, run forward, clobber the global
+        registry (simulating a second frame), then run backward. Without the
+        snapshot/restore, backward fails."""
+        from torch._dynamo.graph_bytecode_inputs import store_user_object_weakrefs
+
+        def fn(x):
+            s = torch.Stream(device=GPU_TYPE)
+            with s:
+                return x * 2 + 1
+
+        compiled_fn = torch.compile(fn)
+        x = torch.randn(4, 4, device=GPU_TYPE, requires_grad=True)
+        out = compiled_fn(x)
+
+        # Clobber the global registry as a second compile frame would.
+        store_user_object_weakrefs(torch.cuda.Stream())
+
+        # Without ctx._external_objects snapshot/restore, backward crashes
+        # with "Index not registered in index_to_external_object_weakref".
+        out.sum().backward()
+        self.assertIsNotNone(x.grad)
+        torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
 
 
 if __name__ == "__main__":
