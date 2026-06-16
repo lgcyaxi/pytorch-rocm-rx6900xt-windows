@@ -3000,7 +3000,7 @@ class InstructionTranslatorBase(
         # problematic for resuming from graph breaks in list comprehensions.  Cpython uses tagged ints (not PyObject) to
         # represent the index, and we can only restore boxed ints, which creates an invalid stack state.  So instead of
         # trying, we just always create a true iterator.
-        self.call_function(VariableTracker.build(self, iter), [self.pop()], {})
+        self.push(generic_getiter(self, self.pop()))
         if sys.version_info >= (3, 15):
             self.push(NullVariable())
 

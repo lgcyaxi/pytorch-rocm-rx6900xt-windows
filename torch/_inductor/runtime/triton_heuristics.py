@@ -196,6 +196,13 @@ def autotune_hints_to_configs(
     configs: list[Config] = []
     for hint in hints:
         if hint == AutotuneHint.ONE_ELEMENT_PER_THREAD:
+            if device_props.warp_size is None:
+                log.debug(
+                    "Skipping %s autotune hint because device %s does not report warp_size",
+                    AutotuneHint.ONE_ELEMENT_PER_THREAD,
+                    device_props.type,
+                )
+                continue
             if len(size_hints) == 1:
                 xyz_options = ((block_size // 4, None, None),)
             elif len(size_hints) == 2:
@@ -715,6 +722,7 @@ class CachingAutotuner(KernelInterface):
             and bool(device_prop.major)
             and (device_prop.major >= 8 or torch.version.hip)
             and device_prop.regs_per_multiprocessor is not None
+            and device_prop.warp_size is not None
         )
 
     def _iter_rblock_scale_candidates(self):
@@ -733,8 +741,10 @@ class CachingAutotuner(KernelInterface):
             )
         if not device_prop.multi_processor_count:
             raise AssertionError("device_prop.multi_processor_count is not set")
+        if device_prop.warp_size is None:
+            raise AssertionError("device_prop.warp_size is not set")
         seen_config_hashes: OrderedSet[Hashable] | None = None
-        warp_size = device_prop.warp_size_or_default
+        warp_size = device_prop.warp_size
         for result in self.compile_results:
             triton_config = result.config
             compiled_binary = result.kernel
@@ -776,14 +786,14 @@ class CachingAutotuner(KernelInterface):
             nreg_per_warp = nreg * warp_size
             nreg_per_block = nreg_per_warp * triton_config.num_warps
 
-            # Previously we set max_blocks_per_sm to 'max_threads_per_multi_processo / (32 * num_warps)'
+            # Previously we set max_blocks_per_sm to 'max_threads_per_multi_processor / (warp_size * num_warps)'
             # The formula below is a tighter upper bound since we have the assumption that
             #   nreg > device_prop.regs_per_multiprocessor // device_prop.max_threads_per_multi_processor
             # due to the if condition above and:
             #   regs_per_multiprocessor / nreg_per_block
-            #   = regs_per_multiprocessor / (nreg * 32 * num_warps)
-            #   < regs_per_multiprocessor / ((regs_per_multiprocessor / max_threads_per_multi_processor) * 32 * num_warps)
-            #   = max_threads_per_multi_processor / (32 * num_warps)
+            #   = regs_per_multiprocessor / (nreg * warp_size * num_warps)
+            #   < regs_per_multiprocessor / ((regs_per_multiprocessor / max_threads_per_multi_processor) * warp_size * num_warps)
+            #   = max_threads_per_multi_processor / (warp_size * num_warps)
             # Using a tighter upper bound can reveal more optimization opportunities.
             max_blocks_per_sm = max(
                 device_prop.regs_per_multiprocessor // nreg_per_block, 1
@@ -1045,7 +1055,10 @@ class CachingAutotuner(KernelInterface):
             if backend_options:
                 # Stash backend-only options separately so they do not get mixed into
                 # `constants`, which are interpreted as signature-bound constexpr args.
-                compile_meta["backend_options"] = backend_options
+                compile_meta["backend_options"] = {
+                    **compile_meta.get("backend_options", {}),
+                    **backend_options,
+                }
         compile_meta["constants"].update(cfg_kwargs)
 
         for i in get_constexprs(self.fn):
@@ -1110,10 +1123,9 @@ class CachingAutotuner(KernelInterface):
             for k in tlx_only_cuda_options():
                 if v := getattr(cfg, k, None):
                     options[k] = v
-        if self.device_props.type == "hip":
-            # HIP backend options are consumed by Triton out-of-band from the kernel
-            # signature. They are intentionally *not* present in `constants`.
-            options.update(compile_meta.get("backend_options", {}))
+        # Backend options are consumed by Triton out-of-band from the kernel
+        # signature. They are intentionally *not* present in `constants`.
+        options.update(compile_meta.get("backend_options", {}))
 
         if self.device_props.type == "xpu" and XPU_KERNEL_FORMAT == "zebin":
             options["generate_native_code"] = True
@@ -1935,7 +1947,7 @@ class CachingAutotuner(KernelInterface):
         E.g., assuming regular autotune only get one config C1; while max-autotune get 4 configs C1, C2, C3, C4
         and max-autotune figure out C3 is the best.
 
-        Then if coordinate desecnt tuning is run with max-autotune disabled, it will start from C1;
+        Then if coordinate descent tuning is run with max-autotune disabled, it will start from C1;
         while if coordinate descent tuning is run with max-autotune enabled, it will start from C3.
         """
         if not self._should_coordesc_tune:
@@ -4326,7 +4338,12 @@ def _reduction_configs(
         )
 
     contiguous_config = make_config(
-        2 if rnumel <= 2048 else 1,  # 1024 or less is persistent
+        # Default XBLOCK=2 launches too few programs to fill
+        # the device. Prefer XBLOCK=1 so the autotuner has a candidate
+        # that can saturate all CUs.
+        1
+        if (torch.version.hip and size_hints.get("x", 0) <= 64)
+        else (2 if rnumel <= 2048 else 1),  # 1024 or less is persistent
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )

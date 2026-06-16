@@ -1238,7 +1238,7 @@ class TensorVariable(VariableTracker):
             context=f"{self}.as_subclass({cls})",
             explanation="Currently not supported",
             hints=[
-                "Avoid this call or move it outside `torch.compile` regione",
+                "Avoid this call or move it outside `torch.compile` region",
                 *graph_break_hints.SUPPORTABLE,
             ],
         )
@@ -1720,6 +1720,25 @@ class TensorVariable(VariableTracker):
 
     def method___abs__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
         return self.nb_absolute_impl(tx)
+
+    def nb_invert_impl(
+        self,
+        tx: "InstructionTranslatorBase",
+    ) -> VariableTracker:
+        from .builder import wrap_fx_proxy
+
+        return wrap_fx_proxy(
+            tx,
+            tx.output.create_proxy(
+                "call_function",
+                operator.invert,
+                (self.as_proxy(),),
+                {},
+            ),
+        )
+
+    def method___invert__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        return self.nb_invert_impl(tx)
 
     def method___getitem__(
         self,
@@ -3261,7 +3280,7 @@ class TensorSubclassVariable(UserDefinedClassVariable):
                     explanation="Currently not supported",
                     hints=[
                         "Avoid this constructor call or move it outside "
-                        "`torch.compile` regione",
+                        "`torch.compile` region",
                         *graph_break_hints.SUPPORTABLE,
                     ],
                 )
