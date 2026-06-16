@@ -818,6 +818,25 @@ def _is_layout_preserving_view_copy_back(
     )
 
 
+def _is_control_deps_ordering_only_use(
+    user: torch.fx.Node, view: torch.fx.Node
+) -> bool:
+    """Check if view appears only in control_deps' ordering-only additional_deps tuple.
+
+    control_deps schema (control_dependencies.py): control_deps(additional_deps, subgraph, *args)
+    kwargs is always empty -- preserve_node_ordering threads all nodes positionally.
+    """
+    if not (
+        user.op == "call_function"
+        and isinstance(user.target, torch._ops.HigherOrderOperator)
+        and user.target._name == "control_deps"
+    ):
+        return False
+    additional_deps = user.args[0]
+    pass_through = user.args[2:]
+    return view in additional_deps and view not in pass_through  # pyrefly: ignore
+
+
 def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
     """
     Reinplaces in-placeable operations.
@@ -921,6 +940,10 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                     and mutated_arg is user.args[0]
                 ):
                     continue
+                # control_deps args[0] is an ordering-only deps tuple;
+                # appearing there does not constitute a real data use.
+                if _is_control_deps_ordering_only_use(user, view):
+                    continue
                 return True
         return False
 
@@ -1021,7 +1044,6 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
         return all(can_inplace(node, arg) for arg in mutated_args)
 
     def log_inplace_results(
-        old_node_name,
         node_name,
         old_tensors_to_clone,
         tensors_to_clone,
@@ -1051,16 +1073,12 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                 missed_bytes += bytes(node)
 
         log.info(
-            "Reinplace for %s (wrapped by %s): candidates=%s, successfully reinplaced=%s, "
-            "remain clones=%s, missed opportunities=%s, missed static bytes=%s.",
-            old_node_name,
+            "For node %s, attempted to reinplace %s. We were unable to reinplace %s; "
+            "%s (if non-empty) are possible missed reinplacing opportunities that may be bad for "
+            "memory usage and performance. Total size of missed opportunities with static shapes is"
+            " : %s bytes.",
             node_name,
             old_tensors_to_clone,
-            [
-                tensor_idx
-                for tensor_idx in old_tensors_to_clone
-                if tensor_idx not in tensors_to_clone
-            ],
             tensors_to_clone,
             missed_args,
             missed_bytes,
@@ -1072,7 +1090,7 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
     replace_dict: dict[torch.fx.Node, torch.fx.Node] = {}
 
     def reinplace_and_refine_tensors_to_clone(
-        old_tensors_to_clone, kwargs, node_name, old_node_name, trigger
+        old_tensors_to_clone, kwargs, node_name, trigger
     ):
         tensors_to_clone: list[str] = []
         storage_of_reinplaced_args = OrderedSet[int | None]()
@@ -1135,7 +1153,6 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                 tensors_to_clone.append(arg)
 
         log_inplace_results(
-            old_node_name,
             node_name,
             old_tensors_to_clone,
             tensors_to_clone,
@@ -1160,26 +1177,19 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
             _mutable_op = node.args[0]
             kwargs = node.kwargs
 
-            if isinstance(
-                _mutable_op, torch._ops.OpOverload
-            ) and torch._library.utils.is_out(_mutable_op):
-                # Out args are write-only, always safe to reinplace (no clones needed)
-                node.meta["only_clone_these_tensors"] = []
-            else:
-                all_bases = kwargs["_all_bases"]
-                bases_to_clone = range(len(all_bases))
-                base_tensors_dct = dict(enumerate(all_bases))
-                new_bases_to_clone: list[int] = reinplace_and_refine_tensors_to_clone(
-                    bases_to_clone,
-                    base_tensors_dct,
-                    node.name,
-                    _mutable_op._name,
-                    ReInplaceTrigger.AUTO_FUNC_V2,
-                )
-                # Stash the metadata. There is a pass later on where we decompose
-                # auto_functionalized into clones + a mutable op; this metadata
-                # tells the decomp to only clone the following inputs
-                node.meta["only_clone_these_tensors"] = new_bases_to_clone
+            all_bases = kwargs["_all_bases"]
+            bases_to_clone = range(len(all_bases))
+            base_tensors_dct = dict(enumerate(all_bases))
+            new_bases_to_clone: list[int] = reinplace_and_refine_tensors_to_clone(
+                bases_to_clone,
+                base_tensors_dct,
+                node.target,
+                ReInplaceTrigger.AUTO_FUNC_V2,
+            )
+            # Stash the metadata. There is a pass later on where we decompose
+            # auto_functionalized into clones + a mutable op; this metadata
+            # tells the decomp to only clone the following inputs
+            node.meta["only_clone_these_tensors"] = new_bases_to_clone
         elif node.target is torch.ops.higher_order.auto_functionalized:
             _mutable_op = node.args[0]
             from torch._higher_order_ops.auto_functionalize import get_mutable_args
@@ -1192,7 +1202,6 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
             tensors_to_clone = reinplace_and_refine_tensors_to_clone(
                 tensors_to_clone,
                 node.kwargs,
-                node.name,
                 _mutable_op._name,
                 ReInplaceTrigger.AUTO_FUNC_V1,
             )
@@ -1362,7 +1371,6 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
             tensors_to_clone = reinplace_and_refine_tensors_to_clone(
                 node.kwargs["tensors_to_clone"],
                 node.kwargs["kwargs"],
-                node.name,
                 kernel_name,
                 ReInplaceTrigger.TRITON_OPS,
             )
