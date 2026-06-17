@@ -11,11 +11,11 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
 
 import numpy as np
+from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
 import torch
 
 from . import cupti_python
-from .cupti_python import ActivityKind
 from .records import FIELD_REGISTRY, STRING_FIELDS, Sync
 
 

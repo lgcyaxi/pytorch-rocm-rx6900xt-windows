@@ -12,7 +12,7 @@ from typing import cast, TYPE_CHECKING
 if TYPE_CHECKING:
     import os
 
-from .cupti_python import (
+from cupti.cupti import (  # pyrefly: ignore[missing-import]
     Driver_api_trace_cbid,
     ExternalCorrelationKind,
     Runtime_api_trace_cbid,
