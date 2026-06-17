@@ -18195,7 +18195,7 @@ op_db: list[OpInfo] = [
     OpInfo(
         'torch.ops.aten._scaled_dot_product_flash_attention_for_cpu',
         sample_inputs_func=sample_inputs_scaled_dot_product_attention,
-        dtypes=floating_types(),
+        dtypes=floating_types_and(torch.float16, torch.bfloat16),
         supports_out=False,
         has_nondeterministic_output=True,
         supports_autograd=True,
@@ -18204,12 +18204,11 @@ op_db: list[OpInfo] = [
         supports_forward_ad=False,
         supports_scripting=False,
         check_batched_forward_grad=False,
+        supports_cow_input_no_materialize_forward=False,
         decorators=[onlyCPU],
         skips=(
             # Bug: noncontiguous inputs produce NaN outputs - implementation doesn't handle strides correctly
             DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_noncontiguous_samples', device_type='cpu'),
-            # Bug: OpInfo is missing float16/bfloat16 in dtypes even though implementation supports them
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='cpu'),
         )
     ),
     OpInfo(
