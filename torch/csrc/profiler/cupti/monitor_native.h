@@ -118,6 +118,13 @@ struct CuptiColumn {
   std::vector<uint8_t> bytes;
 };
 
+// A record layout's grouping key: its sorted (field_id, size) pairs. Records
+// sharing this key share an identical column layout, so they accumulate
+// together; a different key (a kind whose layout changed mid-session) groups
+// separately, keeping every group's columns length-aligned. Used only as a map
+// key -- never serialized -- so the sorted pairs are the key directly.
+using CuptiLayoutKey = std::vector<std::pair<int, size_t>>;
+
 // Native decode worker for the CUPTI monitor. Runs its own thread that pulls
 // completed buffers from CuptiMonitorBuffers, iterates their records with
 // CUPTI's own v2 record iterator (cuptiActivityGetNextRecord_v2, passed in as a
@@ -179,10 +186,10 @@ class TORCH_API CuptiMonitorDecoder {
   void decode_buffer(const CompletedCuptiBuffer& buf);
 
   std::mutex mutex_; // guards columns_
-  // kind -> layout-signature -> {field_id -> column}. Grouping by signature
-  // keeps records decoded against different layouts in separate, internally
+  // kind -> layout-key -> {field_id -> column}. Grouping by layout key keeps
+  // records decoded against different layouts in separate, internally
   // length-consistent groups (see drain()).
-  std::map<uint32_t, std::map<std::string, std::map<int, CuptiColumn>>>
+  std::map<uint32_t, std::map<CuptiLayoutKey, std::map<int, CuptiColumn>>>
       columns_;
   std::thread thread_;
   std::atomic<bool> running_{false};
