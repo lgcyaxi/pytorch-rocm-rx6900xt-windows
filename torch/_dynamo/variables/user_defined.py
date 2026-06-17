@@ -878,6 +878,18 @@ class UserDefinedClassVariable(UserDefinedVariable):
             f"bad operand type for abs(): '{self.python_type_name()}'",
         )
 
+    def nb_invert_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        m = self._maybe_get_baseclass_method("__invert__")
+        if m:
+            source = self.source and AttrSource(self.source, "__invert__")
+            return variables.UserMethodVariable(
+                m, self, source_fn=source
+            ).call_function(tx, [], {})
+        raise_type_error(
+            tx,
+            f"bad operand type for unary ~: '{self.python_type_name()}'",
+        )
+
     def mp_ass_subscript_impl(
         self,
         tx: "InstructionTranslatorBase",
@@ -1546,12 +1558,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
             return self.value.__name__
         return super().const_getattr(tx, name)
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, variables.UserDefinedClassVariable)
-            and self.value is other.value
-        )
-
     def reconstruct_pycode(self, codegen) -> str:
         if self.source:
             return self.source.reconstruct_pycode(codegen)
@@ -2018,6 +2024,31 @@ class UserDefinedObjectVariable(UserDefinedVariable):
             )
 
         return self.call_method(tx, "__abs__", [], {})
+
+    def nb_invert_impl(
+        self,
+        tx: "InstructionTranslatorBase",
+    ) -> VariableTracker:
+        # CPython: slot_nb_invert calls __invert__() via vectorcall_method.
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/typeobject.c#L9426
+
+        type_attr = self.lookup_class_mro_attr("__invert__")
+        if type_attr is NO_SUCH_SUBOBJ:
+            raise_type_error(
+                tx,
+                f"bad operand type for unary ~: '{self.python_type_name()}'",
+            )
+        if type_attr is None:
+            raise_type_error(tx, "'NoneType' object is not callable")
+
+        method = self._maybe_get_baseclass_method("__invert__")
+        if method is None:
+            raise_type_error(
+                tx,
+                f"bad operand type for unary ~: '{self.python_type_name()}'",
+            )
+
+        return self.call_method(tx, "__invert__", [], {})
 
     def torch_function_check(self) -> None:
         if not has_torch_function(self):
@@ -3836,18 +3867,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         return object_richcompare(self, tx, other, op)
 
-    def is_python_equal(self, other: object) -> bool:
-        if (
-            isinstance(other, VariableTracker)
-            and self.is_python_constant()
-            and other.is_python_constant()
-        ):
-            return self.as_python_constant() == other.as_python_constant()
-        # id check
-        if not isinstance(other, UserDefinedVariable):
-            return False
-        return self.value is other.value
-
     def call_tree_map_branch(
         self,
         tx: "InstructionTranslatorBase",
@@ -4107,18 +4126,6 @@ class FrozenDataClassVariable(UserDefinedObjectVariable):
             is_fake = is_fake or fake
             raw_hashes.append(RawHash(h))
         return hash(tuple(raw_hashes)), is_fake
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, FrozenDataClassVariable):
-            return False
-        if self.python_type() is not other.python_type():
-            return False
-        from dataclasses import fields as dc_fields
-
-        return all(
-            self._get_field_vt(f.name).is_python_equal(other._get_field_vt(f.name))
-            for f in dc_fields(self.value)  # type: ignore[arg-type]
-        )
 
 
 class SourcelessGraphModuleVariable(UserDefinedObjectVariable):
@@ -5047,13 +5054,6 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
             raise AssertionError("_base_vt must not be None in items")
         return self._base_vt.items  # pyrefly: ignore[missing-attribute]
 
-    def is_python_equal(self, other: object) -> bool:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in is_python_equal")
-        if isinstance(other, UserDefinedSetVariable):
-            other = other._base_vt
-        return self.as_python_constant() == other.as_python_constant()  # type: ignore[union-attr]
-
 
 class UserDefinedListVariable(UserDefinedObjectVariable):
     """
@@ -5279,12 +5279,6 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
             )
 
         return self._make_tree_map_result(new_items)
-
-    def is_python_equal(self, other: object) -> bool:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in is_python_equal")
-        other = other._base_vt if isinstance(other, UserDefinedTupleVariable) else other
-        return self._base_vt.is_python_equal(other)
 
 
 class NamedTupleVariable(UserDefinedTupleVariable):

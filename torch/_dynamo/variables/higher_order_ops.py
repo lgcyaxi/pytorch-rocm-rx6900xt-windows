@@ -2138,7 +2138,7 @@ def speculate_subgraph(
             # Register output to graph
             # Modeled off of compile_and_call_fx_graph
             # TODO: support pytree output
-            # We check always_restore because we dont use the output or side effects of always_restore code,
+            # We check always_restore because we don't use the output or side effects of always_restore code,
             # like bwd.
             if always_restore:
                 # Nothing left to do here
@@ -2359,12 +2359,6 @@ class TorchHigherOrderOperatorVariable(VariableTracker):
 
     def as_python_constant(self) -> HigherOrderOperator:
         return self.value
-
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
 
 
 class CustomFunctionHigherOrderOperatorVariable(TorchHigherOrderOperatorVariable):
@@ -4838,7 +4832,7 @@ class FlexAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
         ]
 
         # Store the invocation as a call
-        # Norm_kwargs contains the score_function and we dont want to proxy this because
+        # Norm_kwargs contains the score_function and we don't want to proxy this because
         # Proxying user defined functions is not supported.
         inp_args, _ = proxy_args_kwargs(proxied_args, {})
 

@@ -6836,6 +6836,11 @@ class TestTorch(TestCase):
             with self.assertRaisesRegex(expected_error, message):
                 check_fn(False, lambda: message)
 
+            # A plain string message (not wrapped in a callable) should be
+            # accepted and used directly as the error message.
+            with self.assertRaisesRegex(expected_error, 'plain string error text'):
+                check_fn(False, 'plain string error text')
+
             # Test message with tensor
             def message():
                 return torch.arange(4)
@@ -9270,6 +9275,7 @@ tensor([[[1.+1.j, 1.+1.j, 1.+1.j,  ..., 1.+1.j, 1.+1.j, 1.+1.j],
             torch.float8_e8m0fnu: "f8e8m0fnu",
             torch.float4_e2m1fn_x2: "f4e2m1fnx2",
             torch.complex32: "c32",
+            torch.bcomplex32: "bc32",
             torch.complex64: "c64",
             torch.complex128: "c128",
             torch.int8: "i8",
@@ -9299,7 +9305,7 @@ tensor([[[1.+1.j, 1.+1.j, 1.+1.j,  ..., 1.+1.j, 1.+1.j, 1.+1.j],
             torch.uint8, torch.uint16, torch.uint32, torch.uint64,
             torch.int8, torch.int16, torch.int32, torch.int64,
             torch.float16, torch.float32, torch.float64, torch.bfloat16,
-            torch.complex32, torch.complex64, torch.complex128,
+            torch.complex32, torch.bcomplex32, torch.complex64, torch.complex128,
             torch.bool,
             torch.float8_e5m2, torch.float8_e4m3fn,
             torch.float8_e5m2fnuz, torch.float8_e4m3fnuz,

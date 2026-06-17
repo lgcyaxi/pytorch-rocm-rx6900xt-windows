@@ -459,16 +459,6 @@ class ConstantVariable(VariableTracker):
         result = hasattr(self.value, name)
         return variables.ConstantVariable.create(result)
 
-    def is_python_equal(self, other: object) -> bool:
-        from .tensor import SymNodeVariable
-
-        if isinstance(other, SymNodeVariable):
-            return self.as_python_constant() == other.evaluate_expr()
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
     def get_id(self, tx: InstructionTranslatorBase) -> int | None:
         # Singletons have guaranteed stable identity across the process lifetime.
         if self.value is None or self.value is True or self.value is False:
@@ -862,6 +852,15 @@ class ConstantVariable(VariableTracker):
         except OverflowError as e:
             raise_observed_exception(OverflowError, tx, args=list(e.args))
 
+    def nb_invert_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        # int: https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L5163-L5177
+        #   long_invert implements ~x as -(x+1).
+        # bool inherits nb_invert from int via slot inheritance.
+        return ConstantVariable.create(~self.value)
+
 
 CONSTANT_VARIABLE_NONE = ConstantVariable(None)
 CONSTANT_VARIABLE_TRUE = ConstantVariable(True)
@@ -936,11 +935,6 @@ class FakeIdVariable(VariableTracker):
                 *graph_break_hints.SUPPORTABLE,
             ],
         )
-
-    def is_python_equal(self, other: object) -> bool:
-        if isinstance(other, (FakeIdVariable, ConstantVariable)):
-            return self.value == other.as_python_constant()
-        return False
 
     def reconstruct(self, codegen: Any) -> None:
         unimplemented(

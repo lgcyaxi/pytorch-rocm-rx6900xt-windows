@@ -1300,6 +1300,91 @@ class TestMPS(TestCaseMPS):
         result_cpu = torch.addmm(bias.cpu().conj(), a.cpu(), b.cpu())
         self.assertEqual(result_cpu, result_mps)
 
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @parametrize("case", [
+        ((1, 64, 12), "inner"),
+        ((12, 64, 1), "inner"),
+        ((8, 64, 12), "inner"),
+        ((8, 64, 12), "transposed"),
+        ((8, 64, 12), "outer"),
+        ((33, 17, 49), "inner"),
+        ((33, 17, 49), "transposed"),
+        ((33, 17, 49), "outer"),
+    ])
+    def test_mm_strided_output(self, case, dtype):
+        # Non-contiguous out= is mis-written by the MPSGraph matmul before macOS 26.4.
+        (M, K, N), layout = case
+        a = torch.randn(M, K, device="mps", dtype=dtype)
+        b = torch.randn(K, N, device="mps", dtype=dtype)
+        if layout == "transposed":
+            out = torch.empty(N, M, device="mps", dtype=dtype).t()
+        elif layout == "outer":
+            out = torch.empty(2 * M, N, device="mps", dtype=dtype)[::2]
+        else:
+            out = torch.empty(M, N, 2, device="mps", dtype=dtype)[..., 0]
+        self.assertFalse(out.is_contiguous())
+        torch.mm(a, b, out=out)
+        ref = torch.mm(a.cpu(), b.cpu())
+        tol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        self.assertEqual(out.cpu(), ref, atol=tol, rtol=tol)
+
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @parametrize("case", [
+        ((1, 64, 12), "inner"),
+        ((12, 64, 1), "inner"),
+        ((8, 64, 12), "inner"),
+        ((8, 64, 12), "transposed"),
+        ((8, 64, 12), "outer"),
+        ((33, 17, 49), "inner"),
+        ((33, 17, 49), "transposed"),
+        ((33, 17, 49), "outer"),
+    ])
+    def test_addmm_strided_output(self, case, dtype):
+        # addmm shares mm's strided-output fallback; same contract.
+        (M, K, N), layout = case
+        bias = torch.randn(M, N, device="mps", dtype=dtype)
+        a = torch.randn(M, K, device="mps", dtype=dtype)
+        b = torch.randn(K, N, device="mps", dtype=dtype)
+        if layout == "transposed":
+            out = torch.empty(N, M, device="mps", dtype=dtype).t()
+        elif layout == "outer":
+            out = torch.empty(2 * M, N, device="mps", dtype=dtype)[::2]
+        else:
+            out = torch.empty(M, N, 2, device="mps", dtype=dtype)[..., 0]
+        self.assertFalse(out.is_contiguous())
+        torch.addmm(bias, a, b, out=out)
+        ref = torch.addmm(bias.cpu(), a.cpu(), b.cpu())
+        tol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        self.assertEqual(out.cpu(), ref, atol=tol, rtol=tol)
+
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @parametrize("case", [
+        ((2, 2, 2, 2), "inner"),
+        ((2, 2, 2, 2), "transposed"),
+        ((2, 2, 2, 2), "outer"),
+        ((4, 8, 64, 12), "inner"),
+        ((4, 8, 64, 12), "transposed"),
+        ((4, 8, 64, 12), "outer"),
+        ((3, 33, 17, 49), "inner"),
+        ((3, 33, 17, 49), "transposed"),
+        ((3, 33, 17, 49), "outer"),
+    ])
+    def test_bmm_strided_output(self, case, dtype):
+        (B, M, K, N), layout = case
+        a = torch.randn(B, M, K, device="mps", dtype=dtype)
+        b = torch.randn(B, K, N, device="mps", dtype=dtype)
+        if layout == "transposed":
+            out = torch.empty(B, N, M, device="mps", dtype=dtype).transpose(-1, -2)
+        elif layout == "outer":
+            out = torch.empty(2 * B, M, N, device="mps", dtype=dtype)[::2]
+        else:
+            out = torch.empty(B, M, N, 2, device="mps", dtype=dtype)[..., 0]
+        self.assertFalse(out.is_contiguous())
+        torch.bmm(a, b, out=out)
+        ref = torch.bmm(a.cpu(), b.cpu())
+        tol = 1e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+        self.assertEqual(out.cpu(), ref, atol=tol, rtol=tol)
+
     @xfailIf(MACOS_VERSION < 15.0)
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_large_bmm(self, dtype):
@@ -3492,6 +3577,25 @@ class TestMPS(TestCaseMPS):
         helper(torch.not_equal)
         helper(torch.eq)
 
+    def test_cpu_scalar_storage_offset_binary(self):
+        # https://github.com/pytorch/pytorch/issues/187117
+        # CPU 0-dim view with storage_offset > 0 was ignored; the kernel read
+        # element 0 of the backing storage instead of the correct element.
+        cpu_vals = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0])
+        mps_tensor = torch.ones(3, device="mps")
+        for i in range(len(cpu_vals)):
+            scalar_cpu = cpu_vals[i]  # 0-dim view, storage_offset = i
+            self.assertEqual((mps_tensor + scalar_cpu).cpu(), torch.full((3,), 1.0 + i))
+            self.assertEqual((scalar_cpu + mps_tensor).cpu(), torch.full((3,), 1.0 + i))
+            self.assertEqual((mps_tensor * scalar_cpu).cpu(), torch.full((3,), float(i)))
+
+        # also verify with integer dtype
+        cpu_ints = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+        mps_ints = torch.ones(3, dtype=torch.int32, device="mps")
+        for i in range(len(cpu_ints)):
+            scalar_int = cpu_ints[i]
+            self.assertEqual((mps_ints + scalar_int).cpu(), torch.full((3,), 1 + (i + 1) * 10, dtype=torch.int32))
+
     def test_slice_contiguous_view(self):
         # https://github.com/pytorch/pytorch/issues/77750
 
@@ -5360,6 +5464,13 @@ class TestMPS(TestCaseMPS):
             ref = x.sum().item()
             for _ in range(4):
                 self.assertEqual(x.sum().item(), ref, msg=f"unstable sum for N={N}")
+
+    def test_sum_reduction_non_contiguous(self):
+        x = torch.randn(64, 96, dtype=torch.bfloat16, device="mps")
+        for dim, keepdim in itertools.product((0, -1), [False, True]):
+            kw = {"dim": dim, "keepdim": keepdim}
+            for cpu, mps in ((x.cpu(), x), (x.t().cpu(), x.t())):
+                self.assertEqual(mps.sum(**kw).cpu(), cpu.sum(**kw))
 
     def test_trace_repeated(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/178497

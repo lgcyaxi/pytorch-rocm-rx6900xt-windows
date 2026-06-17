@@ -57,10 +57,6 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.hpp>
 #endif
 
-#ifdef USE_C10D_NCCL
-#include <torch/csrc/distributed/c10d/symm_mem/nccl_ep.hpp>
-#endif
-
 #include <torch/csrc/distributed/c10d/comm.hpp>
 #include <torch/csrc/distributed/c10d/debug.h>
 #include <torch/csrc/distributed/c10d/logger.hpp>
@@ -1238,6 +1234,38 @@ Example:
           py::arg("peer_rank"),
           py::call_guard<py::gil_scoped_release>());
 
+  py::enum_<::c10d::HookOpName>(module, "HookOpName")
+      .value("SEND", ::c10d::HookOpName::SEND)
+      .value("RECV", ::c10d::HookOpName::RECV)
+      .value("BROADCAST", ::c10d::HookOpName::BROADCAST)
+      .value("ALLREDUCE", ::c10d::HookOpName::ALLREDUCE)
+      .value("REDUCE", ::c10d::HookOpName::REDUCE)
+      .value("ALLGATHER", ::c10d::HookOpName::ALLGATHER)
+      .value("REDUCE_SCATTER", ::c10d::HookOpName::REDUCE_SCATTER)
+      .value("ALLTOALL", ::c10d::HookOpName::ALLTOALL)
+      .value("BARRIER", ::c10d::HookOpName::BARRIER)
+      .value("SCATTER", ::c10d::HookOpName::SCATTER)
+      .value("GATHER", ::c10d::HookOpName::GATHER)
+      .value("SPLIT", ::c10d::HookOpName::SPLIT)
+      .value("NEW_WINDOW", ::c10d::HookOpName::NEW_WINDOW)
+      .value("UNKNOWN", ::c10d::HookOpName::UNKNOWN);
+
+  py::class_<::c10d::PreHookArgs>(module, "PreHookArgs")
+      .def(py::init<>())
+      .def_readwrite("name", &::c10d::PreHookArgs::name)
+      .def_readwrite("async_op", &::c10d::PreHookArgs::async_op)
+      .def_readwrite("input_tensors", &::c10d::PreHookArgs::input_tensors)
+      .def_readwrite("output_tensors", &::c10d::PreHookArgs::output_tensors)
+      .def_readwrite("root", &::c10d::PreHookArgs::root)
+      .def_readwrite("op_id", &::c10d::PreHookArgs::op_id);
+
+  py::class_<::c10d::PostHookArgs>(module, "PostHookArgs")
+      .def(py::init<>())
+      .def_readwrite("name", &::c10d::PostHookArgs::name)
+      .def_readwrite("async_op", &::c10d::PostHookArgs::async_op)
+      .def_readwrite("work", &::c10d::PostHookArgs::work)
+      .def_readwrite("op_id", &::c10d::PostHookArgs::op_id);
+
   py::class_<::c10d::DistributedBackendOptions>(
       module, "_DistributedBackendOptions")
       .def(py::init<>())
@@ -1452,53 +1480,6 @@ Example:
       py::arg("group_name"),
       py::arg("device"));
 #endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT
-
-  // nccl_ep.cu (which defines these symbols) is only compiled into torch_cuda
-  // for CUDA + NCCL distributed builds; guard the registration with the same
-  // condition so non-NCCL builds of libtorch_python don't reference undefined
-  // symbols (e.g. typeinfo for c10d::nccl_ep::NcclEpGroup).
-  using NcclEpGroup = ::c10d::nccl_ep::NcclEpGroup;
-  using NcclEpHandle = ::c10d::nccl_ep::NcclEpHandle;
-
-  py::class_<NcclEpGroup, c10::intrusive_ptr<NcclEpGroup>>(
-      module, "_NcclEpGroup")
-      .def_static(
-          "create",
-          &::c10d::nccl_ep::nccl_ep_create_group,
-          py::arg("pg"),
-          py::arg("num_experts"),
-          py::arg("max_dispatch_tokens_per_rank"),
-          py::arg("max_recv_tokens_per_rank"),
-          py::arg("max_token_bytes"));
-
-  py::class_<NcclEpHandle, c10::intrusive_ptr<NcclEpHandle>>(
-      module, "_NcclEpHandle")
-      .def_static(
-          "create",
-          &::c10d::nccl_ep::nccl_ep_create_handle,
-          py::arg("group"),
-          py::arg("topk_idx"),
-          py::arg("recv_expert_counter") = py::none())
-      .def(
-          "get_num_recv_tokens",
-          &::c10d::nccl_ep::nccl_ep_handle_get_num_recv_tokens);
-
-  module.def(
-      "_nccl_ep_dispatch",
-      &::c10d::nccl_ep::nccl_ep_dispatch,
-      py::arg("handle"),
-      py::arg("tokens"),
-      py::arg("topk_weights"),
-      py::arg("out_tokens"),
-      py::arg("out_topk_weights"),
-      py::arg("out_topk_idx"));
-
-  module.def(
-      "_nccl_ep_combine",
-      &::c10d::nccl_ep::nccl_ep_combine,
-      py::arg("handle"),
-      py::arg("expert_tokens"),
-      py::arg("out_tokens"));
 #endif // USE_C10D_NCCL
 
   auto store =
@@ -3093,6 +3074,36 @@ Arguments:
               py::arg("tensor") = std::nullopt,
               py::call_guard<py::gil_scoped_release>(),
               "Create a new one-sided communication window")
+          .def(
+              "register_abort_hook",
+              &::c10d::ProcessGroup::registerAbortHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register an abort hook, called before abort on timeout/error")
+          .def(
+              "unregister_abort_hook",
+              &::c10d::ProcessGroup::unregisterAbortHook,
+              py::arg("hook_id"))
+          .def(
+              "register_pre_hook",
+              &::c10d::ProcessGroup::registerPreHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register a pre-hook, called before each collective is issued")
+          .def(
+              "unregister_pre_hook",
+              &::c10d::ProcessGroup::unregisterPreHook,
+              py::arg("hook_id"))
+          .def(
+              "register_post_hook",
+              &::c10d::ProcessGroup::registerPostHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register a post-hook, called after each collective is issued")
+          .def(
+              "unregister_post_hook",
+              &::c10d::ProcessGroup::unregisterPostHook,
+              py::arg("hook_id"))
           .def("boxed", [](c10::intrusive_ptr<::c10d::ProcessGroup> self) {
             return torch::jit::toPyObject(c10::IValue(std::move(self)));
           })
@@ -3203,6 +3214,16 @@ Arguments:
               py::arg("tensor") = std::nullopt,
               py::call_guard<py::gil_scoped_release>(),
               "Create a new one-sided communication window")
+          .def(
+              "register_abort_hook",
+              &::c10d::Backend::registerAbortHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register an abort hook, called before abort on timeout/error")
+          .def(
+              "unregister_abort_hook",
+              &::c10d::Backend::unregisterAbortHook,
+              py::arg("hook_id"))
           .def(
               "broadcast",
               &::c10d::Backend::broadcast,
