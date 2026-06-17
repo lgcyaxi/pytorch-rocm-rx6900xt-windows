@@ -538,6 +538,7 @@ class HigherOrderOperator(OperatorBase, abc.ABC):
             return torch.overrides.handle_torch_function(
                 self, flat_args, *args, **kwargs
             )
+        del flat_args
 
         dispatch_key_set = _compute_keyset(args, kwargs, self.non_fallthrough_keys)
         return self.dispatch(dispatch_key_set.highestPriorityTypeId(), *args, **kwargs)
@@ -1281,6 +1282,9 @@ class OpOverloadPacket(Generic[_P, _T]):
     # TODO: use this to make a __dir__
     def overloads(self):
         return [n if n else "default" for n in self._overload_names]
+
+    def op_overloads(self):
+        return [getattr(self, n) for n in self.overloads()]
 
 
 # Note - this mirrors the logic of the cpp_function defined in jit/python/init.cpp
