@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -370,7 +370,7 @@ class CuptiMonitor:
                 f"loaded {cupti_python.find_cupti_library()}"
             )
         _cupti_monitor_native.configure_decoder(
-            self._subscriber, fn_addr, int(_FENCE_KIND), _FENCE_END_FIELD
+            cast(int, self._subscriber), fn_addr, int(_FENCE_KIND), _FENCE_END_FIELD
         )
         _cupti_monitor_native.start_decoder()
         # Background drain when flush_period_s >= 0 (0 = drain continuously, no wait);
@@ -482,9 +482,7 @@ class CuptiMonitor:
                 if _cupti_monitor_native.decoder_max_sync_ns() >= target:
                     break
                 if time.time() >= deadline:
-                    logger.warning(
-                        "CUPTI monitor flush(sync) did not reach its fence"
-                    )
+                    logger.warning("CUPTI monitor flush(sync) did not reach its fence")
                     break
                 time.sleep(0.005)
         finally:
@@ -677,7 +675,9 @@ class CuptiMonitor:
         if sub is None:
             return
         removed = [k for k in self._enabled if k not in target]
-        changed = [k for k in target if k in self._enabled and self._enabled[k] != target[k]]
+        changed = [
+            k for k in target if k in self._enabled and self._enabled[k] != target[k]
+        ]
         added = [k for k in target if k not in self._enabled]
         for kind in (*removed, *changed):
             self._cupti.activity_disable(sub, kind)
@@ -792,7 +792,9 @@ class CuptiMonitor:
         with self._lock:
             self._chains_gc_pending.append(external_id)
         if cupti_ok:
-            self._cupti.activity_pop_external_correlation_id(sub_handle=self._subscriber)
+            self._cupti.activity_pop_external_correlation_id(
+                sub_handle=self._subscriber
+            )
             _cupti_monitor_native.note_external_pop()  # keep the mirror in sync
         return external_id
 
@@ -932,9 +934,7 @@ class CuptiMonitor:
         for fid, (size, raw) in fields.items():
             if fid in str_fields and size == 8:
                 ptrs = np.frombuffer(raw, dtype="<u8")
-                cols[fid] = np.array(
-                    [_deref_cstr(int(p)) for p in ptrs], dtype=object
-                )
+                cols[fid] = np.array([_deref_cstr(int(p)) for p in ptrs], dtype=object)
             elif size in (1, 2, 4, 8):
                 # .copy() so the column is writable and owns its memory (the
                 # frombuffer view is read-only over the transient bytes), matching

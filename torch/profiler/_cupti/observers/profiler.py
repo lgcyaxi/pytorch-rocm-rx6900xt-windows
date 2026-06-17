@@ -248,9 +248,7 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         ext = [e for e in events if "start_ns" not in e]
         self._annotate_user_external_ids(ext)
         meta = (
-            self._monitor.take_external_metadata()
-            if self._monitor is not None
-            else {}
+            self._monitor.take_external_metadata() if self._monitor is not None else {}
         )
         with self._lock:
             self._events.extend(timed)
@@ -366,7 +364,9 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                             break
                     time.sleep(self._poll_interval_s)
                 with self._win_lock:
-                    sync = bool(self._boundaries)  # stalled -> fall back to a forced drain
+                    sync = bool(
+                        self._boundaries
+                    )  # stalled -> fall back to a forced drain
             self._stop_windowing(sync=sync)
         # Write every window whose output path was set. Writing happens here (and in
         # set_export) on the foreground -- never the poll thread -- so it stays inside

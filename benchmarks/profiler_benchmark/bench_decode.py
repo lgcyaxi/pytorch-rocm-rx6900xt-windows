@@ -45,7 +45,6 @@ import time
 from typing import Any
 
 import torch
-
 from torch.profiler._cupti.cupti_python import ActivityKind
 from torch.profiler._cupti.monitor import CuptiMonitorBuffer
 from torch.profiler._cupti.records import Kernel
@@ -225,7 +224,9 @@ def main() -> None:
     results: dict[str, Any] = {"roofline": {}, "strategy": {}, "selection": {}}
 
     if _HAS_NATIVE_BENCH:
-        print("(py = CuptiMonitorBuffer.decode numpy; nat = native CuptiMonitorDecoder)")
+        print(
+            "(py = CuptiMonitorBuffer.decode numpy; nat = native CuptiMonitorDecoder)"
+        )
     else:
         print("(native bench entry point absent in this torch build; py only)")
 
@@ -273,7 +274,9 @@ def main() -> None:
     for name, (layouts, cycle) in strategies.items():
         keep, addr, vs = _build_buffer(layouts, cycle, n)
         m = _time_decode(addr, vs, layouts, n, iters=args.iters, reps=args.reps)
-        nat = _time_native_decode(addr, vs, layouts, n, iters=args.iters, reps=args.reps)
+        nat = _time_native_decode(
+            addr, vs, layouts, n, iters=args.iters, reps=args.reps
+        )
         del keep
         _print_pair(name, m, nat)
         results["strategy"][name] = {"py": m, "native": nat}
@@ -284,7 +287,9 @@ def main() -> None:
         layouts = {_KERNEL: _layout(fids)}
         keep, addr, vs = _build_buffer(layouts, [_KERNEL], n)
         m = _time_decode(addr, vs, layouts, n, iters=args.iters, reps=args.reps)
-        nat = _time_native_decode(addr, vs, layouts, n, iters=args.iters, reps=args.reps)
+        nat = _time_native_decode(
+            addr, vs, layouts, n, iters=args.iters, reps=args.reps
+        )
         del keep
         _print_pair(name, m, nat)
         results["selection"][name] = {"py": m, "native": nat}

@@ -529,7 +529,9 @@ def _gpu_user_annotation_events(
     for event in trace_window_events:
         if event.get("kind") != "external_correlation":
             continue
-        external_id = _as_int(event.get("user_external_id", event.get("external_id", 0)))
+        external_id = _as_int(
+            event.get("user_external_id", event.get("external_id", 0))
+        )
         correlation_id = _as_int(event.get("correlation_id", 0))
         if external_id in user_annotations and correlation_id != 0:
             correlation_to_user_external[correlation_id] = external_id

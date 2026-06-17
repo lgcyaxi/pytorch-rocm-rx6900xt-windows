@@ -63,7 +63,28 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(
             FIELD_REGISTRY[kernel],
             frozenset(
-                {0, 4, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 31, 33, 45}
+                {
+                    0,
+                    4,
+                    7,
+                    8,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    22,
+                    24,
+                    31,
+                    33,
+                    45,
+                }
             ),
         )
         self.assertEqual(STRING_FIELDS[kernel], frozenset({24}))
@@ -315,7 +336,9 @@ class TestCuptiRecords(TestCase):
         ]
         blob = json.dumps({"func": "AllReduce", "count": 4096})
         _attach_metadata(timed, ext_events, {42: blob}, None)
-        self.assertEqual(json.loads(timed[0]["metadata"]), {"func": "AllReduce", "count": 4096})
+        self.assertEqual(
+            json.loads(timed[0]["metadata"]), {"func": "AllReduce", "count": 4096}
+        )
         self.assertNotIn("metadata", timed[1])  # external id has no blob
         self.assertNotIn("metadata", timed[2])  # no correlation -> external mapping
         # No metadata + no resolver is a no-op (the non-collective path pays nothing).
@@ -369,7 +392,6 @@ class TestCuptiRecords(TestCase):
         _, ext_meta = m.drain_decoded()
         self.assertEqual(set(ext_meta), {77})
         self.assertEqual(json.loads(ext_meta[77]), {"backend": "x", "extra": 1})
-
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
@@ -678,7 +700,6 @@ class TestCuptiMonitorCUDA(TestCase):
         self.assertEqual(set(spans), {""})
         self.assertGreater(len(spans[""]), 0)
 
-
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_small_buffer_chain_no_deadlock(self):
         # A tiny buffer maximizes buffer-completion churn: the decode worker runs
@@ -703,11 +724,15 @@ class TestCuptiMonitorCUDA(TestCase):
         m = CuptiMonitor(buffer_size=1024, flush_period_s=0.02)
         want = {
             ActivityKind.CONCURRENT_KERNEL: {
-                Kernel.START, Kernel.END, Kernel.CORRELATION_ID,
-                Kernel.GRAPH_NODE_ID, Kernel.NAME,
+                Kernel.START,
+                Kernel.END,
+                Kernel.CORRELATION_ID,
+                Kernel.GRAPH_NODE_ID,
+                Kernel.NAME,
             },
             ActivityKind.EXTERNAL_CORRELATION: {
-                ExternalCorrelation.EXTERNAL_ID, ExternalCorrelation.CORRELATION_ID,
+                ExternalCorrelation.EXTERNAL_ID,
+                ExternalCorrelation.CORRELATION_ID,
             },
             ActivityKind.RUNTIME: {Api.CORRELATION_ID},
             ActivityKind.DRIVER: {Api.CORRELATION_ID},
@@ -738,6 +763,7 @@ class TestCuptiMonitorCUDA(TestCase):
 
         self.assertGreater(counts.get(int(ActivityKind.CONCURRENT_KERNEL), 0), 0)
         self.assertGreater(stats["buffers_completed"], 0)
+
 
 class TestWindowFinalizer(TestCase):
     """Cover-and-finalize loop of WindowFinalizerMixin -- pure Python, no CUDA/CUPTI.
