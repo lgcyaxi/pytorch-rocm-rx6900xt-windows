@@ -241,6 +241,9 @@ class ConstantVariable(VariableTracker):
 
         return python_constant_richcompare_impl(self, tx, other, op)
 
+    def str_impl(self, tx: InstructionTranslatorBase) -> VariableTracker:
+        return ConstantVariable.create(str(self.value))
+
     def len_impl(self, tx: InstructionTranslatorBase) -> VariableTracker:
         """Generic len for any constant value (sequence or mapping)."""
         try:
@@ -456,16 +459,6 @@ class ConstantVariable(VariableTracker):
         result = hasattr(self.value, name)
         return variables.ConstantVariable.create(result)
 
-    def is_python_equal(self, other: object) -> bool:
-        from .tensor import SymNodeVariable
-
-        if isinstance(other, SymNodeVariable):
-            return self.as_python_constant() == other.evaluate_expr()
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
     def get_id(self, tx: InstructionTranslatorBase) -> int | None:
         # Singletons have guaranteed stable identity across the process lifetime.
         if self.value is None or self.value is True or self.value is False:
@@ -562,6 +555,91 @@ class ConstantVariable(VariableTracker):
         return self._nb_binary_impl(
             tx, other, operator.rshift, type_implements_nb_rshift, reverse
         )
+
+    def nb_floor_divide_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int and float define nb_floor_divide; bool inherits int's.
+        # complex does NOT (complex floor division raises TypeError).
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L4057 (long_floor_div)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c#L660 (float_floor_div)
+        if not isinstance(self.value, (int, float)):
+            return ConstantVariable.create(NotImplemented)
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = self_.as_python_constant(), other_.as_python_constant()
+        try:
+            return VariableTracker.build(tx, v // w)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def nb_true_divide_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int, float, and complex define nb_true_divide; bool inherits int's.
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L4146 (long_true_divide)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c#L618 (float_div)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/complexobject.c#L518 (complex_div)
+        if not isinstance(self.value, (int, float, complex)):
+            return ConstantVariable.create(NotImplemented)
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = self_.as_python_constant(), other_.as_python_constant()
+        try:
+            return VariableTracker.build(tx, v / w)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def nb_remainder_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int and float define nb_remainder (bool inherits int's); complex
+        # does NOT. str/bytes/bytearray define nb_remainder for %-formatting.
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L4116 (long_mod)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c#L640 (float_rem)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/unicodeobject.c#L15170 (unicode_mod)
+        if not isinstance(self.value, (int, float, str, bytes, bytearray)):
+            return ConstantVariable.create(NotImplemented)
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = self_.as_python_constant(), other_.as_python_constant()
+        try:
+            return VariableTracker.build(tx, v % w)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def nb_divmod_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int and float define nb_divmod (bool inherits int's); complex
+        # does NOT. Returns a (quotient, remainder) tuple.
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L4126 (long_divmod)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c#L680 (float_divmod)
+        if not isinstance(self.value, (int, float)):
+            return ConstantVariable.create(NotImplemented)
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = self_.as_python_constant(), other_.as_python_constant()
+        try:
+            return VariableTracker.build(tx, divmod(v, w))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
 
     def nb_or_impl(
         self,
@@ -710,6 +788,55 @@ class ConstantVariable(VariableTracker):
             tx, other, operator.add, type_implements_nb_add, reverse
         )
 
+    def nb_power_impl(
+        self,
+        tx: Any,
+        other: VariableTracker,
+        z: VariableTracker | None,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        # CPython: int, float, and complex all define nb_power (bool inherits int's).
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c (long_pow)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c (float_pow)
+        # https://github.com/python/cpython/blob/v3.13.0/Objects/complexobject.c (complex_pow)
+
+        if z is not None:
+            z = z.as_python_constant()
+
+        if not other.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+
+        self_, other_ = (other, self) if reverse else (self, other)
+        v, w = (
+            self_.as_python_constant(),
+            other_.as_python_constant(),
+        )
+
+        try:
+            return VariableTracker.build(tx, pow(v, w, z))
+        except TypeError:
+            return ConstantVariable.create(NotImplemented)
+        except (ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def nb_power_z_impl(
+        self,
+        tx: Any,
+        v: VariableTracker,
+        w: VariableTracker,
+    ) -> VariableTracker:
+        if not isinstance(self.value, int):
+            return ConstantVariable.create(NotImplemented)
+        if not v.is_python_constant() or not w.is_python_constant():
+            return ConstantVariable.create(NotImplemented)
+        v_val, w_val = v.as_python_constant(), w.as_python_constant()
+        if not isinstance(v_val, int) or not isinstance(w_val, int):
+            return ConstantVariable.create(NotImplemented)
+        try:
+            return VariableTracker.build(tx, pow(v_val, w_val, self.value))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
     def nb_absolute_impl(
         self,
         tx: Any,
@@ -724,6 +851,15 @@ class ConstantVariable(VariableTracker):
             return ConstantVariable.create(abs(self.value))
         except OverflowError as e:
             raise_observed_exception(OverflowError, tx, args=list(e.args))
+
+    def nb_invert_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        # int: https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L5163-L5177
+        #   long_invert implements ~x as -(x+1).
+        # bool inherits nb_invert from int via slot inheritance.
+        return ConstantVariable.create(~self.value)
 
 
 CONSTANT_VARIABLE_NONE = ConstantVariable(None)
@@ -799,11 +935,6 @@ class FakeIdVariable(VariableTracker):
                 *graph_break_hints.SUPPORTABLE,
             ],
         )
-
-    def is_python_equal(self, other: object) -> bool:
-        if isinstance(other, (FakeIdVariable, ConstantVariable)):
-            return self.value == other.as_python_constant()
-        return False
 
     def reconstruct(self, codegen: Any) -> None:
         unimplemented(
