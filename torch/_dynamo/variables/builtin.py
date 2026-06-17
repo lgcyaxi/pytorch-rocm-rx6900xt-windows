@@ -114,6 +114,7 @@ from .object_protocol import (
     generic_getiter,
     generic_inplace_multiply,
     generic_int,
+    generic_invert,
     generic_len,
     generic_multiply,
     generic_neg,
@@ -392,11 +393,6 @@ class BaseBuiltinVariable(VariableTracker):
         from .object_protocol import python_constant_richcompare_impl
 
         return python_constant_richcompare_impl(self, tx, other, op)
-
-    def is_python_equal(self, other: object) -> bool:
-        return isinstance(other, BaseBuiltinVariable) and (
-            self.as_python_constant() is other.as_python_constant()  # type: ignore[union-attr]
-        )
 
     def call_method(
         self,
@@ -1588,6 +1584,14 @@ class BuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        if self.fn is object and not args and not kwargs:
+            # object() -> a fresh opaque instance, wrapped as ObjectVariable to
+            # match how SourcelessBuilder wraps bare `object` instances. Falling
+            # through to the constant handler cannot build a VT from object().
+            from .builder import SourcelessBuilder
+
+            return SourcelessBuilder.create(tx, object())
+
         key: tuple[object, ...]
         if kwargs:
             kwargs = {k: v.realize() for k, v in kwargs.items()}
@@ -1737,6 +1741,11 @@ class BuiltinVariable(BaseBuiltinVariable):
             # type.__abs__(instance) → abs(instance)
             # e.g., int.__abs__(-4) → abs(-4)
             return generic_abs(tx, args[0])
+
+        if name == "__invert__" and len(args) == 1 and not kwargs:
+            # type.__invert__(instance) → ~instance
+            # e.g., int.__invert__(4) → ~4
+            return generic_invert(tx, args[0])
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -2565,6 +2574,11 @@ class BuiltinVariable(BaseBuiltinVariable):
     ) -> VariableTracker:
         return generic_neg(tx, a)
 
+    def call_invert(
+        self, tx: "InstructionTranslatorBase", a: VariableTracker
+    ) -> VariableTracker:
+        return generic_invert(tx, a)
+
     def call_format(
         self,
         tx: "InstructionTranslatorBase",
@@ -2871,9 +2885,6 @@ class BuiltinVariable(BaseBuiltinVariable):
         from .object_protocol import generic_contains
 
         return generic_contains(tx, a, b)
-
-    def is_python_equal(self, other: object) -> bool:
-        return isinstance(other, variables.BuiltinVariable) and self.fn is other.fn
 
 
 class DictBuiltinVariable(BaseBuiltinVariable):
@@ -3297,7 +3308,7 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
             try:
                 return obj.var_getattr(tx, name)
             except AsPythonConstantNotImplementedError:
-                # dont fallback on as_python_constant error because this leads
+                # don't fallback on as_python_constant error because this leads
                 # to a failure later on, and leads to a wrong stacktrace
                 raise
             except NotImplementedError:

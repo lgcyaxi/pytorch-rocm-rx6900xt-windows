@@ -761,9 +761,15 @@ class DelayGraphBreakVariable(UnknownVariable):
     Used to insert a dummy variable in the stack to do the graph break at CALL_FUNCTION.
     """
 
-    def __init__(self, msg: str | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        msg: str | None = None,
+        hints: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self.msg = msg
+        self.hints = hints or []
 
     def call_function(
         self,
@@ -777,7 +783,7 @@ class DelayGraphBreakVariable(UnknownVariable):
             context=f"source: {self.source}",
             explanation="Dynamo determined that a graph break should occur "
             f"when calling `{name}`. Reason: {self.msg}",
-            hints=[],
+            hints=self.hints,
         )
 
 
@@ -1719,12 +1725,6 @@ class TypingVariable(VariableTracker):
         #
         codegen.append_output(codegen.create_load_const(self.value))
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
 
 @functools.lru_cache(maxsize=1)
 def get_np_to_tnp_map() -> dict[types.BuiltinFunctionType, types.FunctionType]:
@@ -1940,12 +1940,6 @@ class NumpyVariable(VariableTracker):
 
         return super().as_proxy()
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
 
 # Used to keep track of NULLs pushed on the stack for Python 3.11 function calls
 class NullVariable(VariableTracker):
@@ -2076,6 +2070,13 @@ class ObjectVariable(VariableTracker):
 
     def python_type(self) -> type[object]:
         return object
+
+    def richcompare_impl(
+        self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
+    ) -> "VariableTracker":
+        from .object_protocol import object_richcompare
+
+        return object_richcompare(self, tx, other, op)
 
 
 class DebuggingVariable(VariableTracker):
@@ -2626,11 +2627,11 @@ class WeakRefVariable(VariableTracker):
     def richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
-        from .object_protocol import object_richcompare
+        from .object_protocol import generic_richcompare
 
-        return object_richcompare(self, tx, other, op)
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, WeakRefVariable):
-            return False
-        return self.referent_vt.is_python_equal(other.referent_vt)
+        # Weak references only support equality, not ordering. Two weak references
+        # are equal if the underlying objects are equal. If the underlying object has
+        # gone away, they are equal if they are identical.
+        if op not in ("__eq__", "__ne__") or not isinstance(other, WeakRefVariable):
+            return ConstantVariable.create(NotImplemented)
+        return generic_richcompare(tx, self.referent_vt, other.referent_vt, op)
