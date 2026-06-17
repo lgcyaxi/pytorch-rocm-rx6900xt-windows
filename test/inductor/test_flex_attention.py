@@ -74,7 +74,9 @@ from torch.testing._internal.common_device_type import (
 from torch.testing._internal.common_quantized import _snr
 from torch.testing._internal.common_utils import (  # noqa: F401
     IS_LINUX,
+    isRocmArchAnyOf,
     MI200_ARCH,
+    serialTest,
     skipIfRocm,
     skipIfRocmArch,
     TEST_WITH_ROCM,
@@ -2845,7 +2847,6 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     @dtypes(*device_configs["cpu"].dtypes)
     @dtypesIfCUDA(*device_configs["cuda"].dtypes)
     @dtypesIfXPU(*device_configs["xpu"].dtypes)
-    @common_utils.skipIfRocmArch(common_utils.MI200_ARCH)
     @expected_not_implemented_on_mps
     def test_autocast(self, device, dtype):
         """Test torch autocast functionality"""
@@ -2853,10 +2854,18 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         k = torch.randn(1, 1, 1024, 64, device=device, dtype=dtype)
         v = torch.randn(1, 1, 1024, 64, device=device, dtype=dtype)
 
+        atol = 1e-3
+        rtol = 1e-3
+
+        if isRocmArchAnyOf(MI200_ARCH) and dtype == torch.float16:
+            # this behavior matches known subnormal (denormal) handling on MI200 for float16
+            atol = 0.002
+            rtol = 0.41  # relative difference can become large at small tensor values
+
         with torch.autocast(dtype=torch.float16, enabled=True, device_type=device):
             sdpa_output = torch.nn.functional.scaled_dot_product_attention(q, k, v)
             flex_output = flex_attention(q, k, v)
-            torch.testing.assert_close(sdpa_output, flex_output, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(sdpa_output, flex_output, atol=atol, rtol=rtol)
             self.assertEqual(flex_output.dtype, torch.float16)
 
     @supported_platform
@@ -3983,6 +3992,29 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             v_grad, v_grad2, atol=tolerance.atol, rtol=tolerance.rtol
         )
 
+    @supported_platform
+    @skip_on_cpu
+    @expected_not_implemented_on_mps
+    def test_score_mod_without_score_gradient_errors(self, device):
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        dtype = torch.float16 if torch.device(device).type == "cuda" else torch.float32
+        make_tensor = functools.partial(
+            torch.randn,
+            (1, 1, 128, 16),
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        q, k, v = make_tensor(), make_tensor(), make_tensor()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "flex_attention backward requires the output of score_mod to depend on score",
+        ):
+            torch.compile(flex_attention, dynamic=False)(q, k, v, score_mod=score_mod)
+
     # Use weird mask to test reusing block_mask does work well.
     @supported_platform
     @skip_on_cpu
@@ -4691,6 +4723,102 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
         self.assertEqual(decode_out.shape, (1, 2, 64, 64))
         torch.testing.assert_close(default_out, decode_out, atol=3e-3, rtol=3e-3)
+
+    def test_unbacked_flex_decoding_eligibility_falls_back(self, device):
+        from torch._inductor.kernel.flex.flex_decoding import _use_flex_decoding
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        class FakeBuffer:
+            def __init__(self, size):
+                self.size = size
+
+            def get_size(self):
+                return self.size
+
+        shape_env = ShapeEnv()
+        seq_len = shape_env.create_unbacked_symint().node.expr
+        shape_env.var_to_hint_override[seq_len] = 64
+        graph = mock.Mock(sizevars=SizeVarAllocator(shape_env))
+
+        with V.set_graph_handler(graph):
+            self.assertFalse(
+                _use_flex_decoding(
+                    FakeBuffer([1, 2, seq_len, 64]),
+                    FakeBuffer([1, 1, 1, 1]),
+                    FakeBuffer([1, 2, seq_len, 64]),
+                    {},
+                    False,
+                )
+            )
+
+    def test_backward_fake_symbolic_query_key_batch_metadata(self, device):
+        from torch._dynamo.source import LocalSource
+        from torch._higher_order_ops.flex_attention import (
+            flex_attention_backward_fake_tensor_mode,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        shape_env = ShapeEnv()
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=shape_env)
+
+        def fakeify(t, name, shape_id=None):
+            dynamic_sizes = [DimDynamic.STATIC] * t.dim()
+            shape_ids = {}
+            if shape_id is not None:
+                dynamic_sizes[0] = DimDynamic.UNBACKED
+                shape_ids[0] = shape_id
+            return fake_mode.from_tensor(
+                t,
+                source=LocalSource(name, is_input=True),
+                symbolic_context=StatelessSymbolicContext(
+                    dynamic_sizes=dynamic_sizes,
+                    shape_ids=shape_ids,
+                ),
+            )
+
+        B, H, S, D = 4, 2, 8, 16
+
+        def run(query, key, value, out, logsumexp, grad_out, grad_logsumexp):
+            with fake_mode:
+                _, grad_key, grad_value, _ = flex_attention_backward_fake_tensor_mode(
+                    query,
+                    key,
+                    value,
+                    out,
+                    logsumexp,
+                    grad_out,
+                    grad_logsumexp,
+                    None,
+                    None,
+                    (),
+                    1.0,
+                    {},
+                )
+            return grad_key, grad_value
+
+        query = fakeify(torch.empty(B, H, S, D, device=device), "query", "batch")
+        key = fakeify(torch.empty(B, H, S, D, device=device), "key", "batch")
+        value = fakeify(torch.empty(B, H, S, D, device=device), "value", "batch")
+        out = fakeify(torch.empty(B, H, S, D, device=device), "out", "batch")
+        grad_out = fakeify(torch.empty(B, H, S, D, device=device), "grad_out", "batch")
+        logsumexp = fakeify(torch.empty(B, H, S, device=device), "logsumexp", "batch")
+        grad_logsumexp = fakeify(
+            torch.empty(B, H, S, device=device), "grad_logsumexp", "batch"
+        )
+
+        grad_key, grad_value = run(
+            query, key, value, out, logsumexp, grad_out, grad_logsumexp
+        )
+
+        self.assertEqual(grad_key.shape, key.shape)
+        self.assertEqual(grad_value.shape, value.shape)
 
     @supported_platform
     @skip_on_cpu
@@ -5701,6 +5829,76 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(compiled_buffer_grads, ref_buffer_grads)
 
     @supported_platform
+    @skip_on_cpu
+    @expected_not_implemented_on_mps  # backward Triton lowering
+    def test_direct_backward_inductor_supports_scalar_score_mod_buffers(self, device):
+        def score_mod(score, b, h, m, n, head_dim):
+            # Explicit HOP captures are recorded in subgraph_inps even when the
+            # score graph does not use them.
+            return score
+
+        def mask_mod(b, h, m, n):
+            return m >= n
+
+        block_mask = create_block_mask(
+            mask_mod,
+            B=2,
+            H=2,
+            Q_LEN=128,
+            KV_LEN=128,
+            device=device,
+        )
+        scale = 1.0 / 16**0.5
+        dtype = torch.float32
+        q = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
+        k = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
+        v = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
+        backward_grad = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
+        static_head_dim = q.shape[-1]
+
+        out, logsumexp = flex_attention_fwd(
+            q,
+            k,
+            v,
+            _identity,
+            block_mask,
+            scale,
+        )
+
+        @torch.compile(fullgraph=True)
+        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
+            return torch.ops.higher_order.flex_attention_backward(
+                query,
+                key,
+                value,
+                fwd_out,
+                lse,
+                grad_out,
+                None,
+                score_mod,
+                None,
+                block_mask.as_tuple(),
+                scale,
+                {"BACKEND": "TRITON"},
+                (static_head_dim,),
+                (),
+            )
+
+        with torch.no_grad():
+            dq, dk, dv, _ = compiled_bw(
+                q,
+                k,
+                v,
+                out.detach(),
+                logsumexp.detach(),
+                backward_grad,
+            )
+
+        self.assertEqual(dq.shape, q.shape)
+        self.assertEqual(dk.shape, k.shape)
+        self.assertEqual(dv.shape, v.shape)
+
+    @supported_platform
     def test_tensor_subclass_dispatch_order(self, device):
         """Test that tensor subclasses get proper dispatch priority over modes.
 
@@ -6586,6 +6784,65 @@ class GraphModule(torch.nn.Module):
             "get_stride_and_maybe_freeze_layout should be called with FlexibleLayout nodes",
         )
 
+    @unittest.skip(
+        "Too large to run reliably in CI. Kept as a manual repro for #185262"
+    )
+    @supported_platform
+    @skip_on_cpu
+    @largeTensorTest("12GB", inductor=True)
+    @serialTest()
+    def test_large_kv_int64_pointer_math(self, device):
+        # Regression test for #185262: load_checked_2d (and a few inline
+        # pointer-arithmetic sites in the backwards template) computed
+        # `offs * stride` in int32 even when Inductor had already promoted
+        # INDEX_DTYPE to int64 because some input buffer exceeded 2**31
+        # elements. The product silently overflowed and caused an IMA.
+        #
+        # We construct K/V so that (a) each tensor's storage exceeds 2**31
+        # elements (so Inductor uses int64 indexing), and (b) the last KV
+        # index times its KV-dim stride also exceeds 2**31 (so the
+        # in-kernel pointer math would overflow without the .to(INDEX_DTYPE)
+        # cast). Without the fix this raises a CUDA illegal memory access.
+        H, D = 1, 128
+        KV_S = 2**24 + 1024
+        Q_S = 128
+        dtype = torch.bfloat16
+
+        q = torch.randn(1, H, Q_S, D, device=device, dtype=dtype)
+        k = torch.randn(1, H, KV_S, D, device=device, dtype=dtype)
+        v = torch.randn(1, H, KV_S, D, device=device, dtype=dtype)
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx >= (KV_S - tail)
+
+        BLOCK = _DEFAULT_SPARSE_BLOCK_SIZE
+        tail = BLOCK
+        last_kv_block = KV_S // BLOCK - 1
+        kv_num_blocks = torch.ones(1, 1, 1, dtype=torch.int32, device=device)
+        kv_indices = torch.full(
+            (1, 1, 1, 1), last_kv_block, dtype=torch.int32, device=device
+        )
+        block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks,
+            kv_indices,
+            BLOCK_SIZE=BLOCK,
+            mask_mod=mask_mod,
+            seq_lengths=(Q_S, KV_S),
+        )
+
+        compiled = torch.compile(flex_attention, fullgraph=True)
+        out = compiled(q, k, v, block_mask=block_mask)
+
+        # Reference: only the last `tail` KV positions are unmasked.
+        k_tail = k[:, :, -tail:, :].to(torch.float32)
+        v_tail = v[:, :, -tail:, :].to(torch.float32)
+        q_f32 = q.to(torch.float32)
+        scale = D**-0.5
+        scores = (q_f32 @ k_tail.transpose(-1, -2)) * scale
+        ref = (torch.softmax(scores, dim=-1) @ v_tail).to(dtype)
+
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
 
 class TestBlockMask(InductorTestCase):
     def setUp(self):
@@ -7264,11 +7521,11 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
 
         block_mask = create_block_mask(mask_mod, None, None, 1024, 1024, device=device)
         flex_attention_call(*create_inputs(1024), block_mask=block_mask)
-        with self.assertRaisesRegex(ValueError, "block_mask was created for"):
+        with self.assertRaisesRegex(RuntimeError, "block_mask was created for"):
             flex_attention_call(*create_inputs(2048), block_mask=block_mask)
 
         block_mask = create_block_mask(mask_mod, None, None, 1023, 1023, device=device)
-        with self.assertRaisesRegex(ValueError, "block_mask was created for"):
+        with self.assertRaisesRegex(RuntimeError, "block_mask was created for"):
             flex_attention_call(*create_inputs(1024), block_mask=block_mask)
 
     @supported_platform
