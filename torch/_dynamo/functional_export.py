@@ -7,6 +7,7 @@ import traceback
 import types
 from collections import namedtuple
 from contextlib import nullcontext
+from itertools import zip_longest
 from typing import Any, cast, TYPE_CHECKING, TypeVar
 
 import sympy
@@ -949,8 +950,7 @@ def _walk_spec(
                 f"sequence length {len(arg_value)}"
             )
         out: list[IntermediateSpec | None] = []
-        for i, value in enumerate(arg_value):
-            sub_spec = entries[i] if i < len(entries) else None
+        for i, (value, sub_spec) in enumerate(zip_longest(arg_value, entries)):
             out += _walk_spec(sub_spec, value, where=f"{where}[{i}]")
         return out
 
@@ -962,9 +962,9 @@ def _walk_spec(
         unmatched = set(user_spec) - set(arg_value)
         if unmatched:
             raise ValueError(
-                f"{where}: DictSpec has entries {sorted(unmatched)!r} "
+                f"{where}: DictSpec has entries {sorted(unmatched, key=repr)!r} "
                 f"that do not match any key in the runtime dict. "
-                f"Runtime keys: {sorted(arg_value.keys())!r}"
+                f"Runtime keys: {sorted(arg_value.keys(), key=repr)!r}"
             )
         # Walk runtime ordering so positions align with pytree.tree_flatten
         # (insertion order for plain dicts).
@@ -1016,14 +1016,13 @@ def _walk_spec(
         for key_entry, child in key_children:
             # Only ``GetAttrKey`` entries can match an ObjectSpec entry; any
             # other key shape contributes a static subtree.
-            if isinstance(key_entry, pytree.GetAttrKey) and key_entry.name in user_spec:
-                out += _walk_spec(
-                    user_spec._fields[key_entry.name],
-                    child,
-                    where=f"{where}.{key_entry.name}",
-                )
-            else:
-                out += [None] * len(pytree.tree_leaves(child))
+            spec = None
+            sub_where = where
+            if isinstance(key_entry, pytree.GetAttrKey):
+                sub_where = f"{where}.{key_entry.name}"
+                if key_entry.name in user_spec:
+                    spec = user_spec._fields[key_entry.name]
+            out += _walk_spec(spec, child, where=sub_where)
         return out
 
     # Leaf spec — a single flat slot. Type-check against the runtime value.
@@ -1064,9 +1063,6 @@ def _flatten_shapes_spec(
     inputs flattened — so every source dynamo tracks is rooted at a
     positional ``flat_args[i]``. The user wrote their spec against the
     original parameter names, so we rewrite it to target ``flat_args``.
-
-    Limitations (v0): container specs (DictSpec / SeqSpec / ObjectSpec) on
-    any arg/kwarg slot are rejected inline with NotImplementedError.
     """
     params_spec = shapes_spec._params
     kwargs = kwargs or {}
