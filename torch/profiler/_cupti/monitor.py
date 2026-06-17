@@ -265,6 +265,7 @@ class CuptiMonitor:
         self._cupti = cupti_python.pylibcupti()
         # The CUPTI subscriber handle.
         self._subscriber: int | None = None
+        self._latency_enabled = False
         # Layout state -- a function of registration, recomputed only when the
         # The fields enabled per kind on the subscriber (a function of the observer
         # field union, recomputed only on register/deregister, never per buffer). The
@@ -662,6 +663,13 @@ class CuptiMonitor:
         if target != self._enabled:
             self._reconfigure(target)
             self._enabled = target
+        # queued/submitted need the per-subscriber latency-timestamp attribute. Enable
+        # it once, iff an observer selected the QUEUED kernel field (25) -- so the
+        # always-on timing path pays no latency-tracking overhead.
+        if self._subscriber is not None and not self._latency_enabled:
+            if 25 in target.get(int(ActivityKind.CONCURRENT_KERNEL), frozenset()):
+                self._cupti.enable_kernel_latency_timestamps(self._subscriber, True)
+                self._latency_enabled = True
 
     def _reconfigure(self, target: dict[int, frozenset[int]]) -> None:
         # Reconcile the per-field selection to ``target`` with a minimal diff: only

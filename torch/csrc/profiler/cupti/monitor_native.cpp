@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+
+#include <fmt/format.h>
 
 namespace torch::profiler::impl {
 
@@ -44,15 +47,13 @@ std::string layoutSignature(const CuptiRecordLayout& layout) {
   for (const auto& f : layout.fields) {
     fields.emplace_back(f.field_id, f.size);
   }
-  std::sort(fields.begin(), fields.end());
-  std::string sig;
+  std::ranges::sort(fields);
+  fmt::memory_buffer buf;
+  auto out = std::back_inserter(buf);
   for (const auto& [fid, size] : fields) {
-    sig += std::to_string(fid);
-    sig += ':';
-    sig += std::to_string(size);
-    sig += ',';
+    fmt::format_to(out, "{}:{},", fid, size);
   }
-  return sig;
+  return fmt::to_string(buf);
 }
 
 } // namespace

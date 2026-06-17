@@ -84,6 +84,9 @@ class TestCuptiRecords(TestCase):
                     31,
                     33,
                     45,
+                    25,
+                    35,
+                    36,
                 }
             ),
         )

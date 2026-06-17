@@ -830,6 +830,277 @@ _cupti_monitor.enable_hes_early()
         )
         self.assertIn("OK", p.stdout)
 
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    def test_cupti_monitor_kineto_parity(self):
+        # In a FRESH process (clean CUPTI), profile a couple of representative models
+        # under stock (Kineto) and then the cupti_monitor backend, eager AND graphed,
+        # and assert the aten-op set + kernel-name multiset are identical between the
+        # two backends -- the monitor must observe the same ops/kernels Kineto does.
+        # Stock runs first; cuptiFinalize() then releases CUPTI so the monitor can
+        # subscribe. The child inherits this process's libcupti via the environment.
+        import subprocess
+
+        script = textwrap.dedent(
+            """
+            import gzip, json, os, tempfile
+            import torch, torch.nn as nn
+            from torch.profiler import profile, ProfilerActivity
+            from torch._C._profiler import _ExperimentalConfig
+
+            # HES (hardware events) must be armed before any CUDA context exists; the
+            # monitor must still produce kernel metadata identical to Kineto with it on.
+            # Arm it first thing and assert no context exists yet -- a failure here means
+            # the harness created a context too early (a test bug), distinct from HES
+            # being unsupported on the platform (is_hes_enabled stays False -> SKIP_HES).
+            HES = os.environ.get("PARITY_HES") == "1"
+            if HES:
+                assert not torch.cuda.is_initialized(), "CUDA context exists before HES arm"
+                from torch.profiler._cupti import monitor as _cupti_monitor
+                _cupti_monitor.enable_hes_early()
+                if not _cupti_monitor.is_hes_enabled():
+                    print("SKIP_HES"); raise SystemExit(0)
+
+            def make_models():
+                torch.manual_seed(0)
+                mlp = nn.Sequential(nn.Linear(1024, 4096), nn.GELU(),
+                                    nn.Linear(4096, 1024), nn.GELU(), nn.Linear(1024, 1024))
+                enc = nn.TransformerEncoderLayer(d_model=512, nhead=8,
+                        dim_feedforward=2048, batch_first=True, dropout=0.0)
+                return {"mlp": (mlp.cuda().eval(), torch.randn(64, 1024, device="cuda")),
+                        "transformer": (enc.cuda().eval(),
+                                        torch.randn(8, 128, 512, device="cuda"))}
+
+            def capture(model, inp):
+                s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3): model(inp)
+                torch.cuda.current_stream().wait_stream(s)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g): model(inp)
+                return g
+
+            def summary(model, inp, mode, use_monitor):
+                # The cupti_monitor backend writes the trace gzipped at <path>.gz and
+                # asynchronously, so export then wait_for_exports then read the .gz.
+                g = capture(model, inp) if mode == "graphed" else None
+                cfg = _ExperimentalConfig(
+                    custom_profiler_config='{"backend":"cupti_monitor"}' if use_monitor else "")
+                with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+                    with torch.no_grad(), profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        experimental_config=cfg) as prof:
+                        for _ in range(5):
+                            g.replay() if mode == "graphed" else model(inp)
+                        torch.cuda.synchronize()
+                    prof.export_chrome_trace(f.name)
+                    prof.wait_for_exports()
+                    gz = f.name + ".gz"
+                    if os.path.exists(gz):
+                        ev = json.load(gzip.open(gz))["traceEvents"]; os.remove(gz)
+                    else:
+                        ev = json.load(open(f.name))["traceEvents"]
+                aten = frozenset(e["name"] for e in ev
+                    if e.get("cat") == "cpu_op" and e.get("name", "").startswith("aten::"))
+                # name -> multiset of per-kernel launch configs. Excludes timing
+                # (start/end/queued), backend-specific ids (correlation/graph), and
+                # the occupancy fields kineto derives; the rest must match exactly.
+                META = ("grid", "block", "registers per thread", "shared memory",
+                        "device", "context", "priority", "channel", "channel_type")
+                meta = {}
+                for e in ev:
+                    if e.get("cat") == "kernel" and e.get("ph") == "X":
+                        a = e.get("args") or {}
+                        key = tuple(tuple(a[k]) if isinstance(a.get(k), list)
+                                    else a.get(k) for k in META)
+                        d = meta.setdefault(e["name"], {})
+                        d[key] = d.get(key, 0) + 1
+                # Launch parity (eager): cudaLaunchKernel calls, and the ac2g flow arrows
+                # that terminate at a GPU op (kernel/gpu_memset) -- one inbound launch
+                # arrow per GPU op in both backends. (Kineto also draws arrows ending at
+                # cuda_runtime correlation hops, which we deliberately ignore.)
+                gpu_ops = [e for e in ev if e.get("ph") == "X"
+                           and e.get("cat") in ("kernel", "gpu_memset")]
+                launches = sum(1 for e in ev if e.get("ph") == "X"
+                               and e.get("cat") == "cuda_runtime"
+                               and e.get("name") == "cudaLaunchKernel")
+                def _on_gpu(fe):
+                    p, t, ts = fe.get("pid"), fe.get("tid"), fe.get("ts", 0)
+                    return any(x.get("pid") == p and x.get("tid") == t
+                               and x.get("ts", 0) <= ts <= x.get("ts", 0) + x.get("dur", 0)
+                               for x in gpu_ops)
+                arrows = sum(1 for e in ev if e.get("ph") in ("f", "t")
+                             and e.get("cat") == "ac2g" and _on_gpu(e))
+                launch = {"launches": launches, "arrows": arrows, "gpu_ops": len(gpu_ops)}
+                return aten, meta, launch
+
+            MODES = ("eager", "graphed")
+            models = make_models()
+
+            def nkernels(meta):
+                return sum(sum(c.values()) for c in meta.values())
+
+            # HES is process-global and armed before CUDA init, which perturbs a stock
+            # Kineto session (it drops activity records). So compare the monitor against
+            # stock only with HES off; the HES run instead emits its monitor metadata for
+            # the parent to compare against the HES-off monitor (transitively == stock).
+            if not HES:
+                stock = {(n, mode): summary(m, i, mode, False)
+                         for n, (m, i) in models.items() for mode in MODES}
+                from torch.profiler._cupti.cupti_python import pylibcupti
+                pylibcupti().finalize()
+            mon = {(n, mode): summary(m, i, mode, True)
+                   for n, (m, i) in models.items() for mode in MODES}
+
+            if not HES:
+                for n in models:
+                    for mode in MODES:
+                        sa, sm, sx = stock[(n, mode)]; ma, mm, mx = mon[(n, mode)]
+                        assert nkernels(sm) > 0, f"{n}/{mode}: no stock kernels"
+                        assert nkernels(mm) > 0, f"{n}/{mode}: no monitor kernels"
+                        assert sa == ma, (f"{n}/{mode} aten differ: "
+                            f"only_stock={sorted(sa - ma)} only_mon={sorted(ma - sa)}")
+                        # Parity on kernel names, per-kernel launch counts, AND launch
+                        # config (grid/block/regs/shared/...) -- everything but timing.
+                        assert sm == mm, (f"{n}/{mode} kernel metadata differ: "
+                            f"name_only_stock={sorted(set(sm) - set(mm))} "
+                            f"name_only_mon={sorted(set(mm) - set(sm))} "
+                            f"config_diffs={ {k: (sm.get(k), mm.get(k)) for k in set(sm) & set(mm) if sm[k] != mm[k]} }")
+                        if mode == "eager":
+                            # One inbound launch arrow per GPU op in both backends, and
+                            # cudaLaunchKernel counts match (graphed replays launch via a
+                            # single cudaGraphLaunch, so this only holds eager).
+                            assert sx["arrows"] == sx["gpu_ops"] == mx["arrows"] == mx["gpu_ops"], (
+                                f"{n} launch-arrow parity: stock={sx} monitor={mx}")
+                            assert sx["launches"] == mx["launches"], (
+                                f"{n} cudaLaunchKernel parity: stock={sx} monitor={mx}")
+            else:
+                for n in models:
+                    for mode in MODES:
+                        assert nkernels(mon[(n, mode)][1]) > 0, f"{n}/{mode}: no monitor kernels"
+
+            serial = {f"{n}|{mode}": {name: {repr(ck): cnt for ck, cnt in cfgs.items()}
+                                      for name, cfgs in mon[(n, mode)][1].items()}
+                      for n in models for mode in MODES}
+            print("RESULT", json.dumps(serial))
+            print("OK")
+            """
+        )
+        # Run parity once with HES off and once with it on (the HES child self-skips
+        # via SKIP_HES when the platform doesn't support hardware events). Each child
+        # prints its monitor metadata after RESULT; the HES-on monitor must match the
+        # HES-off monitor (which already matched stock above).
+        import json
+
+        captured = {}
+        for hes in (False, True):
+            env = dict(os.environ)
+            if hes:
+                env["PARITY_HES"] = "1"
+            p = subprocess.run(
+                [sys.executable, "-c", script],
+                text=True,
+                capture_output=True,
+                timeout=300,
+                env=env,
+            )
+            self.assertEqual(
+                p.returncode,
+                0,
+                f"subprocess failed (hes={hes}):\nstdout={p.stdout}\nstderr={p.stderr}",
+            )
+            if hes and "SKIP_HES" in p.stdout:
+                continue
+            self.assertIn("OK", p.stdout)
+            line = next(
+                (ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None
+            )
+            self.assertIsNotNone(line, f"no RESULT line (hes={hes}):\n{p.stdout}")
+            captured[hes] = json.loads(line[len("RESULT ") :])
+        if True in captured:
+            self.assertEqual(
+                captured[False],
+                captured[True],
+                "monitor kernel metadata differs with HES enabled vs disabled",
+            )
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    def test_cupti_monitor_observed_kinds_present(self):
+        # Every activity kind the ProfilerObserver subscribes to must surface in the
+        # exported chrome trace. One workload exercises kernels, H2D/D2H memcpy, memset,
+        # runtime + driver API, CUPTI overhead, record_function annotations (external
+        # correlation), and -- with enable_cuda_sync_events -- CUDA synchronization +
+        # event records (cuda_sync, with the wait_on join the trace validator checks).
+        import subprocess
+
+        script = textwrap.dedent(
+            """
+            import gzip, json, os, tempfile, collections
+            import torch, torch.nn as nn
+            from torch.profiler import profile, ProfilerActivity, record_function
+            from torch._C._profiler import _ExperimentalConfig
+            from torch.profiler._trace_validator import validate_trace
+
+            mlp = nn.Sequential(nn.Linear(1024, 4096), nn.GELU(),
+                                nn.Linear(4096, 1024), nn.GELU(),
+                                nn.Linear(1024, 1024)).cuda().eval()
+
+            def workload():
+                x = torch.randn(64, 1024).cuda()          # H2D memcpy
+                with record_function("region"):           # external correlation
+                    y = mlp(x)                            # kernels/runtime/driver/memset
+                y.cpu()                                    # D2H memcpy
+                e = torch.cuda.Event(); e.record(); e.synchronize()
+                torch.cuda.current_stream().wait_event(e)
+                torch.cuda.synchronize()
+
+            def categories(sync_on):
+                cb = ('{"backend":"cupti_monitor","enable_cuda_sync_events":true}'
+                      if sync_on else '{"backend":"cupti_monitor"}')
+                cfg = _ExperimentalConfig(custom_profiler_config=cb)
+                f = tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False)
+                with torch.no_grad(), profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        experimental_config=cfg) as prof:
+                    for _ in range(3):
+                        workload()
+                    torch.cuda.synchronize()
+                prof.export_chrome_trace(f.name)
+                prof.wait_for_exports()
+                gz = f.name + ".gz"
+                path = gz if os.path.exists(gz) else f.name
+                ev = (json.load(gzip.open(gz)) if os.path.exists(gz)
+                      else json.load(open(f.name)))["traceEvents"]
+                cats = collections.Counter(e.get("cat") for e in ev if e.get("ph") == "X")
+                ok, viol = validate_trace(path)
+                os.remove(path)
+                return cats, ok, [str(v) for v in viol]
+
+            cats, ok, viol = categories(True)
+            # CONCURRENT_KERNEL/MEMCPY/MEMSET/RUNTIME/DRIVER/OVERHEAD,
+            # EXTERNAL_CORRELATION (-> user_annotation), SYNCHRONIZATION + CUDA_EVENT
+            # (-> cuda_sync) must all be represented.
+            expected = ["kernel", "gpu_memcpy", "gpu_memset", "cuda_runtime",
+                        "cuda_driver", "overhead", "user_annotation",
+                        "gpu_user_annotation", "cuda_sync"]
+            missing = [c for c in expected if not cats.get(c)]
+            assert not missing, f"missing categories {missing}; got {dict(cats)}"
+            assert ok, f"trace validator failed: {viol}"
+
+            from torch.profiler._cupti.cupti_python import pylibcupti
+            pylibcupti().finalize()
+            off, _, _ = categories(False)
+            assert not off.get("cuda_sync"), f"cuda_sync without opt-in: {dict(off)}"
+            print("OK", dict(cats))
+            """
+        )
+        p = subprocess.run(
+            [sys.executable, "-c", script], text=True, capture_output=True, timeout=300
+        )
+        self.assertEqual(
+            p.returncode, 0, f"subprocess failed:\nstdout={p.stdout}\nstderr={p.stderr}"
+        )
+        self.assertIn("OK", p.stdout)
+
 
 @unittest.skipIf(not torch.profiler.itt.is_available(), "ITT is required")
 class TestProfilerITT(TestCase):

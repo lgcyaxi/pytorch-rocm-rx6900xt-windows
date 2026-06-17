@@ -333,8 +333,13 @@ class _KinetoProfile:
             self._monitor_trace_window = None
             # Constructing the observer registers it with the shared CUPTI
             # monitor and starts collection; mark it active so record_function
-            # user annotations route to it.
-            self._cupti_profiler_observer = ProfilerObserver()
+            # user annotations route to it. cuda_sync events (SYNCHRONIZATION +
+            # CUDA_EVENT) are opt-in via the config, matching kineto's flag.
+            self._cupti_profiler_observer = ProfilerObserver(
+                enable_cuda_sync=bool(
+                    self._custom_profiler_config.get("enable_cuda_sync_events")
+                )
+            )
             set_active_profiler_observer(self._cupti_profiler_observer)
         self.profiler._prepare_trace()
 

@@ -46,6 +46,24 @@ _MEMORY_KIND_NAMES = {
 
 _FLOW_CATEGORY = "ac2g"
 _OVERHEAD_PID = -1
+
+# CUpti_ActivitySynchronizationType -> kineto cuda_sync name.
+_SYNC_TYPE_NAMES = {
+    0: "Unknown",
+    1: "Event Sync",
+    2: "Stream Wait Event",
+    3: "Stream Sync",
+    4: "Context Sync",
+}
+# CUPTI sentinel for "not applicable" stream/context on a synchronization record.
+_SYNC_INVALID = 0xFFFFFFFF
+
+
+def _sync_stream(event: dict[str, object]) -> int:
+    s = _as_int(event.get("stream_id", _SYNC_INVALID))
+    return s if s != _SYNC_INVALID else -1
+
+
 _RUNTIME_CBID_NAMES: dict[int, str] | None = None
 _DRIVER_CBID_NAMES: dict[int, str] | None = None
 _RUNTIME_BLOCKLIST = {
@@ -211,6 +229,23 @@ def _trace_window_entries(
     cpu_thread_by_external_id: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     events = cast(list[dict[str, object]], trace_window["events"])
+    # context -> device (cuda_sync records carry no device id) and cuda_event_sync_id ->
+    # cudaEventRecord correlation, for the wait_on join on Event Sync / Stream Wait Event.
+    context_to_device: dict[int, int] = {}
+    event_sync_to_corr: dict[int, int] = {}
+    for event in events:
+        ekind = event.get("kind")
+        if ekind in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            context_to_device.setdefault(
+                _as_int(event["context_id"]), _as_int(event["device_id"])
+            )
+        elif ekind == "cuda_event":
+            context_to_device.setdefault(
+                _as_int(event["context_id"]), _as_int(event["device_id"])
+            )
+            sid = _as_int(event["cuda_event_sync_id"])
+            if sid:
+                event_sync_to_corr[sid] = _as_int(event["correlation_id"])
     cpu_thread_by_external_id = cpu_thread_by_external_id or {}
     thread_resource_map = cast(
         dict[int, dict[int, int]], trace_window.get("thread_resource_map", {})
@@ -281,6 +316,11 @@ def _trace_window_entries(
             if _is_trailing_buffer_request(event, max_non_overhead_end_ns):
                 continue
             need_overhead_metadata = True
+        elif kind == "cuda_sync":
+            device_id = context_to_device.get(_as_int(event["context_id"]), 0)
+            stream_id = _sync_stream(event)
+            seen_devices.setdefault(device_id, _as_int(event["start_ns"]))
+            seen_streams.add((device_id, stream_id))
 
     for did, first_ts in sorted(seen_devices.items()):
         ts_us = max((first_ts - base_ns) / 1000.0, 0.0)
@@ -411,6 +451,41 @@ def _trace_window_entries(
                             "name": _FLOW_CATEGORY,
                         }
                     )
+            elif kind == "cuda_sync":
+                device = context_to_device.get(_as_int(event["context_id"]), 0)
+                stream = _sync_stream(event)
+                sync_type = _as_int(event["sync_type"])
+                kind_name = _SYNC_TYPE_NAMES.get(sync_type, f"sync_{sync_type}")
+                args = {
+                    "cuda_sync_kind": kind_name,
+                    "stream": stream,
+                    "correlation": _as_int(event["correlation_id"]),
+                    "device": device,
+                    "context": _as_int(event["context_id"]),
+                }
+                if sync_type in (1, 2):  # Event Sync, Stream Wait Event
+                    args["wait_on_stream"] = -1
+                    args["wait_on_cuda_event_id"] = _as_int(event["cuda_event_id"])
+                    args["wait_on_cuda_event_record_corr_id"] = event_sync_to_corr.get(
+                        _as_int(event["cuda_event_sync_id"]), -1
+                    )
+                ts_us = max((_as_int(event["start_ns"]) - base_ns) / 1000.0, 0.0)
+                dur_us = max(
+                    (_as_int(event["end_ns"]) - _as_int(event["start_ns"])) / 1000.0,
+                    0.0,
+                )
+                trace_events.append(
+                    {
+                        "ph": "X",
+                        "cat": "cuda_sync",
+                        "name": kind_name,
+                        "pid": device,
+                        "tid": _export_tid(stream),
+                        "ts": ts_us,
+                        "dur": dur_us,
+                        "args": args,
+                    }
+                )
             continue
 
         if kind == "overhead":
@@ -466,6 +541,9 @@ def _trace_window_entries(
                     event.get("static_shared_memory", 0)
                 ) + _as_int(event.get("dynamic_shared_memory", 0))
                 args["priority"] = _as_int(event.get("priority", 0))
+                args["queued"] = _as_int(event.get("queued", 0))
+                args["channel"] = _as_int(event.get("channel", 0))
+                args["channel_type"] = _as_int(event.get("channel_type", 0))
 
         ts_us = max((_as_int(event["start_ns"]) - base_ns) / 1000.0, 0.0)
         dur_us = max(

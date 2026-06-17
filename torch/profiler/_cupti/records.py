@@ -64,6 +64,9 @@ class Kernel:
     GRAPH_NODE_ID = Field(31)
     GRAPH_ID = Field(33)
     LAUNCH_PRIORITY = Field(45)
+    QUEUED = Field(25)
+    CHANNEL_ID = Field(35)
+    CHANNEL_TYPE = Field(36)
 
 
 class Memcpy:

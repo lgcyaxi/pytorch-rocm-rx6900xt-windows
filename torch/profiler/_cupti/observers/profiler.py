@@ -30,12 +30,14 @@ from torch.profiler._cupti.observers.base import (
 from torch.profiler._cupti.observers.windowing import WindowFinalizerMixin
 from torch.profiler._cupti.records import (
     Api,
+    CudaEvent,
     ExternalCorrelation,
     Field,
     Kernel,
     Memcpy,
     Memset,
     Overhead,
+    Sync,
 )
 
 
@@ -88,6 +90,9 @@ PROFILER_FIELDS: dict[ActivityKind, set[Field]] = {
         Kernel.STATIC_SHARED_MEMORY,
         Kernel.DYNAMIC_SHARED_MEMORY,
         Kernel.LAUNCH_PRIORITY,
+        Kernel.QUEUED,
+        Kernel.CHANNEL_ID,
+        Kernel.CHANNEL_TYPE,
     },
     ActivityKind.MEMCPY: {
         Memcpy.START,
@@ -148,6 +153,32 @@ PROFILER_FIELDS: dict[ActivityKind, set[Field]] = {
 }
 
 
+# CUDA synchronization + event fields, selected only when the caller opts in via
+# enable_cuda_sync_events -- matching kineto, which emits cuda_sync events only under
+# that flag. SYNCHRONIZATION carries the sync spans; CUDA_EVENT records are join inputs
+# that resolve which cudaEventRecord a wait refers to (the wait_on join in monitor_trace).
+SYNC_FIELDS: dict[ActivityKind, set[Field]] = {
+    ActivityKind.SYNCHRONIZATION: {
+        Sync.TYPE,
+        Sync.START,
+        Sync.END,
+        Sync.CORRELATION_ID,
+        Sync.CONTEXT_ID,
+        Sync.STREAM_ID,
+        Sync.CUDA_EVENT_ID,
+        Sync.CUDA_EVENT_SYNC_ID,
+    },
+    ActivityKind.CUDA_EVENT: {
+        CudaEvent.CORRELATION_ID,
+        CudaEvent.CONTEXT_ID,
+        CudaEvent.STREAM_ID,
+        CudaEvent.EVENT_ID,
+        CudaEvent.DEVICE_ID,
+        CudaEvent.CUDA_EVENT_SYNC_ID,
+    },
+}
+
+
 class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
     """Accumulates decoded activity records and exports them as chrome-trace windows
     *asynchronously*. A window is opened at trace start (:meth:`open_window`) and
@@ -169,6 +200,7 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         self,
         annotation_resolver: AnnotationResolver | None = None,
         metadata_resolver: Callable[[int], str | None] | None = None,
+        enable_cuda_sync: bool = False,
     ) -> None:
         self._lock = threading.Lock()
         # Timestamped events (have "start_ns"), bucketed into windows by start time.
@@ -205,8 +237,11 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         # PROFILER_FIELDS already selects RUNTIME + EXTERNAL_CORRELATION + correlation
         # ids and the eager join happens in monitor_trace, so this doesn't opt into the
         # base's eager augmentation.
+        selection = {k: set(v) for k, v in PROFILER_FIELDS.items()}
+        if enable_cuda_sync:
+            selection.update({k: set(v) for k, v in SYNC_FIELDS.items()})
         super().__init__(
-            {k: set(v) for k, v in PROFILER_FIELDS.items()},
+            selection,
             annotations=ObserverAnnotationSettings(
                 graph=True, custom_graph_annotation_resolver=annotation_resolver
             ),
@@ -557,6 +592,11 @@ def _kernel_events(cols, convert_time, resolver):
                 "static_shared_memory": int(cols[Kernel.STATIC_SHARED_MEMORY.id][i]),
                 "dynamic_shared_memory": int(cols[Kernel.DYNAMIC_SHARED_MEMORY.id][i]),
                 "priority": int(cols[Kernel.LAUNCH_PRIORITY.id][i]),
+                # queued is CUPTI's command-buffer enqueue time (needs the
+                # subscriber latency-timestamp attr); 0 when unavailable.
+                "queued": convert_time(int(cols[Kernel.QUEUED.id][i])),
+                "channel": int(cols[Kernel.CHANNEL_ID.id][i]),
+                "channel_type": int(cols[Kernel.CHANNEL_TYPE.id][i]),
             }
         )
     return events
@@ -680,6 +720,49 @@ def _overhead_events(cols, convert_time, resolver):
     return events
 
 
+def _sync_events(cols, convert_time, resolver):
+    del resolver
+    events = []
+    for i in range(_col_len(cols)):
+        events.append(
+            {
+                "kind": "cuda_sync",
+                "sync_type": int(cols[Sync.TYPE.id][i]),
+                "start_ns": convert_time(int(cols[Sync.START.id][i])),
+                "end_ns": convert_time(int(cols[Sync.END.id][i])),
+                "context_id": int(cols[Sync.CONTEXT_ID.id][i]),
+                "stream_id": int(cols[Sync.STREAM_ID.id][i]),
+                "correlation_id": int(cols[Sync.CORRELATION_ID.id][i]),
+                "cuda_event_id": int(cols[Sync.CUDA_EVENT_ID.id][i]),
+                "cuda_event_sync_id": int(cols[Sync.CUDA_EVENT_SYNC_ID.id][i]),
+                "name": "cuda_sync",
+            }
+        )
+    return events
+
+
+def _cuda_event_events(cols, convert_time, resolver):
+    # No start_ns -> routed to the untimestamped join-input buffer (like
+    # external_correlation). Resolves a Sync's cuda_event_sync_id to the cudaEventRecord
+    # correlation id for the wait_on join in monitor_trace.
+    del convert_time, resolver
+    events = []
+    for i in range(_col_len(cols)):
+        events.append(
+            {
+                "kind": "cuda_event",
+                "cuda_event_sync_id": int(cols[CudaEvent.CUDA_EVENT_SYNC_ID.id][i]),
+                "correlation_id": int(cols[CudaEvent.CORRELATION_ID.id][i]),
+                "device_id": int(cols[CudaEvent.DEVICE_ID.id][i]),
+                "context_id": int(cols[CudaEvent.CONTEXT_ID.id][i]),
+                "stream_id": int(cols[CudaEvent.STREAM_ID.id][i]),
+                "event_id": int(cols[CudaEvent.EVENT_ID.id][i]),
+                "name": "cuda_event",
+            }
+        )
+    return events
+
+
 _BUILDERS: dict[int, Callable[..., list[dict[str, Any]]]] = {
     ActivityKind.CONCURRENT_KERNEL: _kernel_events,
     ActivityKind.MEMCPY: _memcpy_events,
@@ -688,6 +771,8 @@ _BUILDERS: dict[int, Callable[..., list[dict[str, Any]]]] = {
     ActivityKind.DRIVER: _api_events("cuda_driver"),
     ActivityKind.EXTERNAL_CORRELATION: _external_correlation_events,
     ActivityKind.OVERHEAD: _overhead_events,
+    ActivityKind.SYNCHRONIZATION: _sync_events,
+    ActivityKind.CUDA_EVENT: _cuda_event_events,
 }
 
 

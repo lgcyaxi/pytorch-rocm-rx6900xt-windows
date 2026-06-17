@@ -43,6 +43,13 @@ CUPTI_SUCCESS = 0
 # path.
 _ATTR_USER_DEFINED_RECORDS = 11
 
+# CUPTI_ACTIVITY_ATTR_ENABLE_KERNEL_LATENCY_TIMESTAMPS -- per-subscriber toggle for the
+# kernel queued/submitted timestamps (not surfaced by cupti-python). Empirically 15 on
+# the runtime CUPTI ABI (the enum is renumbered vs the header, same reason the value
+# above is 11). Set via cuptiActivitySetAttribute_v2 on the subscriber; unlike the global
+# cuptiActivityEnableLatencyTimestamps it works post-CUDA-init under UDR and with HES.
+_ATTR_ENABLE_KERNEL_LATENCY_TIMESTAMPS = 15
+
 # Minimum libcupti the monitor supports. The v2 user-defined-record API arrived in
 # 13.2, but only 13.3 populates pBufferCompleteInfo->ppRecordLayouts (CUPTI's own
 # per-kind record layout) that the monitor decodes against, so 13.3 is the floor.
@@ -464,6 +471,23 @@ class _PyLibCupti:
                 ctypes.byref(disabled),
             ),
             "cuptiActivitySetAttribute_v2",
+        )
+
+    def enable_kernel_latency_timestamps(self, sub_handle: int, enable: bool) -> bool:
+        """Toggle per-subscriber kernel latency-timestamp tracking (the queued/submitted
+        fields on kernel records). Best-effort: returns False if CUPTI rejects the
+        attribute (e.g. an ABI renumber on a newer version) so the session degrades to
+        no queued/submitted rather than failing."""
+        val = ctypes.c_uint8(1 if enable else 0)
+        size = ctypes.c_size_t(1)
+        return (
+            self._lib.cuptiActivitySetAttribute_v2(
+                ctypes.c_void_p(sub_handle),
+                _ATTR_ENABLE_KERNEL_LATENCY_TIMESTAMPS,
+                ctypes.byref(size),
+                ctypes.byref(val),
+            )
+            == 0
         )
 
     def activity_enable(
