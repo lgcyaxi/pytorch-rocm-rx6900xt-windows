@@ -342,9 +342,7 @@ class _PyLibCupti:
         if not hasattr(self._lib, "cuptiActivityGetNextRecord_v2"):
             return 0
         return (
-            ctypes.cast(
-                self._lib.cuptiActivityGetNextRecord_v2, ctypes.c_void_p
-            ).value
+            ctypes.cast(self._lib.cuptiActivityGetNextRecord_v2, ctypes.c_void_p).value
             or 0
         )
 
