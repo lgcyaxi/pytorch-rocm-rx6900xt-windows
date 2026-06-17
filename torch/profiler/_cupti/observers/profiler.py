@@ -20,8 +20,10 @@ import threading
 import time
 from typing import Any, TYPE_CHECKING
 
+from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
 import torch
-from torch.profiler._cupti.cupti_python import ActivityKind, OVERHEAD_KIND_NAMES
+from torch.profiler._cupti.cupti_python import OVERHEAD_KIND_NAMES
 from torch.profiler._cupti.monitor_trace import merge_trace_window_into_chrome_trace
 from torch.profiler._cupti.observers.base import (
     CuptiMonitorObserver,

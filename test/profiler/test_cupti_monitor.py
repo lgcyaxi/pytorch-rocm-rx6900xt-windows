@@ -52,7 +52,8 @@ class TestCuptiRecords(TestCase):
         # A Field carries (id, string); int(field) is its id. The per-kind catalogs
         # define the supported field ids; FIELD_REGISTRY and STRING_FIELDS derive
         # from them. No byte sizes -- those come from CUPTI's captured layout.
-        from torch.profiler._cupti.cupti_python import ActivityKind
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
         from torch.profiler._cupti.records import FIELD_REGISTRY, Kernel, STRING_FIELDS
 
         self.assertEqual(int(Kernel.START), 7)
@@ -128,8 +129,8 @@ class TestCuptiRecords(TestCase):
             self.assertIn(CORRELATION_FIELD[kind], FIELD_REGISTRY[kind])
 
     def test_cupti_python_bindings(self):
-        # The cupti-python binding layer: ABI constants, the overhead-kind table, the
-        # lazy enum re-export, and the ctypes structs that mirror CUPTI's ABI.
+        # The cupti-python binding layer: ABI constants, the overhead-kind table,
+        # and the ctypes structs that mirror CUPTI's ABI.
         from torch.profiler._cupti import cupti_python as cp
 
         self.assertEqual(cp.LIBCUPTI_MIN_VERSION, 130300)
@@ -138,8 +139,7 @@ class TestCuptiRecords(TestCase):
         # Overhead-kind code -> name (cupti-python does not surface these as an enum).
         self.assertEqual(cp.OVERHEAD_KIND_NAMES[0], "Unknown")
         self.assertEqual(cp.OVERHEAD_KIND_NAMES[7 << 16], "Activity Buffer Request")
-        # Lazy re-export: a non-re-exported name is a clean AttributeError (and does not
-        # trigger the cupti import), not some other error.
+        # An unknown module attribute is a clean AttributeError.
         with self.assertRaises(AttributeError):
             cp.NotAReexportedName
         # ctypes structs must match CUPTI's ABI member layout (order matters).
@@ -176,8 +176,8 @@ class TestCuptiRecords(TestCase):
         # dropping a trailing record that overruns valid_size, and const char* fields
         # dereferenced in place. Synthetic layouts + buffers, no CUDA.
         import numpy as np
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
-        from torch.profiler._cupti.cupti_python import ActivityKind
         from torch.profiler._cupti.monitor import CuptiMonitorBuffer
 
         kernel = int(ActivityKind.CONCURRENT_KERNEL)
@@ -276,7 +276,8 @@ class TestCuptiRecords(TestCase):
         # A registration request resolves to (kinds, per-kind field selection): a
         # bare kind iterable means "all fields"; a field map selects fields, with
         # "all"/None expanding; *_FIELD_KIND (0) is always included.
-        from torch.profiler._cupti.cupti_python import ActivityKind
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
         from torch.profiler._cupti.monitor import CuptiMonitor
         from torch.profiler._cupti.records import FIELD_REGISTRY, Kernel
 
@@ -480,7 +481,8 @@ class TestCuptiMonitorCUDA(TestCase):
     def test_fence_enables_sync_transiently(self):
         # flush(sync=True) fences at a SYNCHRONIZATION sync point, enabled only for
         # the fence (even when no observer requested it) and disabled again after.
-        from torch.profiler._cupti.cupti_python import ActivityKind
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
         from torch.profiler._cupti.monitor import CuptiMonitor
         from torch.profiler._cupti.records import Kernel
 
@@ -504,7 +506,9 @@ class TestCuptiMonitorCUDA(TestCase):
         # End-to-end columnar collection: the monitor turns on a per-activity field
         # selection, decodes each buffer against CUPTI's captured layout, and hands
         # the observer the columns for its selection.
-        from torch.profiler._cupti.cupti_python import ActivityKind, CuptiError
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+        from torch.profiler._cupti.cupti_python import CuptiError
         from torch.profiler._cupti.monitor import CuptiMonitor
         from torch.profiler._cupti.records import Kernel
 
@@ -555,8 +559,10 @@ class TestCuptiMonitorCUDA(TestCase):
         # accessors and flush it: instance() constructs/returns it, get_monitor()
         # hands back that same object, and flush(sync=True) on the singleton
         # delivers everything collected up to the call.
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
         from torch.profiler._cupti import monitor as cupti_monitor
-        from torch.profiler._cupti.cupti_python import ActivityKind, CuptiError
+        from torch.profiler._cupti.cupti_python import CuptiError
         from torch.profiler._cupti.records import Kernel
 
         kernel = ActivityKind.CONCURRENT_KERNEL
@@ -598,7 +604,9 @@ class TestCuptiMonitorCUDA(TestCase):
         # subscriber, then hands each observer only the columns it selected. Two
         # observers on the same kind with disjoint selections each see only their own
         # slice (plus KIND id 0) and the same set of records.
-        from torch.profiler._cupti.cupti_python import ActivityKind, CuptiError
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+        from torch.profiler._cupti.cupti_python import CuptiError
         from torch.profiler._cupti.monitor import CuptiMonitor
         from torch.profiler._cupti.records import Kernel
 
@@ -787,7 +795,9 @@ class TestCuptiMonitorCUDA(TestCase):
         # is the no-deadlock assertion (a regression would hang here), and we also
         # check the pipeline actually delivered. stop() (final sync flush + decoder
         # teardown) on unregister must not hang either.
-        from torch.profiler._cupti.cupti_python import ActivityKind, CuptiError
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+        from torch.profiler._cupti.cupti_python import CuptiError
         from torch.profiler._cupti.monitor import CuptiMonitor
         from torch.profiler._cupti.records import Api, ExternalCorrelation, Kernel
 

@@ -43,7 +43,8 @@ from __future__ import annotations
 import threading
 from typing import Any, TYPE_CHECKING
 
-from torch.profiler._cupti.cupti_python import ActivityKind
+from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
 from torch.profiler._cupti.observers.base import (
     CuptiMonitorObserver,
     ObserverAnnotationSettings,
