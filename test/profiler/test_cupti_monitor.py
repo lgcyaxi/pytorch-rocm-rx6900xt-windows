@@ -92,6 +92,81 @@ class TestCuptiRecords(TestCase):
         )
         self.assertEqual(STRING_FIELDS[kernel], frozenset({24}))
 
+    def test_field_registry_invariants(self):
+        # Cross-cutting invariants on the record-field registry (the source of truth for
+        # columnar decode) across EVERY record kind -- guards against editing mistakes
+        # (duplicate ids, registry/string/correlation drift) that test_field_catalog's
+        # Kernel-only check would not catch.
+        from torch.profiler._cupti.records import (
+            CORRELATION_FIELD,
+            FIELD_REGISTRY,
+            FIELDS,
+            STRING_FIELDS,
+        )
+
+        kinds = set(FIELDS)
+        # Every derived map covers exactly the same kinds.
+        self.assertEqual(set(FIELD_REGISTRY), kinds)
+        self.assertEqual(set(STRING_FIELDS), kinds)
+        self.assertEqual(set(CORRELATION_FIELD), kinds)
+        for kind, fields in FIELDS.items():
+            ids = [f.id for f in fields]
+            # Field ids are unique within a record class (a collision would silently
+            # alias two fields during decode).
+            self.assertEqual(
+                len(ids), len(set(ids)), f"duplicate field ids: kind {kind}"
+            )
+            # FIELD_REGISTRY / STRING_FIELDS derive exactly from FIELDS.
+            self.assertEqual(FIELD_REGISTRY[kind], frozenset(ids))
+            self.assertEqual(
+                STRING_FIELDS[kind], frozenset(f.id for f in fields if f.string)
+            )
+            self.assertLessEqual(STRING_FIELDS[kind], FIELD_REGISTRY[kind])
+            # CUPTI requires *_FIELD_KIND (id 0) first at enable, so every kind has it.
+            self.assertIn(0, FIELD_REGISTRY[kind])
+            # The correlation field id is a real field of this kind.
+            self.assertIn(CORRELATION_FIELD[kind], FIELD_REGISTRY[kind])
+
+    def test_cupti_python_bindings(self):
+        # The cupti-python binding layer: ABI constants, the overhead-kind table, the
+        # lazy enum re-export, and the ctypes structs that mirror CUPTI's ABI.
+        from torch.profiler._cupti import cupti_python as cp
+
+        self.assertEqual(cp.LIBCUPTI_MIN_VERSION, 130300)
+        self.assertEqual(cp._ATTR_USER_DEFINED_RECORDS, 11)
+        self.assertEqual(cp._ATTR_ENABLE_KERNEL_LATENCY_TIMESTAMPS, 15)
+        # Overhead-kind code -> name (cupti-python does not surface these as an enum).
+        self.assertEqual(cp.OVERHEAD_KIND_NAMES[0], "Unknown")
+        self.assertEqual(cp.OVERHEAD_KIND_NAMES[7 << 16], "Activity Buffer Request")
+        # Lazy re-export: a non-re-exported name is a clean AttributeError (and does not
+        # trigger the cupti import), not some other error.
+        with self.assertRaises(AttributeError):
+            cp.NotAReexportedName
+        # ctypes structs must match CUPTI's ABI member layout (order matters).
+        self.assertEqual(
+            [n for n, _ in cp._SubscriberParams._fields_],
+            [
+                "structSize",
+                "subscriberName",
+                "oldSubscriberName",
+                "oldSubscriberSize",
+                "allowMultipleSubscribers",
+                "padding",
+            ],
+        )
+        self.assertEqual(
+            [n for n, _ in cp._UDFieldSelection._fields_],
+            ["structSize", "numFields", "pFieldIds"],
+        )
+        self.assertEqual(
+            [n for n, _ in cp._UDActivityConfig._fields_],
+            ["structSize", "fieldSelection"],
+        )
+        # The field-selection struct is nested by value inside the activity config.
+        self.assertIs(
+            dict(cp._UDActivityConfig._fields_)["fieldSelection"], cp._UDFieldSelection
+        )
+
     def test_decode_columns(self):
         # records.decode demuxes a whole buffer (possibly interleaving
         # kinds) into {kind: {field_id: column}} against CUPTI's captured layout list
