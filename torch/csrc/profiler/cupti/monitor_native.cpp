@@ -4,9 +4,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <iterator>
-
-#include <fmt/format.h>
 
 namespace torch::profiler::impl {
 
@@ -36,24 +33,19 @@ struct AbiBufferCompleteInfo {
   size_t numRecordLayouts;
 };
 
-// A stable signature of a record layout's field set ("fid:size," for each
-// field, sorted). Records sharing a signature share an identical column layout,
-// so they can be accumulated together; records with a different signature (a
-// mid-session field-selection change) go to a separate group, keeping every
-// group's columns length-aligned.
-std::string layoutSignature(const CuptiRecordLayout& layout) {
-  std::vector<std::pair<int, size_t>> fields;
+// A record layout's grouping key: its sorted (field_id, size) pairs. Records
+// sharing this key share an identical column layout, so they accumulate
+// together; a different key (a mid-session field-selection change) groups
+// separately, keeping every group's columns length-aligned. The sorted pairs
+// are the key directly (it is only ever a map key), so there is no string form.
+CuptiLayoutKey layoutKey(const CuptiRecordLayout& layout) {
+  CuptiLayoutKey fields;
   fields.reserve(layout.fields.size());
   for (const auto& f : layout.fields) {
     fields.emplace_back(f.field_id, f.size);
   }
   std::ranges::sort(fields);
-  fmt::memory_buffer buf;
-  auto out = std::back_inserter(buf);
-  for (const auto& [fid, size] : fields) {
-    fmt::format_to(out, "{}:{},", fid, size);
-  }
-  return fmt::to_string(buf);
+  return fields;
 }
 
 } // namespace
@@ -286,9 +278,10 @@ void CuptiMonitorDecoder::decode_buffer(const CompletedCuptiBuffer& buf) {
   // together and fields never end up mismatched in length. Within this buffer a
   // kind has a single layout (ppRecordLayouts is per kind), so cache its
   // signature + layout.
-  std::map<uint32_t, std::map<std::string, std::map<int, CuptiColumn>>> local;
+  std::map<uint32_t, std::map<CuptiLayoutKey, std::map<int, CuptiColumn>>>
+      local;
   std::map<uint32_t, const CuptiRecordLayout*> layout_by_kind;
-  std::map<uint32_t, std::string> sig_by_kind;
+  std::map<uint32_t, CuptiLayoutKey> key_by_kind;
   uint64_t local_max_sync = 0;
   void* record = nullptr;
   while (get_next(subscriber, buf.ptr, buf.valid_size, &record) == 0) {
@@ -304,14 +297,15 @@ void CuptiMonitorDecoder::decode_buffer(const CompletedCuptiBuffer& buf) {
         }
       }
       layout_by_kind[kind] = layout;
-      sig_by_kind[kind] = (layout != nullptr) ? layoutSignature(*layout) : "";
+      key_by_kind[kind] =
+          (layout != nullptr) ? layoutKey(*layout) : CuptiLayoutKey{};
     } else {
       layout = cached->second;
     }
     if (layout == nullptr) {
       continue; // no captured layout for this kind; skip
     }
-    auto& kind_cols = local[kind][sig_by_kind[kind]];
+    auto& kind_cols = local[kind][key_by_kind[kind]];
     for (const auto& field : layout->fields) {
       CuptiColumn& col = kind_cols[field.field_id];
       col.field_size = field.size;
