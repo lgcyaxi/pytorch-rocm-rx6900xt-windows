@@ -73,6 +73,7 @@ from torch._inductor.output_code import MockFXGraphCacheOutput
 from torch._subclasses.fake_tensor import DynamicOutputShapeException, FakeTensorMode
 from torch.fx.experimental.proxy_tensor import is_sym_node
 from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode, ShapeEnv
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.utils.rnn import PackedSequence
 from torch.testing import FileCheck
@@ -109,7 +110,11 @@ from torch.testing._internal.optests import (
 )
 from torch.testing._internal.subclasses import WrapperSubclass
 from torch.testing._internal.two_tensor import TwoTensor, TwoTensorMode
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import (
+    is_traceable_wrapper_subclass,
+    return_and_correct_aliasing,
+    TorchDispatchMode,
+)
 
 
 USE_TORCHVISION = False
@@ -225,7 +230,21 @@ def unpack_fp8_with_scale(packed):
 
 
 class AOTTestCase(TestCase):
-    pass
+    def assertTensorMetadataEqual(self, actual, expected):
+        self.assertEqual(tuple(actual.shape), tuple(expected.shape))
+        self.assertEqual(actual.stride(), expected.stride())
+        self.assertEqual(actual.storage_offset(), expected.storage_offset())
+
+        if is_traceable_wrapper_subclass(expected):
+            self.assertTrue(is_traceable_wrapper_subclass(actual))
+            expected_attrs, _ = expected.__tensor_flatten__()
+            actual_attrs, _ = actual.__tensor_flatten__()
+            self.assertEqual(actual_attrs, expected_attrs)
+            for attr in expected_attrs:
+                expected_inner = getattr(expected, attr)
+                actual_inner = getattr(actual, attr)
+                if isinstance(expected_inner, torch.Tensor):
+                    self.assertTensorMetadataEqual(actual_inner, expected_inner)
 
 
 class TestPythonKey(AOTTestCase):
@@ -2471,17 +2490,80 @@ def forward(self, primals_1):
             x = torch.ones(1, 2, 4, requires_grad=req_grad).clone()
             return [(x,), (x,)]
 
-        # See https://github.com/pytorch/pytorch/issues/114975
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "Metadata mutations are currently not allowed on tensor subclasses",
-        ):
-            self.verify_aot_autograd(
-                f,
-                partial(inp_callable, req_grad=req_grad),
-                test_mutation=True,
-                make_inputs_subclasses=True,
-            )
+        self.verify_aot_autograd(
+            f,
+            partial(inp_callable, req_grad=req_grad),
+            test_mutation=True,
+            make_inputs_subclasses=True,
+        )
+
+    def test_subclass_metadata_mutation_aot_function_metadata(self):
+        def f(a):
+            a.transpose_(1, 0)
+            tmp = a.mul(2)
+            return tmp.transpose(1, 0)
+
+        compiled_f = aot_function(
+            f,
+            fw_compiler=nop,
+            bw_compiler=nop,
+            decompositions=None,
+            keep_inference_input_mutations=True,
+            dynamic=False,
+        )
+
+        with TwoTensorMode():
+            ref_inp = torch.ones(1, 2, 4).clone()
+        with TwoTensorMode():
+            test_inp = torch.ones(1, 2, 4).clone()
+
+        ref_out = f(ref_inp)
+        test_out = compiled_f(test_inp)
+
+        self.assertEqual(test_inp, ref_inp)
+        self.assertEqual(test_out, ref_out)
+        self.assertTensorMetadataEqual(test_inp, ref_inp)
+        self.assertTensorMetadataEqual(test_out, ref_out)
+
+    @parametrize("req_grad", [False, True])
+    @skipIfDynamoInput("Dynamo fails to fakeify non-contiguous TwoTensor inputs")
+    def test_subclass_metadata_mutation_noncontiguous_input(self, req_grad):
+        def f(a):
+            a.transpose_(1, 0)
+            tmp = a.mul(2)
+            return tmp.transpose(1, 0)
+
+        def inp_callable(req_grad):
+            x = torch.ones(2, 4, requires_grad=req_grad).clone()[:, ::2]
+            return [(x,), (x,)]
+
+        self.verify_aot_autograd(
+            f,
+            partial(inp_callable, req_grad=req_grad),
+            test_mutation=True,
+            make_inputs_subclasses=True,
+        )
+
+        compiled_f = aot_function(
+            f,
+            fw_compiler=nop,
+            bw_compiler=nop,
+            decompositions=None,
+            keep_inference_input_mutations=True,
+            dynamic=False,
+        )
+        with TwoTensorMode():
+            ref_inp = torch.ones(2, 4, requires_grad=req_grad).clone()[:, ::2]
+        with TwoTensorMode():
+            test_inp = torch.ones(2, 4, requires_grad=req_grad).clone()[:, ::2]
+
+        ref_out = f(ref_inp)
+        test_out = compiled_f(test_inp)
+
+        self.assertEqual(test_inp, ref_inp)
+        self.assertEqual(test_out, ref_out)
+        self.assertTensorMetadataEqual(test_inp, ref_inp)
+        self.assertTensorMetadataEqual(test_out, ref_out)
 
     def test_input_data_and_metadata_mutation(self):
         def f(a):
@@ -3565,7 +3647,7 @@ def forward(self, primals_1, primals_2):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "Metadata mutations are currently not allowed on tensor subclasses",
+            "Encountered aliased inputs that are mutated in the graph",
         ):
             self.verify_aot_autograd(
                 f,
@@ -5067,14 +5149,16 @@ class TestAOTExport(AOTTestCase):
         ):
             aot_export_module(mod, [inp], trace_joint=False, pre_dispatch=True)
 
-        gm, _ = aot_export_module(mod, [inp], trace_joint=False, pre_dispatch=False)
+        gm, graph_sig = aot_export_module(
+            mod, [inp], trace_joint=False, pre_dispatch=False
+        )
+        self.assertEqual(graph_sig.user_inputs_to_mutate, {"add": "arg1_1"})
         self.assertExpectedInline(
             str(gm.code).strip(),
             """\
 def forward(self, arg0_1, arg1_1):
-    clone = torch.ops.aten.clone.default(arg1_1);  arg1_1 = None
-    add = torch.ops.aten.add.Tensor(clone, 1);  clone = None
-    return (add,)""",
+    add = torch.ops.aten.add.Tensor(arg1_1, 1);  arg1_1 = None
+    return (add, add)""",
         )
 
         fw_graph_cell = [None]
@@ -5094,9 +5178,8 @@ def forward(self, arg0_1, arg1_1):
             str(fw_graph.code).strip(),
             """\
 def forward(self, arg0_1, arg1_1):
-    clone = torch.ops.aten.clone.default(arg1_1);  arg1_1 = None
-    add = torch.ops.aten.add.Tensor(clone, 1);  clone = None
-    return (add,)""",
+    add = torch.ops.aten.add.Tensor(arg1_1, 1);  arg1_1 = None
+    return (add, add)""",
         )
 
     def test_aot_export_predispatch_func_simple(self):
@@ -9321,7 +9404,7 @@ def forward(self, primals_1, tangents_1):
             enable_log=False,
         )
         fake_mode, shape_env = construct_fake_mode(flat_args, aot_config)
-        fake_flat_args, act_input_indices = process_inputs(
+        fake_flat_args, act_input_paths = process_inputs(
             flat_args, aot_config, fake_mode, shape_env
         )
         flat_args_descs = [PlainAOTInput(i) for i in range(len(fake_flat_args))]
@@ -9336,7 +9419,7 @@ def forward(self, primals_1, tangents_1):
                 fake_mode,
                 shape_env,
             )
-            aot_state.fw_metadata.act_input_indices = act_input_indices
+            aot_state.fw_metadata.act_input_paths = act_input_paths
             aot_config_before_stage2 = aot_state.aot_config
             aot_graph_capture = aot_stage1_graph_capture(aot_state, flat_fn)
             compiled_fn, _ = aot_stage2_compile(
@@ -9632,6 +9715,24 @@ class TestAOTDispatch(AOTTestCase):
     # - metadata mutation? (TBD)
     # - guard tests (fw guards *and* bw guards)
     # - subclass test involving _indices_of_inps_to_detach
+    def test_aminmax_out_dtype_mismatch_errors(self):
+        def f(inp, out_min, out_max):
+            return torch.aminmax(inp, dim=-1, out=(out_min, out_max))
+
+        inp = torch.rand(10, 10)
+        out_min = torch.empty(10, dtype=torch.float64)
+        out_max = torch.empty(10, dtype=torch.float64)
+
+        with self.assertRaisesRegex(RuntimeError, "Expected out tensor to have dtype"):
+            f(inp, out_min, out_max)
+
+        compiled_f = torch.compile(f, backend="aot_eager", fullgraph=True)
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.TorchRuntimeError,
+            "Expected out tensor to have dtype",
+        ):
+            compiled_f(inp, out_min, out_max)
+
     def test_aot_dispatch_simple(self):
         # a is a subclass, b is not
         def f(a, b):
@@ -9823,6 +9924,307 @@ metadata incorrectly.
         self.assertEqual(b_ref.grad.a, b_test.grad.a)
         self.assertEqual(b_ref.grad.b, b_test.grad.b)
 
+    def test_output_alias_of_intermediate_wrapper_subclass_legacy_replay(self):
+        def f(x):
+            y = x + 1
+            aux = y[:, :1]
+            return y, aux
+
+        for backend in ("aot_eager", "inductor"):
+            for dynamic in (False, True):
+                with self.subTest(backend=backend, dynamic=dynamic):
+                    x_ref = WrapperSubclass(torch.randn(3, 3, requires_grad=True))
+                    y_ref, aux_ref = f(x_ref)
+
+                    x = WrapperSubclass(x_ref.a.detach().clone().requires_grad_(True))
+                    torch._dynamo.reset()
+                    AOTAutogradCache.clear()
+                    y, aux = torch.compile(
+                        f, backend=backend, fullgraph=True, dynamic=dynamic
+                    )(x)
+
+                    self.assertIsInstance(y, WrapperSubclass)
+                    self.assertIsInstance(aux, WrapperSubclass)
+                    self.assertEqual(y_ref.a, y.a)
+                    self.assertEqual(aux_ref.a, aux.a)
+
+                    self.assertEqual(
+                        StorageWeakRef(y.a.untyped_storage()),
+                        StorageWeakRef(aux.a.untyped_storage()),
+                    )
+
+                    (y_ref.sum() + aux_ref.sum()).backward()
+                    (y.sum() + aux.sum()).backward()
+                    self.assertIsNotNone(x_ref.grad)
+                    self.assertIsNotNone(x.grad)
+                    self.assertEqual(x_ref.grad.a, x.grad.a)
+
+    def test_output_alias_of_intermediate_subclass_view_meta_replay(self):
+        def f(x):
+            y = x + 1
+            aux = y[:, :1]
+            return y, aux
+
+        for backend in ("aot_eager", "inductor"):
+            for dynamic in (False, True):
+                with self.subTest(backend=backend, dynamic=dynamic):
+                    x_ref = ConstantExtraMetadataTensor(
+                        torch.randn(3, 3, requires_grad=True)
+                    )
+                    y_ref, aux_ref = f(x_ref)
+
+                    x = ConstantExtraMetadataTensor(
+                        x_ref.elem.detach().clone().requires_grad_(True)
+                    )
+                    torch._dynamo.reset()
+                    AOTAutogradCache.clear()
+                    y, aux = torch.compile(
+                        f, backend=backend, fullgraph=True, dynamic=dynamic
+                    )(x)
+
+                    self.assertIsInstance(y, ConstantExtraMetadataTensor)
+                    self.assertIsInstance(aux, ConstantExtraMetadataTensor)
+                    self.assertEqual(y_ref.elem, y.elem)
+                    self.assertEqual(aux_ref.elem, aux.elem)
+                    self.assertIsNotNone(aux_ref.grad_fn)
+                    self.assertIsNotNone(aux.grad_fn)
+                    self.assertEqual(aux.grad_fn.__class__, aux_ref.grad_fn.__class__)
+                    self.assertExpectedInline(
+                        str(aux.grad_fn.__class__), """<class 'SliceBackward0'>"""
+                    )
+                    self.assertIsNotNone(aux._base)
+
+                    self.assertEqual(
+                        StorageWeakRef(y.untyped_storage()),
+                        StorageWeakRef(aux.untyped_storage()),
+                    )
+
+                    (y_ref.sum() + aux_ref.sum()).backward()
+                    (y.sum() + aux.sum()).backward()
+                    self.assertIsNotNone(x_ref.grad)
+                    self.assertIsNotNone(x.grad)
+                    self.assertEqual(x_ref.grad.elem, x.grad.elem)
+
+    @patch("torch._dynamo.config.assume_static_by_default", False)
+    def test_output_alias_of_intermediate_subclass_view_meta_replay_automatic_dynamic_fallback(
+        self,
+    ):
+        def f(x, sz):
+            y = x + 1
+            aux = y.view(sz)
+            return y, aux
+
+        x_ref = ConstantExtraMetadataTensor(torch.randn(2, 2, requires_grad=True))
+        y_ref, aux_ref = f(x_ref, (4,))
+
+        x = ConstantExtraMetadataTensor(
+            x_ref.elem.detach().clone().requires_grad_(True)
+        )
+        torch._dynamo.reset()
+        AOTAutogradCache.clear()
+        # Automatic-dynamic makes `sz` symbolic, so subclass alias replay keeps
+        # the dense-style as_strided fallback for this output today.
+        y, aux = torch.compile(f, backend="aot_eager", fullgraph=True)(x, (4,))
+
+        self.assertIsInstance(y, ConstantExtraMetadataTensor)
+        self.assertIsInstance(aux, ConstantExtraMetadataTensor)
+        self.assertEqual(y_ref.elem, y.elem)
+        self.assertEqual(aux_ref.elem, aux.elem)
+        self.assertEqual(
+            StorageWeakRef(y.untyped_storage()),
+            StorageWeakRef(aux.untyped_storage()),
+        )
+
+        self.assertIsNotNone(aux.grad_fn)
+        self.assertExpectedInline(
+            str(aux.grad_fn.__class__), """<class 'AsStridedBackward0'>"""
+        )
+
+        (y_ref.sum() + aux_ref.sum()).backward()
+        (y.sum() + aux.sum()).backward()
+        self.assertIsNotNone(x_ref.grad)
+        self.assertIsNotNone(x.grad)
+        self.assertEqual(x_ref.grad.elem, x.grad.elem)
+
+    def test_output_alias_of_intermediate_subclass_view_meta_replay_signature_mismatch(
+        self,
+    ):
+        class DivergentViewMetadataTensor(torch.Tensor):
+            @staticmethod
+            def __new__(cls, a, b, outer_size=None, outer_stride=None):
+                if outer_size is None:
+                    outer_size = a.size()
+                if outer_stride is None:
+                    outer_stride = a.stride()
+                return torch.Tensor._make_wrapper_subclass(
+                    cls,
+                    outer_size,
+                    strides=outer_stride,
+                    storage_offset=a.storage_offset(),
+                    device=a.device,
+                    layout=a.layout,
+                    requires_grad=a.requires_grad,
+                    dtype=a.dtype,
+                )
+
+            def __init__(self, a, b, outer_size=None, outer_stride=None):
+                self.a = a
+                self.b = b
+
+            def __tensor_flatten__(self):
+                return ["a", "b"], "ctx"
+
+            @staticmethod
+            def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+                if meta != "ctx":
+                    raise AssertionError(f"unexpected meta: {meta}")
+                return DivergentViewMetadataTensor(
+                    inner_tensors["a"],
+                    inner_tensors["b"],
+                    outer_size,
+                    outer_stride,
+                )
+
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args, kwargs):
+                if kwargs is None:
+                    kwargs = {}
+                args_a = pytree.tree_map_only(cls, lambda x: x.a, args)
+                args_b = pytree.tree_map_only(cls, lambda x: x.b, args)
+                kwargs_a = pytree.tree_map_only(cls, lambda x: x.a, kwargs)
+                kwargs_b = pytree.tree_map_only(cls, lambda x: x.b, kwargs)
+
+                out_a = func(*args_a, **kwargs_a)
+                out_b = func(*args_b, **kwargs_b)
+                if func is torch.ops.aten.slice.Tensor:
+                    out_b = pytree.tree_map_only(
+                        torch.Tensor,
+                        lambda t: t.transpose(0, 1).transpose(0, 1),
+                        out_b,
+                    )
+
+                out_a_flat, spec = pytree.tree_flatten(out_a)
+                out_b_flat = pytree.tree_leaves(out_b)
+                out_flat = [
+                    cls(a, b) if isinstance(a, torch.Tensor) else a
+                    for a, b in zip(out_a_flat, out_b_flat, strict=True)
+                ]
+                out = pytree.tree_unflatten(out_flat, spec)
+                return return_and_correct_aliasing(func, args, kwargs, out)
+
+        def f(x):
+            y = x + 1
+            aux = y[:, :1]
+            return y, aux
+
+        x_ref = DivergentViewMetadataTensor(
+            torch.randn(3, 3, requires_grad=True),
+            torch.randn(3, 3, requires_grad=True),
+        )
+        f(x_ref)
+        x = DivergentViewMetadataTensor(
+            x_ref.a.detach().clone().requires_grad_(True),
+            x_ref.b.detach().clone().requires_grad_(True),
+        )
+        compiled_f = aot_function(
+            f,
+            fw_compiler=nop,
+            bw_compiler=nop,
+            partition_fn=min_cut_rematerialization_partition,
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "different outer view signatures",
+        ):
+            compiled_f(x)
+
+    def test_output_alias_of_intermediate_subclass_view_meta_replay_runtime_metadata_mismatch(
+        self,
+    ):
+        class RuntimeMetadataMismatchTensor(torch.Tensor):
+            view_ctx = "compile_ctx"
+
+            @staticmethod
+            def __new__(cls, elem, meta="base_ctx", outer_size=None, outer_stride=None):
+                if outer_size is None:
+                    outer_size = elem.size()
+                if outer_stride is None:
+                    outer_stride = elem.stride()
+                return torch.Tensor._make_wrapper_subclass(
+                    cls,
+                    outer_size,
+                    strides=outer_stride,
+                    storage_offset=elem.storage_offset(),
+                    device=elem.device,
+                    layout=elem.layout,
+                    requires_grad=elem.requires_grad,
+                    dtype=elem.dtype,
+                )
+
+            def __init__(
+                self, elem, meta="base_ctx", outer_size=None, outer_stride=None
+            ):
+                self.elem = elem
+                self.meta = meta
+
+            def __tensor_flatten__(self):
+                return ["elem"], self.meta
+
+            @staticmethod
+            def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+                return RuntimeMetadataMismatchTensor(
+                    inner_tensors["elem"], meta, outer_size, outer_stride
+                )
+
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args, kwargs):
+                if kwargs is None:
+                    kwargs = {}
+                args_inner = pytree.tree_map_only(cls, lambda x: x.elem, args)
+                kwargs_inner = pytree.tree_map_only(cls, lambda x: x.elem, kwargs)
+                out_inner = func(*args_inner, **kwargs_inner)
+                out_inner_flat, spec = pytree.tree_flatten(out_inner)
+
+                def wrap(o_inner):
+                    if not isinstance(o_inner, torch.Tensor):
+                        return o_inner
+                    meta = (
+                        cls.view_ctx
+                        if func is torch.ops.aten.slice.Tensor
+                        else "base_ctx"
+                    )
+                    return cls(o_inner, meta)
+
+                out = pytree.tree_unflatten([wrap(o) for o in out_inner_flat], spec)
+                return return_and_correct_aliasing(func, args, kwargs, out)
+
+        def f(x):
+            y = x + 1
+            aux = y[:, :1]
+            return y, aux
+
+        RuntimeMetadataMismatchTensor.view_ctx = "compile_ctx"
+        x = RuntimeMetadataMismatchTensor(
+            torch.randn(3, 3, requires_grad=True), "base_ctx"
+        )
+        compiled_f = aot_function(
+            f,
+            fw_compiler=nop,
+            bw_compiler=nop,
+            partition_fn=min_cut_rematerialization_partition,
+        )
+        compiled_f(x)
+
+        RuntimeMetadataMismatchTensor.view_ctx = "runtime_ctx"
+        x2 = RuntimeMetadataMismatchTensor(
+            torch.randn(3, 3, requires_grad=True), "base_ctx"
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "outer replay does not reconstruct wrapper metadata",
+        ):
+            compiled_f(x2)
+
     @torch._functorch.config.patch(
         {
             "disable_guess_zero_tangent_for_mutated_input_subclass": True,
@@ -9863,6 +10265,9 @@ metadata incorrectly.
         self.assertEqual(a_test, a_ref)
         self.assertEqual(b_test.a, b_ref.a)
         self.assertEqual(b_test.b, b_ref.b)
+        self.assertTensorMetadataEqual(a_test, a_ref)
+        self.assertTensorMetadataEqual(b_test, b_ref)
+        self.assertTensorMetadataEqual(out_test, out_ref)
 
         # NOTE: we need to use b in our gradient compute. Otherwise we will need to recompile the backward.
         (b_ref * out_ref).sum().backward()
@@ -9873,9 +10278,6 @@ metadata incorrectly.
         self.assertEqual(b_ref_base.grad.a, b_test_base.grad.a)
         self.assertEqual(b_ref_base.grad.b, b_test_base.grad.b)
 
-    # NB: Metadata mutation for subclasses is currently broken and disabled
-    # See https://github.com/pytorch/pytorch/issues/114975
-    @unittest.expectedFailure
     def test_aot_dispatch_input_metadata_mutation(self):
         def f(a, b):
             a.t_()
@@ -9916,6 +10318,9 @@ metadata incorrectly.
         self.assertEqual(a_test, a_ref)
         self.assertEqual(b_test.a, b_ref.a)
         self.assertEqual(b_test.b, b_ref.b)
+        self.assertTensorMetadataEqual(a_test, a_ref)
+        self.assertTensorMetadataEqual(b_test, b_ref)
+        self.assertTensorMetadataEqual(out_test, out_ref)
 
         # NOTE: we need to use b in our gradient compute. Otherwise we will need to recompile the backward.
         (b_ref * out_ref).sum().backward()
@@ -9926,8 +10331,7 @@ metadata incorrectly.
         self.assertEqual(b_ref_base.grad.a, b_test_base.grad.a)
         self.assertEqual(b_ref_base.grad.b, b_test_base.grad.b)
 
-    # NB: Metadata mutation for subclasses is currently broken and disabled
-    # See https://github.com/pytorch/pytorch/issues/114975
+    # NB: Mixed data and metadata mutations still need tangent metadata support.
     @unittest.expectedFailure
     def test_aot_dispatch_input_data_and_metadata_mutation(self):
         def f(a, b):
@@ -11780,8 +12184,6 @@ instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for=onl
 @xfail_inherited_tests(
     [
         "test_set__and_data_mutation_bad",
-        "test_subclass_metadata_mutation_req_grad_True",
-        "test_subclass_metadata_mutation_req_grad_False",
     ]
 )
 class TestAOTAutogradWithDynamo(TestAOTAutograd):
@@ -12125,6 +12527,21 @@ class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
                 dynamic=dynamic,
                 make_inputs_subclasses=make_inputs_subclasses,
             )
+
+    def test_output_alias_of_intermediate_subclass_view_meta_replay_dynamic_cache(
+        self,
+    ):
+        def f(x):
+            y = x + 1
+            aux = y.view(x.shape[0] * x.shape[1])
+            return y, aux
+
+        self.verify_aot_autograd(
+            f,
+            [ConstantExtraMetadataTensor(torch.randn(2, 2, requires_grad=True))],
+            dynamic=True,
+        )
+        self.assertTrue(self.inductor_cache.cache)
 
     def test_input_mutation_false_aliasing(self):
         # This test is disabled because it fails in strict cache mode

@@ -196,6 +196,13 @@ def autotune_hints_to_configs(
     configs: list[Config] = []
     for hint in hints:
         if hint == AutotuneHint.ONE_ELEMENT_PER_THREAD:
+            if device_props.warp_size is None:
+                log.debug(
+                    "Skipping %s autotune hint because device %s does not report warp_size",
+                    AutotuneHint.ONE_ELEMENT_PER_THREAD,
+                    device_props.type,
+                )
+                continue
             if len(size_hints) == 1:
                 xyz_options = ((block_size // 4, None, None),)
             elif len(size_hints) == 2:
@@ -715,6 +722,7 @@ class CachingAutotuner(KernelInterface):
             and bool(device_prop.major)
             and (device_prop.major >= 8 or torch.version.hip)
             and device_prop.regs_per_multiprocessor is not None
+            and device_prop.warp_size is not None
         )
 
     def _iter_rblock_scale_candidates(self):
@@ -733,8 +741,10 @@ class CachingAutotuner(KernelInterface):
             )
         if not device_prop.multi_processor_count:
             raise AssertionError("device_prop.multi_processor_count is not set")
+        if device_prop.warp_size is None:
+            raise AssertionError("device_prop.warp_size is not set")
         seen_config_hashes: OrderedSet[Hashable] | None = None
-        warp_size = device_prop.warp_size_or_default
+        warp_size = device_prop.warp_size
         for result in self.compile_results:
             triton_config = result.config
             compiled_binary = result.kernel
@@ -776,14 +786,14 @@ class CachingAutotuner(KernelInterface):
             nreg_per_warp = nreg * warp_size
             nreg_per_block = nreg_per_warp * triton_config.num_warps
 
-            # Previously we set max_blocks_per_sm to 'max_threads_per_multi_processo / (32 * num_warps)'
+            # Previously we set max_blocks_per_sm to 'max_threads_per_multi_processor / (warp_size * num_warps)'
             # The formula below is a tighter upper bound since we have the assumption that
             #   nreg > device_prop.regs_per_multiprocessor // device_prop.max_threads_per_multi_processor
             # due to the if condition above and:
             #   regs_per_multiprocessor / nreg_per_block
-            #   = regs_per_multiprocessor / (nreg * 32 * num_warps)
-            #   < regs_per_multiprocessor / ((regs_per_multiprocessor / max_threads_per_multi_processor) * 32 * num_warps)
-            #   = max_threads_per_multi_processor / (32 * num_warps)
+            #   = regs_per_multiprocessor / (nreg * warp_size * num_warps)
+            #   < regs_per_multiprocessor / ((regs_per_multiprocessor / max_threads_per_multi_processor) * warp_size * num_warps)
+            #   = max_threads_per_multi_processor / (warp_size * num_warps)
             # Using a tighter upper bound can reveal more optimization opportunities.
             max_blocks_per_sm = max(
                 device_prop.regs_per_multiprocessor // nreg_per_block, 1
@@ -1045,7 +1055,10 @@ class CachingAutotuner(KernelInterface):
             if backend_options:
                 # Stash backend-only options separately so they do not get mixed into
                 # `constants`, which are interpreted as signature-bound constexpr args.
-                compile_meta["backend_options"] = backend_options
+                compile_meta["backend_options"] = {
+                    **compile_meta.get("backend_options", {}),
+                    **backend_options,
+                }
         compile_meta["constants"].update(cfg_kwargs)
 
         for i in get_constexprs(self.fn):
@@ -1110,19 +1123,22 @@ class CachingAutotuner(KernelInterface):
             for k in tlx_only_cuda_options():
                 if v := getattr(cfg, k, None):
                     options[k] = v
-        if self.device_props.type == "hip":
-            # HIP backend options are consumed by Triton out-of-band from the kernel
-            # signature. They are intentionally *not* present in `constants`.
-            options.update(compile_meta.get("backend_options", {}))
+        # Backend options are consumed by Triton out-of-band from the kernel
+        # signature. They are intentionally *not* present in `constants`.
+        options.update(compile_meta.get("backend_options", {}))
 
         if self.device_props.type == "xpu" and XPU_KERNEL_FORMAT == "zebin":
             options["generate_native_code"] = True
 
         return options
 
-    def _precompile_config(self, cfg: Config) -> _KernelCompileResult:
+    def _precompile_config(
+        self, cfg: Config, *, cc_override: str | int | None = None
+    ) -> _KernelCompileResult:
         """Ahead of time compile a given autotuner config."""
         compile_meta = self._create_compile_meta(cfg)
+        if cc_override is not None:
+            compile_meta["cc"] = cc_override
 
         if self.device_props.type == "cpu":
             triton_helpers.set_driver_to_cpu()
@@ -1778,12 +1794,46 @@ class CachingAutotuner(KernelInterface):
         return launcher
 
     def save_gpu_kernel(self, stream, launcher):
-        """Save compiled GPU kernel metadata to the CudaKernelParamCache."""
+        """Save the selected GPU kernel binary and assembly for AOTI packaging."""
         key = self.inductor_meta.get("kernel_name", None)  # unique kernel name
         if key is None:
             raise AssertionError("kernel_name can not be None")
+        binary = launcher.bin
 
         from torch._inductor import config as inductor_config
+
+        target_cc = None
+        cuda_arch = None
+        if (
+            self.device_props.type == "cuda"
+            and torch.version.hip is None
+            and inductor_config.aot_inductor.emit_multi_arch_kernel
+        ):
+            from torch._inductor.codegen.cuda import compile_utils as cuda_compile_utils
+
+            cuda_arch = cuda_compile_utils._aoti_cuda_target_arch()
+            if inductor_config.cuda.arch is not None:
+                target_cc = cuda_compile_utils._cuda_arch_number(cuda_arch)
+                device_cc = cuda_compile_utils._cuda_arch_number(
+                    str(self.device_props.cc)
+                )
+                if target_cc == device_cc:
+                    target_cc = None
+
+        if target_cc is not None:
+            # Autotuning must run kernels compiled for the actual GPU, but AOTI
+            # needs to package PTX/cubin for the requested deployment target.
+            # Recompile the selected config for the target arch without loading
+            # or benchmarking that binary on the current device.
+            target_result = self._precompile_config(
+                launcher.config, cc_override=target_cc
+            )
+            if isinstance(target_result, TritonCompileResult):
+                binary = target_result.kernel
+            else:
+                raise RuntimeError(
+                    "AOTI CUDA target-arch packaging requires a Triton binary"
+                )
 
         # Prefer Level 0 launch metadata schema (versioned, stable contract)
         # over hasattr probing of CompiledKernel internals.
@@ -1791,7 +1841,7 @@ class CachingAutotuner(KernelInterface):
         # CTA clusters, add num_ctas/cluster_dims here from the schema.
         # Currently num_ctas is already captured via config_to_dict(launcher.config)
         # for scratch space scaling, but is not used in the actual kernel launch.
-        schema = getattr(launcher.bin, "launch_metadata_schema", None)
+        schema = getattr(binary, "launch_metadata_schema", None)
         if schema is not None and inductor_config.use_launch_metadata_schema:
             params = {
                 "mangled_name": schema["entry_name"],
@@ -1805,24 +1855,25 @@ class CachingAutotuner(KernelInterface):
                 "call_args": launcher.call_args,
                 "global_scratch": launcher.global_scratch,
                 "profile_scratch": launcher.profile_scratch,
+                "cuda_arch": cuda_arch,
             }
         else:
             # Fallback: hasattr probing for older Triton versions
             params = {
                 "mangled_name": (
-                    launcher.bin.metadata.name
-                    if hasattr(launcher.bin.metadata, "name")
-                    else launcher.bin.metadata["name"]
+                    binary.metadata.name
+                    if hasattr(binary.metadata, "name")
+                    else binary.metadata["name"]
                 ),
                 "num_warps": (
-                    launcher.bin.num_warps
-                    if hasattr(launcher.bin, "num_warps")
-                    else launcher.bin.metadata.num_warps
+                    binary.num_warps
+                    if hasattr(binary, "num_warps")
+                    else binary.metadata.num_warps
                 ),
                 "shared_mem": (
-                    launcher.bin.shared
-                    if hasattr(launcher.bin, "shared")
-                    else launcher.bin.metadata.shared
+                    binary.shared
+                    if hasattr(binary, "shared")
+                    else binary.metadata.shared
                 ),
                 "stream": stream,
                 "config": config_to_dict(launcher.config),
@@ -1832,28 +1883,28 @@ class CachingAutotuner(KernelInterface):
                 "call_args": launcher.call_args,
                 "global_scratch": launcher.global_scratch,
                 "profile_scratch": launcher.profile_scratch,
+                "cuda_arch": cuda_arch,
             }
 
-        from torch._inductor import config
         from torch._inductor.codecache import CudaKernelParamCache
 
         bin_type = {"hip": "hsaco", "xpu": XPU_KERNEL_FORMAT}.get(
             self.device_props.type, "cubin"
         )
-        binary = launcher.bin.asm[bin_type]
+        kernel_binary = binary.asm[bin_type]
 
         # ROCm multi-arch: capture LLVM IR
-        if torch.version.hip and config.aot_inductor.emit_multi_arch_kernel:
+        if torch.version.hip and inductor_config.aot_inductor.emit_multi_arch_kernel:
             # Multi-arch ROCm: Capture LLVM IR for cross-architecture compilation
             asm_type = "ll"
 
             # llir is the key to obtain LLVM IR from triton
-            asm = launcher.bin.asm.get("llir", None)
+            asm = binary.asm.get("llir", None)
 
             # CRITICAL: Multi-arch compilation cannot proceed without LLVM IR
             # Fail fast with clear error message pointing to the issue
             if not asm:
-                available_keys = list(launcher.bin.asm.keys())
+                available_keys = list(binary.asm.keys())
                 raise RuntimeError(
                     f"ROCm multi-arch requires LLVM IR, but none found. "
                     f"Available keys: {available_keys}. "
@@ -1865,9 +1916,9 @@ class CachingAutotuner(KernelInterface):
             asm_type = {"hip": "amdgcn", "cuda": "ptx", "xpu": "spv"}.get(
                 self.device_props.type
             )
-            asm = launcher.bin.asm.get(asm_type, None)
+            asm = binary.asm.get(asm_type, None)
 
-        CudaKernelParamCache.set(key, params, binary, bin_type, asm, asm_type)
+        CudaKernelParamCache.set(key, params, kernel_binary, bin_type, asm, asm_type)
         self.cuda_kernel_saved = True
 
     def save_cpu_kernel(self, launcher):
@@ -1935,7 +1986,7 @@ class CachingAutotuner(KernelInterface):
         E.g., assuming regular autotune only get one config C1; while max-autotune get 4 configs C1, C2, C3, C4
         and max-autotune figure out C3 is the best.
 
-        Then if coordinate desecnt tuning is run with max-autotune disabled, it will start from C1;
+        Then if coordinate descent tuning is run with max-autotune disabled, it will start from C1;
         while if coordinate descent tuning is run with max-autotune enabled, it will start from C3.
         """
         if not self._should_coordesc_tune:
@@ -4326,7 +4377,12 @@ def _reduction_configs(
         )
 
     contiguous_config = make_config(
-        2 if rnumel <= 2048 else 1,  # 1024 or less is persistent
+        # Default XBLOCK=2 launches too few programs to fill
+        # the device. Prefer XBLOCK=1 so the autotuner has a candidate
+        # that can saturate all CUs.
+        1
+        if (torch.version.hip and size_hints.get("x", 0) <= 64)
+        else (2 if rnumel <= 2048 else 1),  # 1024 or less is persistent
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )

@@ -489,7 +489,7 @@ class TestShapeVarCompile(TestCase):
         )
         with self.assertRaisesRegex(
             torch._dynamo.exc.InternalTorchDynamoError,
-            r"shapes_spec declares L\['n'\] as static with value 10, but got 42",
+            r"shapes_spec declared L\['n'\] as static with value 10, but while tracing we found that it was actually 42",
         ):
             compiled(torch.randn(4), 42)
 
@@ -551,6 +551,37 @@ class TestShapeVarCompile(TestCase):
             str(sym).startswith("u"),
             msg=f"expected unbacked symbol (u-prefix), got {sym!r}",
         )
+
+    def test_non_strict_raw_unbacked_symint_input_raises_dde_on_branching(self):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def fn(n):
+            if n > 1:
+                return torch.ones(())
+            return torch.zeros(())
+
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        n = ShapeEnv().create_unbacked_symint()
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.UserError,
+            "Could not guard on data-dependent expression",
+        ):
+            with torch.compiler._non_strict_tracing_context():
+                compiled(n)
+
+    def test_raw_unbacked_symint_input_graph_breaks_outside_non_strict(self):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        def fn(n):
+            return torch.ones((n,))
+
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        n = ShapeEnv().create_unbacked_symint()
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported,
+            "Attempted to wrap unbacked SymInt",
+        ):
+            compiled(n)
 
     def test_none_entry_is_static(self):
         """A ``None`` entry is implicit static.

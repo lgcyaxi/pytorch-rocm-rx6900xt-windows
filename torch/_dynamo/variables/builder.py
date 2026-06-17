@@ -110,6 +110,7 @@ from torch.utils._python_dispatch import (
     is_traceable_wrapper_subclass_type,
 )
 from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._typing_utils import not_none
 from torch.utils.weak import TensorWeakRef
 
 from .. import config, graph_break_hints, mutation_guard, replay_record, trace_rules
@@ -1368,7 +1369,7 @@ class VariableBuilder:
             if not np:
                 raise AssertionError("numpy must be available for numpy tracing")
             if istype(value, types.MethodType):
-                # Dont guard on cython functions as they dont change ids
+                # Don't guard on cython functions as they don't change ids
                 if inspect.isfunction(value.__func__):
                     install_guard(
                         AttrSource(self.source, "__func__").make_guard(
@@ -1462,6 +1463,22 @@ class VariableBuilder:
                 "apply",
                 py_type=type(value),
             )
+        elif (
+            isinstance(value, types.MethodType)
+            and value.__name__ in ("shuffle", "sample")
+            and isinstance(value.__self__, random.Random)
+            and RandomVariable.is_supported_random_obj(value.__self__)
+        ):
+            # Module-level random.shuffle/random.sample are methods bound to the
+            # module-global random.Random instance. The scalar-returning helpers
+            # (random.random/randint/randrange/uniform) already have a dedicated
+            # RandomValueSource path in UserDefinedObjectVariable; shuffle/sample
+            # return sequences instead, so route them through RandomVariable to
+            # model the RNG state rather than skipping into the random module.
+            random_self = value.__self__
+            obj_source = self.source and AttrSource(self.source, "__self__")
+            obj_vt = VariableTracker.build(self.tx, random_self, obj_source)
+            return GetAttrVariable(obj_vt, value.__name__, py_type=type(value))
         elif isinstance(value, torch._C._ImperativeEngine):
             self.install_guards(GuardBuilder.ID_MATCH)
             return AutogradEngineVariable(value, source=self.source)
@@ -1639,7 +1656,7 @@ class VariableBuilder:
             if value.node.has_hint():
                 new_symint = (
                     self.tx.output.shape_env.create_unspecified_symint_and_symbol(
-                        int(value.node.hint),
+                        int(value.node.hint),  # type: ignore[bad-argument-type]
                         source,
                         dynamic_dim=DimDynamic.DYNAMIC,
                     )
@@ -1649,17 +1666,28 @@ class VariableBuilder:
                     # We need to create an unbacked symint to replace the unbacked symbool.
                     new_symint = self.tx.output.shape_env.create_unbacked_symint()
                 else:
-                    # TODO (yidi): we need to figure out a way to propagate the guards
-                    # we accumulated when tracing the subggraph to outer shape_env. For normal symints,
-                    # this is automatically done by evaluating the guards once but this
-                    # will cause data-dependent error when we evaluate the outer unbacked symints.
-                    # The test case that triggers this graph break is test_cond_unbacked_symint_closure
-                    unimplemented(
-                        gb_type="Attempted to wrap unbacked SymInt",
-                        context="",
-                        explanation="Unbacked SymInt input is not supported yet.",
-                        hints=[*graph_break_hints.SUPPORTABLE],
-                    )
+                    shape_env = self.tx.output.shape_env
+                    if not torch.compiler._is_non_strict_tracing():
+                        # TODO: Need to enable this for Dynamo after broader
+                        # verification. See
+                        # test_raw_unbacked_symint_input_graph_breaks_outside_non_strict.
+                        unimplemented(
+                            gb_type="Attempted to wrap unbacked SymInt",
+                            context="",
+                            explanation="Unbacked SymInt input is not supported yet.",
+                            hints=[*graph_break_hints.SUPPORTABLE],
+                        )
+                    if value.node.shape_env is shape_env:
+                        # SymInt already belongs to this ShapeEnv; no
+                        # transfer needed, reuse it directly.
+                        new_symint = value
+                    else:
+                        new_expr = shape_env._transfer_foreign_expr_as_unbacked(
+                            value, source=source
+                        )
+                        new_symint = shape_env.create_symintnode(
+                            new_expr, hint=None, source=source
+                        )
             if new_symint is None:
                 raise AssertionError("new_symint must not be None after wrapping")
             if not isinstance(new_symint, SymInt):
@@ -1679,11 +1707,11 @@ class VariableBuilder:
                 is_tensor=False,
                 example_strong_ref=new_symint,
             )
-            # We bind the new_symint to graph input.
             sym_expr = new_symint.node.expr
-            if not isinstance(sym_expr, sympy.Symbol):
-                raise AssertionError(f"{sym_expr} is not a basic Symbol.")
-            self.tx.output.tracked_fakes.append(TrackedFake(new_symint, source, None))
+            if isinstance(sym_expr, sympy.Symbol):
+                self.tx.output.tracked_fakes.append(
+                    TrackedFake(new_symint, source, None)
+                )
 
             tracing_symint = (
                 new_symint if isinstance(value, torch.SymInt) else new_symint == 1
@@ -2601,8 +2629,9 @@ class VariableBuilder:
                     # Explicit static value — verify the actual matches.
                     if value != int_spec:
                         raise ValueError(
-                            f"shapes_spec declares {self.source.name} as static "
-                            f"with value {int_spec}, but got {value}"
+                            f"shapes_spec declared {self.source.name} as static "
+                            f"with value {int_spec}, but while tracing we found "
+                            f"that it was actually {value}"
                         )
                     self.install_guards(GuardBuilder.CONSTANT_MATCH)
                     return ConstantVariable.create(value=value, source=self.source)
@@ -2943,7 +2972,7 @@ class VariableBuilder:
             value, torch.distributed.tensor.DTensor
         )
         if not is_dtensor:
-            # We guard on the _local_tensor and the _spec, and therefore we dont
+            # We guard on the _local_tensor and the _spec, and therefore we don't
             # have to guard on the outer DTensor.
             self.install_guards(
                 functools.partial(
@@ -4411,7 +4440,7 @@ def _wire_spec_slot(
     """
     from torch.fx.experimental.dynamic_spec import IntVar as _IntVar
 
-    shape_env = size_sym.node.shape_env
+    shape_env = not_none(size_sym.node.shape_env)
 
     if isinstance(spec, _IntVar):
         # Bare IntVar — first occurrence binds the spec sym to this input;
@@ -5134,7 +5163,14 @@ class SourcelessBuilder:
             value,
             (enum.Enum, torch.DispatchKey, torch._C._functorch.TransformType),
         ) or is_pybind11_enum_member(value):
-            return UserDefinedObjectVariable(value)
+            existing = tx.output.side_effects.id_to_variable.get(id(value))
+            if existing is not None:
+                return existing
+            return tx.output.side_effects.track_mutable(
+                value,
+                UserDefinedObjectVariable(value),
+                AttributeMutationNew,
+            )
         elif isinstance(value, (type, abc.ABCMeta)):
             if issubclass(type(value), type) and issubclass(value, BaseException):
                 return UserDefinedExceptionClassVariable(value)

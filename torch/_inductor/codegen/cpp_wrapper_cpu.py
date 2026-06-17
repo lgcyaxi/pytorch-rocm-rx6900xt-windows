@@ -56,6 +56,18 @@ from .wrapper import (
 )
 
 
+def _rewrite_symbol_solution_for_int_codegen(expr: sympy.Expr) -> sympy.Expr:
+    """
+    Convert rational divisions in a solved integer symbol expression to exact
+    integer division before C++ printing.
+    """
+    expr = sympy.together(sympy.sympify(expr))
+    numerator, denominator = sympy.fraction(expr)
+    if denominator == 1:
+        return numerator
+    return CleanDiv(numerator, denominator)
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
@@ -660,24 +672,38 @@ class CppWrapperCpu(PythonWrapperCodegen):
             return f"{name}_stride"
 
         def maybe_emit_replacement_aliases(sym: sympy.Symbol) -> None:
-            # Deferred runtime asserts reference pre-replacement backed
-            # symbols (e.g. s77) that were replaced to this canonical
-            # symbol (s31) during constraint solving. Emit aliases so
-            # the asserts compile. Skip unbacked symbols — they are
-            # defined separately by the unbacked symbol codegen path.
-            from torch.utils._sympy.symbol import symbol_is_type, SymT
+            # Deferred runtime asserts and graph input metadata can reference
+            # either side of a backed-symbol replacement. Emit aliases so both
+            # the pre-replacement and canonical names are defined.
+            def is_backed_symbol(s: sympy.Symbol) -> bool:
+                return not symbol_is_type(s, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT))
+
+            def decl_type(s: sympy.Symbol) -> str:
+                if s.is_integer:
+                    return "int64_t"
+                if s.is_float:
+                    return "double"
+                raise AssertionError("Unexpected symbol type")
 
             for src, tgt in V.graph.sizevars.shape_env.replacements.items():
                 if (
                     tgt == sym
                     and isinstance(src, sympy.Symbol)
                     and src not in bound_vars
-                    and not symbol_is_type(
-                        src, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT)
-                    )
+                    and is_backed_symbol(src)
+                    and is_backed_symbol(sym)
                 ):
-                    code.writeline(f"int64_t {src} = {sym};")
+                    code.writeline(f"{decl_type(src)} {src} = {sym};")
                     bound_vars.add(src)
+                elif (
+                    src == sym
+                    and isinstance(tgt, sympy.Symbol)
+                    and tgt not in bound_vars
+                    and is_backed_symbol(sym)
+                    and is_backed_symbol(tgt)
+                ):
+                    code.writeline(f"{decl_type(tgt)} {tgt} = {sym};")
+                    bound_vars.add(tgt)
 
         def codegen_symbol(
             sym_or_exp: sympy.Symbol | sympy.Expr,
@@ -712,7 +738,8 @@ class CppWrapperCpu(PythonWrapperCodegen):
                 code.writeline(f"int64_t {size_symbol} = {base_name}[{dim}];")
                 solution = try_solve(sympy.Eq(sym_or_exp, size_symbol), free_symbol)
                 if solution is not None:
-                    code.writeline(f"int64_t {free_symbol} = {cexpr(solution[1])};")
+                    expr = _rewrite_symbol_solution_for_int_codegen(solution[1])
+                    code.writeline(f"int64_t {free_symbol} = {cexpr(expr)};")
                     bound_vars.add(free_symbol)
                 else:
                     raise AssertionError(
@@ -1605,6 +1632,8 @@ class CppWrapperCpu(PythonWrapperCodegen):
     def _codegen_entry_impl_prologue(self):
         """Hook for subclasses to emit code at the top of inductor_entry_impl,
         before the GIL is released. Default no-op."""
+        if config.triton.debug_sync_graph:
+            self.generate_debug_sync(self.prefix)
 
     def generate_before_suffix(self, result):
         # Close the entry function. In dual-wrapper-mode `result` is the JIT side;
@@ -2198,6 +2227,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
 
     def codegen_exact_buffer_reuse(self, old_name: str, new_name: str, del_line: str):
         return f"auto {new_name} = std::move({old_name});  // reuse"
+
+    def generate_debug_sync(self, buffer):
+        pass
 
     def generate_profiler_mark_wrapper_call(self, stack):
         self.wrapper_call.writeline(
