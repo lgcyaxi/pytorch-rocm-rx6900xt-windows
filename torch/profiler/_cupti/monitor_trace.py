@@ -21,7 +21,10 @@ except ImportError:
 if TYPE_CHECKING:
     import os
 
-from .cupti_python import Driver_api_trace_cbid, Runtime_api_trace_cbid
+from cupti.cupti import (  # pyrefly: ignore[missing-import]
+    Driver_api_trace_cbid,
+    Runtime_api_trace_cbid,
+)
 
 
 # Matches the value Kineto uses to round the trace base time down to a ~3-month

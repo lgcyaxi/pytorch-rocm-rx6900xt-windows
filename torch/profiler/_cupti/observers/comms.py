@@ -57,7 +57,8 @@ from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass, field
 from typing import Any
 
-from torch.profiler._cupti.cupti_python import ActivityKind
+from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
 from torch.profiler._cupti.observers.base import CuptiMonitorObserver
 from torch.profiler._cupti.records import Api, CudaEvent, ExternalCorrelation, Kernel
 

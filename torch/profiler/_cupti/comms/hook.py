@@ -227,8 +227,9 @@ class _GraphCommAnchor:
         (the eager records would be captured)."""
         if not self._pending:
             return
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
         import torch
-        from torch.profiler._cupti.cupti_python import ActivityKind
         from torch.profiler._cupti.records import CudaEvent
         from torch.profiler._cupti.utils.graph_side_stream import eager_record
 
