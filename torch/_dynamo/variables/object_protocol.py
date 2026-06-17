@@ -598,7 +598,7 @@ def generic_setitem(
     if type_implements_sq_ass_item(o_type):
         key_type = maybe_get_python_type(key)
         if pyindex_check(key_type):
-            key_value = pynumber_as_ssize_t(tx, key)
+            key_value = pynumber_as_ssize_t(tx, key, err=IndexError)
             return vt_sequence_setitem(tx, o, key_value, value)
         raise_type_error(
             tx, f"sequence index must be integer, not '{key.python_type_name()}'"
