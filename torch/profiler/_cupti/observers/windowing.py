@@ -133,6 +133,9 @@ class WindowFinalizerMixin:
         comparison stays order-equivalent (convert_time is monotonic)."""
         return self.now_native_ns()
 
+    def now_native_ns(self) -> int:
+        raise NotImplementedError
+
     def _collect_delivered(self, *, sync: bool) -> None:
         raise NotImplementedError
 
