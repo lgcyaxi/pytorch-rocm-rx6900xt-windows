@@ -11,6 +11,7 @@ size cap so the comment stays under GitHub's ~65k limit.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -35,15 +36,22 @@ def _plats(fs: frozenset[str], all_jobs: set[str]) -> str:
     return "all platforms" if set(fs) == all_jobs else ", ".join(sorted(fs))
 
 
-def _linker(loc_map: dict, sha: str, repo: str) -> Callable[[str], str | None]:
-    """Build test-id -> blob URL from a {test_id: [file, line]} map, or None if the
-    test has no recorded location (left unlinked)."""
+def _linker(
+    loc_map: dict, repo: str, pr: int | None, sha: str, side: str
+) -> Callable[[str], str | None]:
+    """Build test-id -> source URL from a {test_id: [file, line]} map (None when the
+    test has no recorded location). With a PR number, link into the PR's diff view --
+    the file anchor is sha256 of the path, side 'R' = added (new) line, 'L' = removed
+    (old) line. Without a PR (e.g. CLI --json), fall back to a blob link at `sha`."""
 
     def link(test_id: str) -> str | None:
         loc = loc_map.get(test_id)
         if not loc:
             return None
         path, line = loc
+        if pr:
+            anchor = "diff-" + hashlib.sha256(path.encode()).hexdigest()
+            return f"https://github.com/{repo}/pull/{pr}/files#{anchor}{side}{line}"
         return f"https://github.com/{repo}/blob/{sha}/{path}#L{line}"
 
     return link
@@ -79,7 +87,7 @@ def render(res: dict) -> str:
     all_jobs = set(job_names)
     header = (
         f"{MARKER}\n"
-        f"### Test changes\n\n"
+        f"### Test Change Dashboard\n\n"
         f"`{_short(res['from'])}..{_short(res['to'])}` across {len(job_names)} platforms "
         f"— **+{len(added)} added, −{len(removed)} removed**"
     )
@@ -95,8 +103,9 @@ def render(res: dict) -> str:
             "",
         ]
     repo = os.environ.get("GITHUB_REPOSITORY", "pytorch/pytorch")
-    add_link = _linker(res.get("added_loc", {}), res["to"], repo)
-    rem_link = _linker(res.get("removed_loc", {}), res["from"], repo)
+    pr = res.get("pr")
+    add_link = _linker(res.get("added_loc", {}), repo, pr, res["to"], "R")
+    rem_link = _linker(res.get("removed_loc", {}), repo, pr, res["from"], "L")
     parts += _section("➕ Added", added, all_jobs, add_link)
     parts += _section("➖ Removed", removed, all_jobs, rem_link)
 
