@@ -1672,6 +1672,47 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 return empty_result.call_method(tx, "fill_", [fill_value], {})
             return None
 
+        @register(torch.tensor_split)
+        def handle_tensor_split(
+            self,
+            tx: "InstructionTranslatorBase",
+            *args: VariableTracker,
+            **kwargs: VariableTracker,
+        ) -> VariableTracker | None:
+            indices_or_sections = (
+                args[1] if len(args) >= 2 else kwargs.get("indices_or_sections")
+            )
+            if not isinstance(indices_or_sections, TensorVariable):
+                return None
+
+            example_value = indices_or_sections.as_proxy().node.meta.get(
+                "example_value"
+            )
+            if (
+                example_value is None
+                or example_value.dim() != 0
+                or example_value.device.type != "cpu"
+                or example_value.dtype != torch.int64
+                or (item_memo := example_value.item_memo) is None
+            ):
+                return None
+
+            sections = torch.fx.experimental.symbolic_shapes.guard_scalar(item_memo)
+            if not isinstance(sections, int):
+                return None
+
+            # tensor_split's scalar-tensor overload needs a concrete output
+            # arity. Guard the memoized value here so downstream AOT tracing
+            # does not re-read the 0-D tensor as a fresh unbacked scalar.
+            sections_vt = ConstantVariable.create(sections)
+            if len(args) >= 2:
+                args = (args[0], sections_vt, *args[2:])
+            else:
+                kwargs["indices_or_sections"] = sections_vt
+            return TorchInGraphFunctionVariable(torch.tensor_split).call_function(
+                tx, list(args), kwargs
+            )
+
         @register(torch._foreach_lerp_)
         def handle_inplace_foreach_lerp_scalar(
             _: Any,
@@ -2248,6 +2289,23 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 )
             return tx.symbolic_torch_function_state.mode_stack[ind]
 
+        @register(torch.utils._python_dispatch._get_current_dispatch_mode_stack)
+        def handle_get_current_dispatch_mode_stack(
+            self,
+            tx: "InstructionTranslatorBase",
+            *args: VariableTracker,
+            **kwargs: VariableTracker,
+        ) -> VariableTracker:
+            if args or kwargs:
+                raise_type_error(
+                    tx,
+                    "_get_current_dispatch_mode_stack() takes no arguments",
+                )
+            # During tracing, Dynamo runs with dispatch modes removed, so
+            # the stack is always empty. Return [] as a constant instead
+            # of graph-breaking.
+            return VariableTracker.build(tx, [])
+
         @register(torch.get_device_module.__wrapped__)
         def handle_get_device_module(
             self,
@@ -2459,6 +2517,14 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                 raise_type_error(
                     tx,
                     f"{self.value.__name__}() missing 1 required positional argument: 'cond'",
+                )
+
+            if predicate_vt.is_tensor():
+                raise_type_error(
+                    tx,
+                    "cond must be a bool, but got a Tensor. "
+                    "For tensor conditions, use torch._check_tensor_all() "
+                    "to assert that all elements are true.",
                 )
 
             message_eager = None
@@ -3971,11 +4037,6 @@ For now, dynamo will explicitly graph break when it encounters user code with th
                 (torch._ops.OpOverload, torch._ops.OpOverloadPacket),
             )
         ) and can_dispatch_torch_function(tx, args, kwargs)
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, VariableTracker):
-            return False
-        return self.as_python_constant() == other.as_python_constant()
 
 
 class DispatchKeySetVariable(BaseTorchVariable):

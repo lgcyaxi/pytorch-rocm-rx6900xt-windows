@@ -34,6 +34,11 @@ def _linear_cross_entropy_batch_chunked_setup_context(ctx, inputs, output):
         compute_linear_weight_grad,
         compute_linear_bias_grad,
     ) = inputs
+    # Without this, backward through the loss materializes zero-filled
+    # gradients for the three unused grad outputs -- (N, F) + (C, F) + (C,)
+    # at input dtype -- silently adding an input+weight-sized transient to
+    # every backward peak. The backward only consumes the loss gradient.
+    ctx.set_materialize_grads(False)
     ctx.allow_retain_graph = allow_retain_graph
     ctx.compute_input_grad = compute_input_grad
     ctx.compute_linear_weight_grad = compute_linear_weight_grad
@@ -1077,6 +1082,11 @@ def _linear_cross_entropy_batch_chunked_backward(
     ctx, grad_output, _gi_grad, _gw_grad, _gb_grad
 ):
     result = [None] * _NUM_OP_INPUTS
+    # set_materialize_grads(False): grad_output is None when backward is
+    # driven only through the (unsupported) grad outputs -- no gradient
+    # flows through the loss, so none flow to the inputs.
+    if grad_output is None:
+        return tuple(result)
     if ctx.compute_input_grad:
         if ctx.allow_retain_graph:
             result[0] = ctx._gi * grad_output
@@ -1186,7 +1196,20 @@ def _linear_cross_entropy_batch_chunked_no_reduction_setup_context(ctx, inputs, 
         acc_policy,
         acc_dtype,
     ) = inputs
-    ctx.save_for_backward(input, linear_weight, target, linear_bias, weight)
+    # Detach before saving: the backward recomputes the grads analytically
+    # from these values (it does not differentiate through them), and saving
+    # ``linear_weight`` -- a differentiable ``reshape`` view of the
+    # ``nn.Linear`` weight -- would make its SavedVariable retain the base
+    # parameter, inflating its use_count past backward and breaking
+    # swap-based ``module.to()`` (the custom-op node keeps saved tensors
+    # alive while the loss output is still referenced).
+    ctx.save_for_backward(
+        input.detach(),
+        linear_weight.detach(),
+        target,
+        linear_bias.detach() if linear_bias is not None else None,
+        weight.detach() if weight is not None else None,
+    )
     ctx._ignore_index = ignore_index
     ctx._batch_chunk_size = batch_chunk_size
     ctx._acc_policy = acc_policy

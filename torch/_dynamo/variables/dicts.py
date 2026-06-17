@@ -61,7 +61,7 @@ from .base import (
 )
 from .constant import ConstantVariable
 from .hashable import HashableTracker, is_hashable, raise_unhashable
-from .object_protocol import vt_getitem
+from .object_protocol import generic_richcompare_bool, vt_getitem
 from .sets import SetVariable
 
 
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
 # [Adding a new supported class within the keys of ConstDictVariable]
 # - Implement hash_impl(self, tx) on the VariableTracker subclass (or rely on the
 #   base class default which uses get_real_python_backed_value())
-# - Implement is_python_equal() for key equality
+# - Implement richcompare_impl() for key equality
 
 
 def pydict_check(obj: VariableTracker) -> bool:
@@ -1348,7 +1348,9 @@ class DictItemsVariable(DictViewVariable):
             if key_ht not in self.dv_dict.items:
                 return VariableTracker.build(tx, False)
             stored = self.dv_dict.items[key_ht]
-            return VariableTracker.build(tx, val.is_python_equal(stored))
+            # dictitems_contains: PyObject_RichCompareBool(found, value, Py_EQ)
+            # on the stored value, so a value whose __eq__ raises propagates.
+            return generic_richcompare_bool(tx, stored, val, "__eq__")
 
         return iter_contains(self.view_items_vt, item, tx)
 
