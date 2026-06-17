@@ -9,6 +9,15 @@ import time as _time
 from typing import cast, TYPE_CHECKING
 
 
+# orjson serializes/parses ~3-8x faster than stdlib json on large traces and emits
+# bytes directly; it isn't a torch dependency (absent in CI), so use it when present
+# and fall back to json otherwise.
+try:
+    import orjson as _orjson  # pyrefly: ignore[missing-import]
+except ImportError:
+    _orjson = None  # type: ignore[assignment]
+
+
 if TYPE_CHECKING:
     import os
 
@@ -670,8 +679,9 @@ def merge_trace_window_into_chrome_trace(
     cpu_trace_path = str(cpu_trace_path)
     output_path = str(output_path)
     input_opener = gzip.open if cpu_trace_path.endswith(".gz") else open
-    with input_opener(cpu_trace_path, "rt") as f:
-        data = json.load(f)
+    with input_opener(cpu_trace_path, "rb") as f:
+        raw = f.read()
+    data = _orjson.loads(raw) if _orjson is not None else json.loads(raw)
 
     base_ns = int(data.get("baseTimeNanoseconds", _default_base_ns()))
     original_events = list(data.get("traceEvents", []))
@@ -773,6 +783,17 @@ def merge_trace_window_into_chrome_trace(
     data["traceEvents"] = events
     data["traceName"] = trace_name or output_path
 
-    output_opener = gzip.open if output_path.endswith(".gz") else open
-    with output_opener(output_path, "wt") as f:
-        json.dump(data, f, separators=(",", ":"))
+    # Encode once and write the whole buffer: json.dump streaming through gzip's text
+    # wrapper re-encodes per chunk and is ~3-5x slower on large (tens-of-MB) traces.
+    # compresslevel=1 favors export throughput over file size (the export runs off the
+    # training thread, but this still cuts wait_for_exports / step-export latency).
+    if _orjson is not None:
+        payload = _orjson.dumps(data)
+    else:
+        payload = json.dumps(data, separators=(",", ":")).encode()
+    if output_path.endswith(".gz"):
+        with gzip.open(output_path, "wb", compresslevel=1) as f:
+            f.write(payload)
+    else:
+        with open(output_path, "wb") as f:
+            f.write(payload)
