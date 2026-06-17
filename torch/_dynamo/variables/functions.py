@@ -643,10 +643,15 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         return self.fn.__globals__
 
     def should_allow_nested_graph_breaks(self) -> bool:
-        from torch._dynamo.trace_rules import BUILTIN_INLINE_WHEN_CALLED
+        from torch._dynamo.trace_rules import (
+            BUILTIN_INLINE_WHEN_CALLED,
+            is_ngb_suppressed_inline,
+        )
 
         filename = self.get_filename()
         if any(filename.startswith(d) for d in BUILTIN_INLINE_WHEN_CALLED):
+            return False
+        if is_ngb_suppressed_inline(filename):
             return False
         return True
 
@@ -1047,9 +1052,6 @@ class UserFunctionVariable(BaseUserFunctionVariable):
                 collected.extend(flat)
             return collected
         return None
-
-    def is_python_equal(self, other: object) -> bool:
-        return isinstance(other, variables.UserFunctionVariable) and self.fn is other.fn
 
 
 class InspectSignatureVariable(UserFunctionVariable):
@@ -2517,12 +2519,6 @@ class SkipFunctionVariable(VariableTracker):
 
         return fn_var_getattr(tx, self.value, self.source, name)
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
 
 class WrappedSkipFunctionVariable(SkipFunctionVariable):
     def __init__(
@@ -3046,22 +3042,6 @@ class FunctoolsPartialVariable(VariableTracker):
             result.cache_hash = self.original_cache_hash  # type: ignore[missing-attribute]
         return result
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, FunctoolsPartialVariable)
-            and self.func.is_python_equal(other.func)
-            and all(
-                arg_a.is_python_equal(arg_b)
-                for (arg_a, arg_b) in zip(self.args, other.args)
-            )
-            and all(
-                value_a.is_python_equal(value_b)
-                for (value_a, value_b) in zip(
-                    self.keywords.values(), other.keywords.values()
-                )
-            )
-        )
-
 
 class PolyfilledFunctionVariable(VariableTracker):
     _nonvar_fields = {
@@ -3371,10 +3351,8 @@ class DynamoTritonHOPifier(TritonHOPifier):
         variable: "TritonKernelVariable",
         grids: Any,
         combined_args: dict[str, Any],
-        launch_kwargs: tuple[str, ...],
-        kernel_arg_names: set[str],
         tx: "InstructionTranslatorBase",
-    ) -> ConstantVariable | None:
+    ) -> "variables.ConstantVariable":
         from .dicts import ConstDictVariable
 
         # as we can only pass tensors as non-const args in fx graph,
@@ -3414,24 +3392,6 @@ class DynamoTritonHOPifier(TritonHOPifier):
             for k, v in combined_args_vt.items()
             if not (isinstance(v, VariableTracker) and v.is_python_constant())
         }
-        # launch_kwargs records the names passed as kwargs at the Triton launch
-        # site. A non-kernel launch kwarg can only be a compiler option, so it
-        # must be a Python constant before entering the graph. Kernel launch
-        # kwargs may also be compiler options, but that target-specific check
-        # happens in Inductor after the triton backend is determined and
-        # backend.parse_options() is called.
-        non_const_options: list[str] = []
-        for k in launch_kwargs:
-            if k in kernel_arg_names:
-                continue
-            v = combined_args[k]
-            if not (isinstance(v, VariableTracker) and v.is_python_constant()):
-                non_const_options.append(k)
-        if non_const_options:
-            self.raise_unsupported(
-                "Triton backend options must be Python constants: "
-                f"{sorted(non_const_options)!r}."
-            )
 
         for v in non_constant_args.values():
             v = v.realize()
@@ -3452,7 +3412,6 @@ class DynamoTritonHOPifier(TritonHOPifier):
                 "grid": grids,
                 "tma_descriptor_metadata": tma_descriptor_metadata,
                 "kwargs": meta.as_proxy(),
-                "launch_kwargs": launch_kwargs,
             },
         )
 
@@ -4086,14 +4045,6 @@ class MethodWrapperVariable(VariableTracker):
         from .object_protocol import python_constant_richcompare_impl
 
         return python_constant_richcompare_impl(self, tx, other, op)
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, VariableTracker):
-            return False
-        try:
-            return self.as_python_constant() == other.as_python_constant()
-        except NotImplementedError:
-            return False
 
 
 class MethodDescriptorVariable(VariableTracker):

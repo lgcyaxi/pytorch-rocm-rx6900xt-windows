@@ -745,7 +745,7 @@ def pylong_as_ssize_t(tx: "InstructionTranslatorBase", obj: VariableTracker) -> 
 
     https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/longobject.c#L576
     """
-    # Starting on Python 3.16, this will explictly require an integer instance
+    # Starting on Python 3.16, this will explicitly require an integer instance
     # https://docs.python.org/3/deprecations/index.html#pending-removal-in-python-3-16
     if not issubclass(obj.python_type(), int):
         raise_type_error(tx, "an integer is required")
@@ -811,7 +811,7 @@ def pynumber_index(
 
     result = obj.nb_index_impl(tx)
 
-    if not isinstance(result.as_python_constant(), int):
+    if not issubclass(result.python_type(), int):
         raise_type_error(
             tx,
             f"__index__ returned non-int (type {result.python_type_name()})",
