@@ -1,15 +1,12 @@
 # mypy: allow-untyped-defs
 """CUPTI type and constant definitions used by the in-process monitor.
 
-This module is the single place that reaches into the ``cupti-python`` package
-and into CUPTI's ABI constants. The cupti-python module is imported lazily and
-cached by :func:`_cupti`, and the activity-kind enum the monitor needs is
-re-exported as a module attribute resolved on first access (see
-:func:`__getattr__`). Callers therefore just import what they use --
-``from .cupti_python import ActivityKind`` -- and write ``ActivityKind.MEMCPY``
-directly (cupti-python's enums are ``IntEnum``, so kind members compare equal to
-the raw integer kind read from a record), while the cupti import stays deferred
-until one of those names is first touched.
+This module reaches into CUPTI's ABI constants. It does not re-export
+cupti-python's types; callers import those directly
+(``from cupti.cupti import ActivityKind``). The enums this module itself needs at
+runtime are imported eagerly below; ones used only in annotations are imported
+under ``TYPE_CHECKING``. cupti-python is a hard requirement, so importing this
+module without it raises ``ModuleNotFoundError`` (catchable by optional consumers).
 """
 
 from __future__ import annotations
@@ -18,17 +15,27 @@ import ctypes
 import os
 from collections.abc import Iterable  # noqa: TC003
 from functools import lru_cache
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
+
+
+# cupti-python enums used at runtime. cupti-python is a hard requirement of this
+# module; its absence surfaces as a catchable ModuleNotFoundError for optional
+# consumers (e.g. those probing the monitor import).
+try:
+    from cupti.cupti import (  # pyrefly: ignore[missing-import]
+        ExternalCorrelationKind,
+        Runtime_api_trace_cbid,
+    )
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "torch.profiler._cupti requires the cupti-python package. "
+        "Install cupti-python to use the experimental CUPTI monitor."
+    ) from exc
 
 
 if TYPE_CHECKING:
-    # cupti-python's enum classes, for typing the pylibcupti method signatures.
-    # (Resolved to Any by pyrefly -- the cupti stub is a missing-import -- but the
-    # signatures still read as the intended CUPTI types.)
-    from cupti.cupti import (  # pyrefly: ignore[missing-import]
-        ActivityKind,
-        ExternalCorrelationKind,
-    )
+    # Used only in pylibcupti method signatures (Any to pyrefly; cupti has no stub).
+    from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
 
 # Environment override for the libcupti to dlopen; see find_cupti_library().
@@ -70,43 +77,6 @@ OVERHEAD_KIND_NAMES: dict[int, str] = {
     7 << 16: "Activity Buffer Request",
     8 << 16: "UVM Activity Init",
 }
-
-# cupti-python names re-exported lazily by __getattr__: the enums the monitor and
-# trace builder need. Resolved off the cupti module on first access.
-_REEXPORTED = frozenset(
-    {
-        "ActivityKind",
-        "ExternalCorrelationKind",
-        "Runtime_api_trace_cbid",
-        "Driver_api_trace_cbid",
-    }
-)
-
-
-@lru_cache(maxsize=1)
-def _cupti() -> Any:
-    """Import and return the cupti-python module (once, cached)."""
-    try:
-        from cupti import cupti as cc  # pyrefly: ignore[missing-import]
-    except ModuleNotFoundError as exc:
-        # Keep this a ModuleNotFoundError (not a bare ImportError) so optional
-        # consumers that probe `import torch.profiler._cupti.monitor` degrade
-        # gracefully when cupti-python is absent.
-        raise ModuleNotFoundError(
-            "torch.profiler._cupti requires the cupti-python package. "
-            "Install cupti-python to use the experimental CUPTI monitor."
-        ) from exc
-
-    return cc
-
-
-def __getattr__(name: str) -> Any:
-    # Lazily expose cupti-python's enums and record classes as attributes of
-    # this module, so callers can `from .cupti_python import ActivityKind` and
-    # use `ActivityKind.MEMCPY` directly while the cupti import stays deferred.
-    if name in _REEXPORTED:
-        return getattr(_cupti(), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def find_cupti_library() -> str:
@@ -299,7 +269,7 @@ def _noisy_runtime_cbids() -> list[int]:
     """The cbid values for :data:`_NOISY_RUNTIME_API_NAMES`, resolved from the cupti enum
     (``_vNNNN`` version suffix stripped). Empty when the enum is unavailable."""
     try:
-        members = _cupti().Runtime_api_trace_cbid.__members__
+        members = Runtime_api_trace_cbid.__members__
     except Exception:
         return []
     out: list[int] = []
@@ -553,7 +523,7 @@ class _PyLibCupti:
         a user-defined-record subscriber is active, so the subscriber-aware _v2
         variant is used when a handle is given and it's available."""
         if kind is None:
-            kind = _cupti().ExternalCorrelationKind.CUSTOM1
+            kind = ExternalCorrelationKind.CUSTOM1
         if sub_handle is not None and hasattr(
             self._lib, "cuptiActivityPushExternalCorrelationId_v2"
         ):
@@ -574,7 +544,7 @@ class _PyLibCupti:
         """Pop the most recent external-correlation id (default kind CUSTOM1), or
         None on failure. Pass ``sub_handle`` on the v2 path (see the push docstring)."""
         if kind is None:
-            kind = _cupti().ExternalCorrelationKind.CUSTOM1
+            kind = ExternalCorrelationKind.CUSTOM1
         last = ctypes.c_uint64()
         if sub_handle is not None and hasattr(
             self._lib, "cuptiActivityPopExternalCorrelationId_v2"

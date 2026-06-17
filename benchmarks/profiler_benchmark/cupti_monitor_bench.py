@@ -195,7 +195,8 @@ def _node_timer_fields():
     # The NodeTimerObserver field selection: just the compact kernel timing fields.
     # Far fewer fields than PROFILER_FIELDS and a single kind -> the monitor's
     # vectorized stride decode, so its always-on cost should be the lower bound.
-    from torch.profiler._cupti.cupti_python import ActivityKind
+    from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
     from torch.profiler._cupti.records import Kernel
 
     return {

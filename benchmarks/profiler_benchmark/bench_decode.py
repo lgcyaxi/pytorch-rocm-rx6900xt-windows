@@ -44,8 +44,9 @@ import json
 import time
 from typing import Any
 
+from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
 import torch
-from torch.profiler._cupti.cupti_python import ActivityKind
 from torch.profiler._cupti.monitor import CuptiMonitorBuffer
 from torch.profiler._cupti.records import Kernel
 

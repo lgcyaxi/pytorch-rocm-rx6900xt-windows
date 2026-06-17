@@ -60,7 +60,9 @@ def _producer_worker(rank, world_size, q):
 def _full_path_worker(rank, world_size, q):
     # Validates the whole chain: plugin blob + monitor decode + the join attaching
     # event["metadata"] onto the real NCCL kernel.
-    from torch.profiler._cupti.cupti_python import ActivityKind, CuptiError
+    from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+    from torch.profiler._cupti.cupti_python import CuptiError
     from torch.profiler._cupti.monitor import enable_nccl_metadata_plugin, instance
     from torch.profiler._cupti.observers.profiler import _attach_metadata
     from torch.profiler._cupti.records import Api, ExternalCorrelation, Kernel
