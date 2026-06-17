@@ -2873,6 +2873,50 @@ def forward(self, arg0_1, arg1_1):
         self._assert_triton_compile_option(options, "enable_fp_fusion", False)
 
     @requires_gpu
+    def test_triton_kernel_backend_options_preserved_in_fx_wrapper_hop(self):
+        add_kernel = _get_backend_options_kernel(with_enable_fp_fusion=False)
+        f = _get_backend_options_fn(add_kernel, BLOCK_SIZE=128, enable_fp_fusion=False)
+
+        from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+        from torch._inductor.codegen.wrapper_fxir import FxConverter
+
+        captured_gms = []
+        orig_generate = FxConverter.generate
+
+        def record_generate(self):
+            gm = orig_generate(self)
+            captured_gms.append(gm)
+            return gm
+
+        x = torch.randn(4, device=GPU_TYPE)
+        with (
+            inductor_config.patch({"fx_wrapper": True, "compile_threads": 1}),
+            mock.patch.object(FxConverter, "generate", record_generate),
+        ):
+            out = torch.compile(f, fullgraph=True)(x, x)
+
+        self.assertEqual(out, x + x)
+        self.assertTrue(captured_gms)
+        hop_node = next(
+            node
+            for node in captured_gms[0].graph.nodes
+            if node.op == "call_function"
+            and node.target is triton_kernel_wrapper_mutation
+            and "enable_fp_fusion" in node.kwargs["launch_kwargs"]
+        )
+        constant_args = kernel_side_table.get_constant_args(
+            hop_node.kwargs["constant_args_idx"]
+        )
+        hop_kwargs = {**hop_node.kwargs["kwargs"], **constant_args}
+
+        # The FX wrapper runs the HOP directly, so names alone are not enough:
+        # non-signature backend options also need their values in the HOP
+        # payload. Otherwise the direct FXIR run re-enters Triton JIT with
+        # default compiler options and may compile a different kernel.
+        self.assertEqual(hop_node.kwargs["launch_kwargs"], ("enable_fp_fusion",))
+        self.assertEqual(hop_kwargs["enable_fp_fusion"], False)
+
+    @requires_gpu
     def test_triton_kernel_special_kwargs_with_autotune_use_configs(self):
         # SPECIAL_CONFIG_NAMES keep the existing behavior: they update Triton
         # configs instead of being preserved as generic backend options.

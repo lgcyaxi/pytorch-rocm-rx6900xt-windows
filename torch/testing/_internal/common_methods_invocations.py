@@ -1023,10 +1023,7 @@ def error_inputs_linspace(op, device, **kwargs):
         error_regex="received an invalid combination of arguments - got \\(int, int, float",
     )
     yield ErrorInput(
-        SampleInput(
-            torch.tensor([[1, 1], [1, 1]], device=device),
-            args=(torch.tensor([[3, 3], [3, 3]], device=device), 1),
-        ),
+        SampleInput(torch.tensor([1, 1], device=device), args=(torch.tensor([3, 3], device=device), 1)),
         error_type=RuntimeError,
         error_regex="only supports 0-dimensional start and end tensors"
     )
@@ -22562,8 +22559,6 @@ op_db: list[OpInfo] = [
            dtypes=floating_and_complex_types(),
            dtypesIfCUDA=floating_and_complex_types(),
            skips=(
-               # NotImplementedError: The operator 'aten::_linalg_svd.U' is not currently implemented for the MPS device
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', device_type='mps'),
                # Dispatches in Python to matrix_norm. Not sure how to make this test happy
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit',
                             dtypes=(torch.complex64, torch.float32,)),)
@@ -27658,6 +27653,7 @@ python_ref_db = [
         skips=(
             # no _refs support for Tensor.__setitem__
             DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref'),
+            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_python_ref_errors'),
         ),
     ),
     PythonRefInfo(

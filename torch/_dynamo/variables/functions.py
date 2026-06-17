@@ -643,10 +643,15 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         return self.fn.__globals__
 
     def should_allow_nested_graph_breaks(self) -> bool:
-        from torch._dynamo.trace_rules import BUILTIN_INLINE_WHEN_CALLED
+        from torch._dynamo.trace_rules import (
+            BUILTIN_INLINE_WHEN_CALLED,
+            is_ngb_suppressed_inline,
+        )
 
         filename = self.get_filename()
         if any(filename.startswith(d) for d in BUILTIN_INLINE_WHEN_CALLED):
+            return False
+        if is_ngb_suppressed_inline(filename):
             return False
         return True
 
@@ -1047,9 +1052,6 @@ class UserFunctionVariable(BaseUserFunctionVariable):
                 collected.extend(flat)
             return collected
         return None
-
-    def is_python_equal(self, other: object) -> bool:
-        return isinstance(other, variables.UserFunctionVariable) and self.fn is other.fn
 
 
 class InspectSignatureVariable(UserFunctionVariable):
@@ -2517,12 +2519,6 @@ class SkipFunctionVariable(VariableTracker):
 
         return fn_var_getattr(tx, self.value, self.source, name)
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
-
 
 class WrappedSkipFunctionVariable(SkipFunctionVariable):
     def __init__(
@@ -3045,22 +3041,6 @@ class FunctoolsPartialVariable(VariableTracker):
         if self.original_cache_hash is not None:
             result.cache_hash = self.original_cache_hash  # type: ignore[missing-attribute]
         return result
-
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, FunctoolsPartialVariable)
-            and self.func.is_python_equal(other.func)
-            and all(
-                arg_a.is_python_equal(arg_b)
-                for (arg_a, arg_b) in zip(self.args, other.args)
-            )
-            and all(
-                value_a.is_python_equal(value_b)
-                for (value_a, value_b) in zip(
-                    self.keywords.values(), other.keywords.values()
-                )
-            )
-        )
 
 
 class PolyfilledFunctionVariable(VariableTracker):
@@ -4087,14 +4067,6 @@ class MethodWrapperVariable(VariableTracker):
 
         return python_constant_richcompare_impl(self, tx, other, op)
 
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, VariableTracker):
-            return False
-        try:
-            return self.as_python_constant() == other.as_python_constant()
-        except NotImplementedError:
-            return False
-
 
 class MethodDescriptorVariable(VariableTracker):
     """Unbound C method descriptor (method_descriptor on a type).
@@ -4482,7 +4454,7 @@ class MemberDescriptorVariable(VariableTracker):
                 return obj.var_getattr(tx, attr_name)
         try:
             resolved = self.descriptor.__get__(obj_value)
-        except AttributeError:
+        except (AttributeError, TypeError):
             raise_observed_exception(
                 AttributeError,
                 tx,
@@ -4569,7 +4541,7 @@ class GetSetDescriptorVariable(VariableTracker):
                 return obj.var_getattr(tx, attr_name)
         try:
             resolved = self.descriptor.__get__(obj_value)
-        except AttributeError:
+        except (AttributeError, TypeError):
             raise_observed_exception(
                 AttributeError,
                 tx,

@@ -859,6 +859,11 @@ def _grad_context_compatible(
     if not _view_base_compatible(symbolic_context, grad_desc):
         return False
 
+    if grad_desc.is_traceable_wrapper_subclass and not isinstance(
+        symbolic_context, SubclassSymbolicContext
+    ):
+        return False
+
     # Check inner (subclass) level
     if isinstance(symbolic_context, SubclassSymbolicContext):
         if grad_desc.attrs is None:
@@ -1145,13 +1150,13 @@ class MetaConverter(Generic[_TensorT]):
                     )
                 else:
                     # FakeTensor from a different ShapeEnv.  Transfer symbols.
+                    # _transfer_foreign_expr picks the hint up via the foreign env.
                     return shape_env.transfer_symbols_from_foreign_shape_env(
                         t.size,
                         t.stride,
                         t.storage_offset,
                         src,
                         symbolic_context=symbolic_context,
-                        hint_overrides=t.dynamo_hint_overrides,
                     )
             else:
                 return (t.size, t.stride, t.storage_offset)

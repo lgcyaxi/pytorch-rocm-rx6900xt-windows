@@ -1592,7 +1592,9 @@ def set_default_device(device: "Device") -> None:
         :func:`torch.from_numpy` and :func:`torch.frombuffer`
 
     Args:
-        device (device or string): the device to set as default
+        device (:class:`torch.device`, str, int, or None): the device to set as
+            default, or ``None`` to clear the override. An integer is
+            interpreted as an index for the current accelerator.
 
     Example::
 
@@ -2705,6 +2707,12 @@ from torch._classes import classes as classes  # usort: skip
 
 sys.modules.setdefault(f"{__name__}.ops", ops)
 sys.modules.setdefault(f"{__name__}.classes", classes)
+
+if hasattr(torch._C, "_c10d_init"):
+    from torch.distributed.distributed_c10d import _register_process_group_opaque_type
+
+    _register_process_group_opaque_type()
+    del _register_process_group_opaque_type
 
 # quantization depends on torch.fx and torch.ops
 # Import quantization
