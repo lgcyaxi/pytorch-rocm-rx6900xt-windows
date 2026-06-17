@@ -1,6 +1,8 @@
 # Owner(s): ["oncall: profiler"]
 
 import ctypes
+import subprocess
+import sys
 import unittest
 
 import torch
@@ -90,6 +92,91 @@ class TestPyLibCupti(TestCase):
             )
         finally:
             lib.unsubscribe(sub_handle)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
+    def test_v2_activity_lifecycle(self):
+        # Drive the subscription-scoped wrapper surface against real libcupti, the
+        # same sequence the monitor runs: push/pop external correlation, arm UDR
+        # with the native buffer callbacks, enable/disable kinds with field
+        # selections, flush, and read the dropped-record count.
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+        from torch.profiler._cupti.records import FIELD_REGISTRY
+
+        monitor_ext = torch._C._profiler._cupti_monitor
+        torch.cuda.init()
+        lib = pylibcupti()
+        try:
+            sub = lib.subscribe()
+        except CuptiError as e:
+            self.skipTest(f"v2 subscribe unavailable on this driver/cupti: {e}")
+        try:
+            # external-correlation push/pop round-trips the id (v2 form, under sub).
+            self.assertTrue(
+                lib.activity_push_external_correlation_id(4242, sub_handle=sub)
+            )
+            self.assertEqual(
+                lib.activity_pop_external_correlation_id(sub_handle=sub), 4242
+            )
+            lib.arm_user_defined_records(
+                sub,
+                monitor_ext.buffer_request_callback_address(),
+                monitor_ext.buffer_complete_callback_address(),
+            )
+            # CONCURRENT_KERNEL + RUNTIME; enabling RUNTIME also exercises
+            # disable_noisy_runtime_apis (best-effort, inside activity_enable).
+            kinds = [ActivityKind.CONCURRENT_KERNEL, ActivityKind.RUNTIME]
+            for kind in kinds:
+                lib.activity_enable(sub, kind, FIELD_REGISTRY[kind])
+            torch.randn(4096, device="cuda").sum()
+            torch.cuda.synchronize()
+            lib.activity_flush_all()  # must not raise
+            self.assertGreaterEqual(lib.activity_get_num_dropped_records(0, 0), 0)
+            for kind in kinds:
+                lib.activity_disable(sub, kind)
+            lib.disarm_user_defined_records(sub)
+        finally:
+            lib.unsubscribe(sub)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
+    def test_activity_enable_hw_trace_toggle(self):
+        # HW-trace is a GLOBAL toggle -- it perturbs process-wide CUPTI state (and
+        # breaks a sibling UDR session), so exercise it in an isolated child that
+        # inherits this process's libcupti via LD_PRELOAD: enable then restore to
+        # the default disabled state. exit(2) means the platform rejects HW trace.
+        script = (
+            "import sys, torch\n"
+            "torch.cuda.init()\n"
+            "from torch.profiler._cupti.cupti_python import pylibcupti, CuptiError\n"
+            "lib = pylibcupti()\n"
+            "try:\n"
+            "    lib.activity_enable_hw_trace(True)\n"
+            "except CuptiError:\n"
+            "    sys.exit(2)\n"
+            "lib.activity_enable_hw_trace(False)\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        if proc.returncode == 2:
+            self.skipTest("HW trace unsupported on this platform")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
+    def test_finalize_in_subprocess(self):
+        # finalize() is cuptiFinalize -- a global, process-wide teardown the monitor
+        # never calls. Run it in a child (which inherits this process's libcupti via
+        # LD_PRELOAD) so it can't tear CUPTI down for sibling tests; a clean exit
+        # means the wrapper's call + rc-check succeeded.
+        script = (
+            "import torch; torch.cuda.init(); "
+            "from torch.profiler._cupti.cupti_python import pylibcupti; "
+            "pylibcupti().finalize()"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":
