@@ -6986,6 +6986,19 @@ for dtype in (torch.int32, torch.int64):
             (torch.randn([4, 12, 2, 64]),),
         )
 
+    def test_prims_normal_fallback(self):
+        def fn():
+            return torch.ops.prims.normal(
+                [2, 3],
+                mean=0.0,
+                std=1.0,
+                dtype=torch.float32,
+                device=torch.device(self.device),
+                requires_grad=False,
+            )
+
+        self.common(fn, ())
+
     def test_embedding(self):
         m = torch.nn.Sequential(
             torch.nn.Embedding(10, 4, padding_idx=0),
