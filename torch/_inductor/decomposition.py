@@ -653,13 +653,21 @@ def normal(
     requires_grad: bool,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    normal_samples = torch.randn(
-        shape,
-        generator=generator,
-        dtype=dtype,
-        device=device,
-        requires_grad=requires_grad,
-    )
+    if generator is None:
+        normal_samples = torch.randn(
+            shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+        )
+    else:
+        normal_samples = torch.randn(
+            shape,
+            generator=generator,
+            dtype=dtype,
+            device=device,
+            requires_grad=requires_grad,
+        )
     return std * normal_samples + mean
 
 
