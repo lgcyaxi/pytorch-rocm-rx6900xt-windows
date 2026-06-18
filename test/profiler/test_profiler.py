@@ -772,7 +772,7 @@ _cupti_monitor.enable_hes_early()
 
         script = textwrap.dedent(
             """
-            import json, tempfile
+            import gzip, json, os, tempfile
             import torch
             from torch.profiler import profile, ProfilerActivity
             from torch._C._profiler import _ExperimentalConfig
@@ -791,7 +791,14 @@ _cupti_monitor.enable_hes_early()
                         (a @ b).relu().sum()
                         torch.cuda.synchronize()
                     prof.export_chrome_trace(f.name)
-                    events = json.load(open(f.name))["traceEvents"]
+                    # cupti_monitor writes the trace deferred + gzipped at <name>.gz;
+                    # wait for it, then read the .gz (stock writes <name> directly).
+                    prof.wait_for_exports()
+                    gz = f.name + ".gz"
+                    if os.path.exists(gz):
+                        events = json.load(gzip.open(gz))["traceEvents"]
+                    else:
+                        events = json.load(open(f.name))["traceEvents"]
                 aten = {e["name"] for e in events
                         if e.get("cat") == "cpu_op"
                         and e.get("name", "").startswith("aten::")}

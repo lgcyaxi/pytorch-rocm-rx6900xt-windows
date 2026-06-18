@@ -306,9 +306,12 @@ class CuptiMonitor:
         self._id_chains: dict[int, tuple[int, ...]] = {}
         self._chains_gc_pending: list[int] = []
         self._chains_gc_ready: list[int] = []
-        self._time_converter = None
         self._session_start_unix_ns = 0
         self._session_start_approx_ns = 0
+        # CUPTI native record clock (cuptiGetTimestamp_v2) at session start, paired
+        # with _session_start_unix_ns so decoded record timestamps (native clock) can
+        # be aligned to unix-epoch ns. 0 until started (convert_time is then identity).
+        self._session_start_native_ns = 0
         self._session_start_calibrated_unix_ns = 0
 
         # Snapshot of the native pool size taken before stop() frees it, so
@@ -347,15 +350,18 @@ class CuptiMonitor:
         _cupti_monitor_native.reset_buffers()
         _cupti_monitor_native.configure_buffers(self.buffer_size)
         self.register_callbacks()
-        self._time_converter = _PY_PROFILER._ApproximateClockToUnixTimeConverter()
         # The approximate-clock timestamp callback is incompatible with the
         # user-defined-record subscriber (cuptiActivityRegisterTimestampCallback ->
-        # CUPTI_ERROR_NOT_COMPATIBLE), so record timestamps stay in CUPTI's native
-        # clock (durations are unaffected; absolute-time alignment is a follow-up).
+        # CUPTI_ERROR_NOT_COMPATIBLE), so decoded record timestamps stay in CUPTI's
+        # native clock (cuptiGetTimestamp_v2). Pair that native clock with unix-epoch
+        # here -- both are real-time nanosecond clocks, so a single offset aligns
+        # record timestamps to unix (durations are a delta, unaffected). Read the two
+        # back-to-back to minimize skew.
         self._session_start_unix_ns = time.time_ns()
+        self._session_start_native_ns = self.now_native_ns()
         self._session_start_approx_ns = _PY_PROFILER._get_approximate_time()
         self._session_start_calibrated_unix_ns = self._convert_time(
-            self._session_start_approx_ns
+            self._session_start_native_ns
         )
         self._flush_stop.clear()
         # Hand the native decode worker the subscriber + cuptiActivityGetNextRecord_v2
@@ -428,7 +434,7 @@ class CuptiMonitor:
         self._started = False
         self._final_allocated_buffers = _cupti_monitor_native.allocated_buffers()
         _cupti_monitor_native.reset_buffers()
-        self._time_converter = None
+        self._session_start_native_ns = 0
 
     def flush(self, *, sync: bool = False, timeout_s: float = 5.0) -> None:
         """Flush CUPTI's activity buffers to the processing worker.
@@ -541,11 +547,12 @@ class CuptiMonitor:
             return None
 
     def _convert_time(self, value: int) -> int:
-        if value == 0:
-            return 0
-        if self._time_converter is None:
+        # Decoded record START/END are in CUPTI's native clock (cuptiGetTimestamp_v2).
+        # Align to unix-epoch ns via the session-start native/unix pair: both are
+        # real-time ns clocks, so the offset is constant. Identity until started.
+        if value == 0 or self._session_start_native_ns == 0:
             return value
-        return self._time_converter.to_unix_ns(value)
+        return value - self._session_start_native_ns + self._session_start_unix_ns
 
     def convert_time(self, value: int) -> int:
         """Convert a CUPTI-clock timestamp to unix-epoch ns (public passthrough,
@@ -554,9 +561,9 @@ class CuptiMonitor:
         return self._convert_time(value)
 
     def now_unix_ns(self) -> int:
-        """Current time on the same unix-epoch clock as decoded record
-        timestamps -- the approximate clock run through convert_time."""
-        return self._convert_time(_PY_PROFILER._get_approximate_time())
+        """Current time on the same unix-epoch clock as decoded record timestamps --
+        CUPTI's native clock run through convert_time."""
+        return self._convert_time(self.now_native_ns())
 
     def now_native_ns(self) -> int:
         """Current value of CUPTI's native record clock (cuptiGetTimestamp_v2) -- the
