@@ -34,25 +34,229 @@ def _cupti_version() -> int:
 TEST_CUPTI_V13_3 = TEST_CUPTI_PYTHON and _cupti_version() >= 130300
 
 
+def _have_node_tools_id() -> bool:
+    # Graph-node correlation needs cudaGraphNodeGetToolsId, gated by the driver /
+    # cuda-compat (NewerDriver below ~13.3); without it the graph node-walk no-ops.
+    if not TEST_CUDA:
+        return False
+    try:
+        from torch.profiler._cupti.utils.graph_nodes import HAVE_NODE_TOOLS_ID
+
+        return HAVE_NODE_TOOLS_ID
+    except Exception:
+        return False
+
+
+TEST_NODE_TOOLS_ID = _have_node_tools_id()
+
+
+def _symm_mem_measurer_worker(rank: int, world: int) -> None:
+    # Subprocess body for TestCuptiCommsCUDA.test_symm_mem_collective_via_measurer.
+    # A real symm-mem one_shot_all_reduce (its kernel is NOT nccl-named) wrapped in
+    # CollectiveMeasurer must be recorded by a CommsObserver purely by its mark (the
+    # observer has no name heuristic) -- exercising the measure CM (eager external id +
+    # metadata). Asserts on rank 0; mp.spawn re-raises in parent.
+    import os
+
+    import torch.distributed as dist
+
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT="29563",
+    )
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        from torch.distributed._symmetric_memory import empty as symm_empty, rendezvous
+        from torch.profiler._cupti import monitor as cupti_monitor
+        from torch.profiler._cupti.comms import CollectiveMeasurer
+        from torch.profiler._cupti.observers.comms import CommsObserver
+
+        gname = dist.group.WORLD.group_name
+        t = symm_empty(1024, dtype=torch.float32, device=f"cuda:{rank}")
+        t.fill_(float(rank + 1))
+        rendezvous(t, gname)
+        obs = CommsObserver()
+        assert obs.available, "CUPTI monitor unavailable in subprocess"
+        mon = obs._monitor
+        measurer = CollectiveMeasurer(mon)
+        try:
+            for _ in range(4):
+                with measurer.measure(
+                    "symm_one_shot_all_reduce", dtype=str(t.dtype), numel=t.numel()
+                ):
+                    torch.ops.symm_mem.one_shot_all_reduce(t, "sum", gname)
+            torch.cuda.synchronize()
+            mon.flush(sync=True)
+            records = obs.poll()
+        finally:
+            obs.close()
+            cupti_monitor._instance = None
+        if rank == 0:
+            named = [
+                r
+                for r in records
+                if r.metadata.get("name") == "symm_one_shot_all_reduce"
+            ]
+            assert named, f"symm-mem collective not recorded (total={len(records)})"
+            assert all(r.end_ns >= r.start_ns for r in records), "non-monotonic timing"
+    finally:
+        dist.destroy_process_group()
+
+
+def _symm_mem_dispatch_worker(rank: int, world: int) -> None:
+    # Like _symm_mem_measurer_worker, but the symm-mem op is captured AUTOMATICALLY by
+    # SymmMemDispatchMode (it operates on a symm-mem tensor) -- no manual measure().
+    import os
+
+    import torch.distributed as dist
+
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT="29564",
+    )
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        from torch.distributed._symmetric_memory import empty as symm_empty, rendezvous
+        from torch.profiler._cupti import monitor as cupti_monitor
+        from torch.profiler._cupti.comms import (
+            disable_symm_mem_dispatch,
+            enable_symm_mem_dispatch,
+        )
+        from torch.profiler._cupti.observers.comms import CommsObserver
+
+        gname = dist.group.WORLD.group_name
+        t = symm_empty(1024, dtype=torch.float32, device=f"cuda:{rank}")
+        t.fill_(float(rank + 1))
+        rendezvous(t, gname)
+        obs = CommsObserver()
+        assert obs.available, "CUPTI monitor unavailable in subprocess"
+        mon = obs._monitor
+        enable_symm_mem_dispatch(mon)  # process-wide; no per-op wrapping
+        try:
+            for _ in range(4):
+                torch.ops.symm_mem.one_shot_all_reduce(t, "sum", gname)
+            torch.cuda.synchronize()
+            mon.flush(sync=True)
+            records = obs.poll()
+        finally:
+            disable_symm_mem_dispatch()
+            obs.close()
+            cupti_monitor._instance = None
+        if rank == 0:
+            named = [
+                r
+                for r in records
+                if r.metadata.get("name") == "symm_mem::one_shot_all_reduce"
+            ]
+            assert named, f"symm-mem op not auto-recorded (total={len(records)})"
+            assert all(r.end_ns >= r.start_ns for r in records), "non-monotonic timing"
+    finally:
+        dist.destroy_process_group()
+
+
+def _symm_mem_dispatch_graph_worker(rank: int, world: int) -> None:
+    # Like _symm_mem_dispatch_worker, but the symm-mem op is captured into a CUDA graph.
+    # During capture SymmMemDispatchMode routes through _GraphCommAnchor (start event off
+    # the critical path + a node-walk for the kernel's graph_node_id); replays carry no
+    # external id, so the observer keeps and attributes them by graph_node_id. Exercises
+    # the graph keep path (drain_collectives' metadata-resolver keep, lag-free).
+    import os
+
+    import torch.distributed as dist
+
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT="29565",
+    )
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    try:
+        from torch.distributed._symmetric_memory import empty as symm_empty, rendezvous
+        from torch.profiler._cupti import monitor as cupti_monitor
+        from torch.profiler._cupti.comms import (
+            disable_symm_mem_dispatch,
+            enable_symm_mem_dispatch,
+        )
+        from torch.profiler._cupti.comms.hook import _GraphCommAnchor
+        from torch.profiler._cupti.observers.comms import CommsObserver
+
+        gname = dist.group.WORLD.group_name
+        t = symm_empty(1024, dtype=torch.float32, device=f"cuda:{rank}")
+        t.fill_(float(rank + 1))
+        rendezvous(t, gname)
+        obs = CommsObserver(start_events=True)
+        assert obs.available, "CUPTI monitor unavailable in subprocess"
+        mon = obs._monitor
+        anchor = _GraphCommAnchor(mon)
+        obs.set_event_resolver(anchor.event_resolver)
+        obs.set_metadata_resolver(anchor.metadata_resolver)
+        enable_symm_mem_dispatch(mon, anchor=anchor)  # anchor -> graph capture path
+        try:
+            for _ in range(3):  # warmup eager before capture
+                torch.ops.symm_mem.one_shot_all_reduce(t, "sum", gname)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s), torch.cuda.graph(g):
+                torch.ops.symm_mem.one_shot_all_reduce(t, "sum", gname)
+            torch.cuda.current_stream().wait_stream(s)
+            anchor.finalize(g)  # remap nodes + learn start-event ids before replay
+            for _ in range(4):
+                g.replay()
+            torch.cuda.synchronize()
+            mon.flush(sync=True)
+            records = obs.poll()
+        finally:
+            disable_symm_mem_dispatch()
+            anchor.close()
+            obs.close()
+            cupti_monitor._instance = None
+        if rank == 0:
+            graph = [
+                r
+                for r in records
+                if r.graph_node_id
+                and r.metadata.get("name") == "symm_mem::one_shot_all_reduce"
+            ]
+            assert len(graph) >= 4, f"graph replays not recorded ({len(graph)})"
+            assert all(r.end_ns >= r.start_ns for r in records), "non-monotonic timing"
+    finally:
+        dist.destroy_process_group()
+
+
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
 class TestCuptiComms(TestCase):
     def test_comms_observer_correlate_kernels(self):
-        # The per-collective kernel correlation: each collective kernel is attributed
-        # to its collective by correlation_id -> external_id. All subsystems push on
-        # one kind, so a kernel carries the innermost active id; a collective is a leaf
-        # call, so that id is the collective's even when nested in a tracer region.
-        # Host-side.
+        # The per-collective kernel correlation: each eager collective kernel (graph_node
+        # 0) is attributed to its collective by correlation_id -> external_id; a kernel
+        # whose id is not a marked collective is dropped. Host-side.
         import numpy as np
 
-        from torch.profiler._cupti.observers.comms import _correlate_kernels
+        from torch.profiler._cupti.observers.comms import (
+            _attribution,
+            _correlate_kernels,
+        )
 
-        # kernels: AllReduce (corr 100), an elementwise (corr 200), RS (corr 300).
+        # kernels: AllReduce (corr 100), an elementwise (corr 200), RS (corr 300); all
+        # eager, so graph_node 0.
         kernels = [
             (
                 np.array([12, 11, 30], dtype="<i8"),  # start
                 np.array([20, 15, 40], dtype="<i8"),  # end
                 np.array([100, 200, 300], dtype="<u8"),  # correlation_id
-                np.array([7, 0, 8], dtype="<u8"),  # graph_node
+                np.array([0, 0, 0], dtype="<u8"),  # graph_node
                 np.array(
                     [
                         "ncclDevKernel_AllReduce",
@@ -73,10 +277,13 @@ class TestCuptiComms(TestCase):
         ]
 
         out = sorted(
-            _correlate_kernels(kernels, ext, "nccl"), key=lambda r: r["external_id"]
+            _correlate_kernels(
+                kernels, _attribution(ext, keep_ext_ids=frozenset({42, 43}))
+            ),
+            key=lambda r: r["external_id"],
         )
-        # corr100->42, corr300->43; the elementwise (corr200, no ext tag and not nccl)
-        # is dropped.
+        # corr100->42, corr300->43 (both marked collectives); the elementwise (corr200,
+        # no ext tag, so not a marked collective) is dropped.
         self.assertEqual(len(out), 2)
         self.assertEqual(
             out[0],
@@ -84,20 +291,137 @@ class TestCuptiComms(TestCase):
                 "external_id": 42,
                 "start_ns": 12,
                 "end_ns": 20,
-                "graph_node_id": 7,
+                "graph_node_id": 0,
                 "name": "ncclDevKernel_AllReduce",
             },
         )
         self.assertEqual(out[1]["external_id"], 43)
         self.assertEqual((out[1]["start_ns"], out[1]["end_ns"]), (30, 40))
 
-    def test_comms_observer_graph_collective(self):
-        # A CUDA-graph collective kernel has no EXTERNAL_CORRELATION record at replay,
-        # so it is attributed by graph_node_id (external_id 0) -- still timed, for the
-        # graph metadata resolver to name. Eager kernels (with an external id) take it.
+    def test_comms_observer_correlate_kernels_nested_chain(self):
+        # The collective's external id need not be the kernel's innermost active id: a
+        # nested region (e.g. a tracer) pushed inside the collective makes its id the one
+        # CUPTI tags. _correlate_kernels walks the innermost id's push chain
+        # (chain_resolver) and attributes the kernel to the collective id active when that
+        # id was pushed. Host-side.
         import numpy as np
 
-        from torch.profiler._cupti.observers.comms import _correlate_kernels
+        from torch.profiler._cupti.observers.comms import (
+            _attribution,
+            _correlate_kernels,
+        )
+
+        # One collective kernel tagged with innermost id 99 (a nested region); the
+        # collective is id 42, an ancestor in 99's push chain.
+        kernels = [
+            (
+                np.array([12], dtype="<i8"),
+                np.array([20], dtype="<i8"),
+                np.array([100], dtype="<u8"),  # correlation_id
+                np.array([0], dtype="<u8"),  # graph_node
+                np.array(["ncclDevKernel_AllReduce"], dtype=object),
+            )
+        ]
+        ext = [
+            (np.array([99], dtype="<u8"), np.array([100], dtype="<u8"))
+        ]  # corr100->99
+        chains = {99: (42, 99)}  # 42 (collective) encloses 99 (innermost, nested)
+
+        out = _correlate_kernels(
+            kernels,
+            _attribution(
+                ext,
+                keep_ext_ids=frozenset({42}),
+                chain_resolver=lambda i: chains.get(i, (i,)),
+            ),
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["external_id"], 42)  # the collective, not innermost 99
+        self.assertEqual((out[0]["start_ns"], out[0]["end_ns"]), (12, 20))
+
+        # Innermost-only (no chain): 99 is not a collective, so the kernel is dropped.
+        self.assertEqual(
+            _correlate_kernels(
+                kernels, _attribution(ext, keep_ext_ids=frozenset({42}))
+            ),
+            [],
+        )
+
+    def test_comms_observer_keeps_only_marked_kernels(self):
+        # A raw symm-mem kernel (not nccl-named) bracketed by CollectiveMeasurer is
+        # tagged as a collective -- eager by external id, graph by a registered node.
+        # _correlate_kernels keeps a kernel only when that mark is supplied; an unmarked
+        # kernel (no collective external id, no registered graph node) is always dropped.
+        import numpy as np
+
+        from torch.profiler._cupti.observers.comms import (
+            _attribution,
+            _correlate_kernels,
+        )
+
+        kernels = [
+            (
+                np.array([12, 30], dtype="<i8"),  # start
+                np.array([20, 45], dtype="<i8"),  # end
+                np.array([100, 555], dtype="<u8"),  # correlation_id
+                np.array([0, 8589934592], dtype="<u8"),  # graph_node (eager 0 / graph)
+                np.array(
+                    ["_triton_symm_mem_barrier", "_triton_all_gather_kernel"],
+                    dtype=object,
+                ),
+            )
+        ]
+        ext = [
+            (np.array([42], dtype="<u8"), np.array([100], dtype="<u8"))
+        ]  # corr100->42
+
+        # No marks: neither is a tagged collective, so both are dropped.
+        self.assertEqual(_correlate_kernels(kernels, _attribution(ext)), [])
+
+        # Marked: eager by external id 42, graph by node 8589934592 -> both kept.
+        out = _correlate_kernels(
+            kernels,
+            _attribution(
+                ext,
+                keep_ext_ids=frozenset({42}),
+                keep_graph_nodes=frozenset({8589934592}),
+            ),
+        )
+        self.assertEqual(len(out), 2)
+        by_ext = {r["external_id"]: r for r in out}
+        self.assertEqual(by_ext[42]["name"], "_triton_symm_mem_barrier")
+        self.assertEqual((by_ext[42]["start_ns"], by_ext[42]["end_ns"]), (12, 20))
+        self.assertEqual(by_ext[0]["graph_node_id"], 8589934592)
+        self.assertEqual(by_ext[0]["name"], "_triton_all_gather_kernel")
+
+    def test_enable_disable_symm_mem_dispatch(self):
+        # Process-wide enable is idempotent and disables cleanly (host-side; a fake
+        # monitor is fine -- no ops dispatch here, so __torch_dispatch__ never fires).
+        from torch.profiler._cupti.comms import (
+            disable_symm_mem_dispatch,
+            enable_symm_mem_dispatch,
+            SymmMemDispatchMode,
+        )
+
+        mode = enable_symm_mem_dispatch(object())
+        try:
+            self.assertIsInstance(mode, SymmMemDispatchMode)
+            self.assertIs(enable_symm_mem_dispatch(object()), mode)  # idempotent
+        finally:
+            disable_symm_mem_dispatch()
+            disable_symm_mem_dispatch()  # idempotent no-op
+
+    def test_comms_observer_graph_collective(self):
+        # A CUDA-graph collective kernel has no EXTERNAL_CORRELATION record at replay,
+        # so it is attributed by graph_node_id (external_id 0) -- kept via its registered
+        # node, still timed for the graph metadata resolver to name. Eager kernels (with
+        # a marked external id) take that path.
+        import numpy as np
+
+        from torch.profiler._cupti.observers.comms import (
+            _attribution,
+            _correlate_kernels,
+        )
 
         kernels = [
             (
@@ -116,7 +440,15 @@ class TestCuptiComms(TestCase):
         ]  # eager only
 
         out = sorted(
-            _correlate_kernels(kernels, ext, "nccl"), key=lambda r: r["graph_node_id"]
+            _correlate_kernels(
+                kernels,
+                _attribution(
+                    ext,
+                    keep_ext_ids=frozenset({42}),
+                    keep_graph_nodes=frozenset({8589934592}),
+                ),
+            ),
+            key=lambda r: r["graph_node_id"],
         )
         self.assertEqual(len(out), 2)
         # Eager: external id from the ext record, no graph node.
@@ -628,7 +960,6 @@ class TestCuptiComms(TestCase):
         from torch.profiler._cupti.observers.comms import CommsObserver
 
         obs = CommsObserver.__new__(CommsObserver)
-        obs._name_filter = "nccl"
         obs._resolver = None
         obs._meta_resolver = None
         obs._event_resolver = event_resolver
@@ -844,14 +1175,15 @@ class TestCuptiCommsCUDA(TestCase):
         # timing with the metadata and notifies a plugin. Each collective's kernel
         # completes (non-zero end), so poll() clears it from in-flight; a hung
         # collective (no completing kernel) would instead linger and be flagged.
-        # name_filter=None keeps all kernels (the workload stands in for collectives).
+        # Each kernel is kept by its mark (the pushed external id carries metadata), so
+        # the workload's relu/matmul stand in for collectives.
         from torch.profiler._cupti import monitor as cupti_monitor
         from torch.profiler._cupti.comms import CommRecordPlugin
         from torch.profiler._cupti.observers.comms import CommsObserver
 
         # Drop the singleton after teardown so later tests get a fresh monitor.
         self.addCleanup(setattr, cupti_monitor, "_instance", None)
-        obs = CommsObserver(kernel_name_filter=None)
+        obs = CommsObserver()
         if not obs.available:
             self.skipTest("CUPTI monitor unavailable (v2 subscribe failed)")
 
@@ -887,6 +1219,41 @@ class TestCuptiCommsCUDA(TestCase):
         self.assertEqual(len(obs.in_flight()), 0)
         self.assertEqual(len(obs.past()), len(records))
         self.assertEqual(seen, records)  # the plugin saw every completed record
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    def test_symm_mem_collective_via_measurer(self):
+        # End-to-end on 2 ranks: a raw symm-mem collective (one_shot_all_reduce, whose
+        # kernel is not "nccl"-named) wrapped in CollectiveMeasurer is recorded by the
+        # CommsObserver purely by its mark (no name heuristic) -- exercising the measure
+        # context manager (eager external id + metadata). The worker asserts; mp.spawn
+        # re-raises any subprocess failure here.
+        import torch.multiprocessing as mp
+
+        mp.spawn(_symm_mem_measurer_worker, args=(2,), nprocs=2)
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    def test_symm_mem_collective_via_dispatch_mode(self):
+        # End-to-end on 2 ranks: a symm_mem.* dispatcher op (one_shot_all_reduce) is
+        # auto-measured by SymmMemDispatchMode because it operates on a symm-mem tensor,
+        # and recorded by the CommsObserver -- no manual measure(). The worker asserts;
+        # mp.spawn re-raises any subprocess failure here.
+        import torch.multiprocessing as mp
+
+        mp.spawn(_symm_mem_dispatch_worker, args=(2,), nprocs=2)
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @unittest.skipIf(not TEST_NODE_TOOLS_ID, "requires cudaGraphNodeGetToolsId")
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires 2 GPUs")
+    def test_symm_mem_collective_via_dispatch_mode_graph(self):
+        # End-to-end on 2 ranks: a symm_mem.* dispatcher op captured into a CUDA graph is
+        # auto-measured by SymmMemDispatchMode through the _GraphCommAnchor, and its
+        # replays are recorded by the CommsObserver and attributed by graph_node_id -- no
+        # manual measure(). The worker asserts; mp.spawn re-raises any subprocess failure.
+        import torch.multiprocessing as mp
+
+        mp.spawn(_symm_mem_dispatch_graph_worker, args=(2,), nprocs=2)
 
 
 if __name__ == "__main__":

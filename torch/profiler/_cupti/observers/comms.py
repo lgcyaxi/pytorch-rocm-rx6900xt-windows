@@ -10,12 +10,16 @@ by the external-correlation id the comms hook pushes around the call
 (``CommMonitorHook``, in ``torch.profiler._cupti.comms``): CUPTI emits an
 ``EXTERNAL_CORRELATION`` record linking that id to the kernel's ``correlation_id``.
 All subsystems push on one external-correlation kind, so CUPTI tags the kernel with
-the *innermost* active id; a collective is a leaf call, so that id is the
-collective's even when nested in a tracer region (no kind filtering, no
-stream/timestamp pairing). External ids do not survive CUDA-graph capture/replay, so
+the *innermost* active id, which need not be the collective's (a nested tracer/op
+region may be pushed inside the collective before its kernel launches). The monitor
+snapshots each id's full push chain (``external_id_chain``), so the observer maps a
+kernel's innermost id through it and attributes the kernel to the collective id active
+when that id was pushed (no kind filtering, no stream/timestamp pairing). External ids
+do not survive CUDA-graph capture/replay, so
 eager collectives are keyed by external id and CUDA-graph collectives by
-``graph_node_id`` (their name-filtered replay kernels, named downstream by a graph
-metadata resolver). To make CUPTI emit the ``EXTERNAL_CORRELATION`` records, both
+``graph_node_id`` (the anchor registers each collective's replay-kernel node, named
+downstream by a graph metadata resolver). To make CUPTI emit the
+``EXTERNAL_CORRELATION`` records, both
 ``RUNTIME`` and ``DRIVER`` must be enabled as carriers (NCCL launches the collective
 kernel via the DRIVER API).
 
@@ -136,8 +140,13 @@ class CommsObserver(CuptiMonitorObserver):
     and tracks in-flight (issued, not yet timed) and recently-completed collectives.
     See the module docstring.
 
-    ``kernel_name_filter`` (default ``"nccl"``) keeps only kernels whose demangled
-    name contains the substring; ``None`` keeps all. ``metadata_resolver``
+    A kernel is kept only when the instrumentation marked it a collective: an external-
+    correlation id carrying collective metadata (eager -- the comm hook or a
+    :class:`CollectiveMeasurer` / ``SymmMemDispatchMode`` pushes one around the launch)
+    or a registered graph node (graph capture, via ``_GraphCommAnchor``). There is no
+    kernel-name heuristic: the multiplexer pushes a correlation id around every
+    collective in scope, so the mark is authoritative and arbitrary other kernels are
+    ignored. ``metadata_resolver``
     (``graph_node_id -> blob``) supplies metadata for CUDA-graph collectives.
     ``max_records`` bounds the completed-record ring. ``CUDA_EVENT`` (the per-collective
     device-start signal feeding ``on_start``) is captured when ``start_events`` or an
@@ -155,7 +164,6 @@ class CommsObserver(CuptiMonitorObserver):
 
     def __init__(
         self,
-        kernel_name_filter: str | None = "nccl",
         *,
         metadata_resolver: Callable[[int], str | None] | None = None,
         max_records: int = 1024,
@@ -168,7 +176,6 @@ class CommsObserver(CuptiMonitorObserver):
         quiescence_interval_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._name_filter = kernel_name_filter
         self._meta_resolver = metadata_resolver
         self._event_resolver = event_resolver
         # Quiescence (stall) detection: when a timeout is set the observer runs its own
@@ -474,7 +481,29 @@ class CommsObserver(CuptiMonitorObserver):
         kernels, _ext = self._take()  # _take folds ext into the persistent map
         if not kernels:
             return []
-        return _correlate_kernels(kernels, self._corr_to_ext, self._name_filter)
+        # A kernel is a collective iff the instrumentation marked it: an external id
+        # carrying metadata (CollectiveMeasurer / a hook -- folded into _in_flight) or a
+        # registered graph node. Prefer the metadata resolver as the registered-node set:
+        # the anchor fills it at finalize(), before the first replay, so a graph kernel
+        # that drains in the same poll as its start event is still kept. Fall back to the
+        # lazy set (_graph_coll_nodes) only when no resolver is wired -- it lags, since
+        # poll fills it from start events after this drain.
+        keep_graph_nodes: Any = (
+            _ResolverNodes(self._meta_resolver)
+            if self._meta_resolver is not None
+            else frozenset(
+                n for nodes in self._graph_coll_nodes.values() for n in nodes
+            )
+        )
+        attribute = _attribution(
+            self._corr_to_ext,
+            keep_ext_ids=frozenset(self._in_flight),
+            keep_graph_nodes=keep_graph_nodes,
+            chain_resolver=(
+                self._monitor.external_id_chain if self._monitor is not None else None
+            ),
+        )
+        return _correlate_kernels(kernels, attribute)
 
     def poll(self, flush: bool = False) -> list[CommRecord]:
         """Absorb newly-issued collective metadata, pair completed timing with it into
@@ -575,17 +604,41 @@ class CommsObserver(CuptiMonitorObserver):
         return list(self._past)
 
 
-def _correlate_kernels(
-    kernel_chunks: list[tuple[Any, Any, Any, Any, Any]],
+class _ResolverNodes:
+    """A membership view over a ``graph_node_id -> blob`` resolver (the anchor's,
+    populated at ``finalize()`` before any replay): ``node in self`` iff the resolver
+    has it. Lets the kernel keep treat registered graph nodes as a set without
+    enumerating the resolver, which is a callable, not an iterable."""
+
+    __slots__ = ("_resolver",)
+
+    def __init__(self, resolver: Callable[[int], str | None]) -> None:
+        self._resolver = resolver
+
+    def __contains__(self, node: int) -> bool:
+        return self._resolver(int(node)) is not None
+
+
+def _attribution(
     corr_to_ext: dict[int, int] | Any,
-    name_filter: str | None,
-) -> list[dict[str, Any]]:
-    """Attribute collective kernels: eager ones join ``correlation_id -> external_id``
-    (a collective is a leaf, so its kernel carries the innermost active id, even when
-    nested in a tracer region); CUDA-graph ones have no external id at replay, so a
-    name-filtered kernel with a ``graph_node_id`` is emitted with ``external_id == 0``
-    keyed by that node. Non-collective kernels (dropped by ``name_filter``) and
-    untagged eager kernels (no external id, not a graph node) are dropped.
+    *,
+    keep_ext_ids: frozenset[int] = frozenset(),
+    keep_graph_nodes: Any = frozenset(),
+    chain_resolver: Callable[[int], tuple[int, ...]] | None = None,
+) -> Callable[[int, int], int | None]:
+    """Build the per-kernel keep + attribution fn ``(correlation_id, graph_node_id) ->
+    external_id``: the collective external id to record (``0`` for a CUDA-graph
+    collective, keyed by its node), or ``None`` to drop. A graph-replay kernel
+    (``graph_node_id != 0``) carries no external id, so it is kept iff its node is a
+    registered collective (``keep_graph_nodes`` -- any container, e.g. a set or a
+    resolver-backed membership view). An eager kernel (``graph_node_id == 0``) is kept
+    iff a collective id (``keep_ext_ids``) was active when its id was pushed: CUPTI tags
+    a kernel with only the *innermost* active id, which need not be the collective's
+    (a nested tracer/op region may be pushed inside the collective), so we resolve the
+    innermost id's full push chain (``chain_resolver`` -- the monitor's
+    ``external_id_chain``; without one the chain is just the innermost id) and attribute
+    to the innermost collective id in it. There is no name heuristic, the mark is
+    authoritative.
 
     ``corr_to_ext`` is the prebuilt (persistent) ``correlation_id -> external_id`` map;
     a list of ``(external_id col, correlation_id col)`` chunks is also accepted (it is
@@ -600,6 +653,33 @@ def _correlate_kernels(
             for eid, corr in zip(eids, corrs):
                 corr_to_ext[int(corr)] = int(eid)
 
+    def attribute(correlation_id: int, graph_node_id: int) -> int | None:
+        if graph_node_id:
+            return 0 if graph_node_id in keep_graph_nodes else None
+        innermost = corr_to_ext.get(correlation_id)
+        if innermost is None:
+            return None
+        chain = (
+            chain_resolver(innermost) if chain_resolver is not None else (innermost,)
+        )
+        for cid in reversed(chain):
+            if cid in keep_ext_ids:
+                return cid
+        return None
+
+    return attribute
+
+
+def _correlate_kernels(
+    kernel_chunks: list[tuple[Any, Any, Any, Any, Any]],
+    attribute: Callable[[int, int], int | None],
+) -> list[dict[str, Any]]:
+    """Build raw timing dicts for the collective kernels in ``kernel_chunks``, attributing
+    each to its collective via ``attribute`` (see :func:`_attribution`): kept kernels get
+    ``external_id`` (the collective's, or ``0`` for a graph collective keyed by
+    ``graph_node_id``); kernels ``attribute`` maps to ``None`` are dropped."""
+    import numpy as np
+
     out: list[dict[str, Any]] = []
     for start_col, end_col, corr_col, gnode_col, name_col in kernel_chunks:
         n = len(start_col)
@@ -609,26 +689,23 @@ def _correlate_kernels(
         ends = np.asarray(end_col).tolist()
         corrs = np.asarray(corr_col).tolist()
         for i in range(n):
-            name = str(names[i])
-            if name_filter is not None and name_filter not in name:
-                continue
             if int(ends[i]) == 0:
                 # Defensive: a record with a zero end timestamp is an in-progress
                 # kernel (not yet run to completion), not a completion -- counting one
                 # would mask a hang. The monitor only ever plain-flushes (completed
                 # records), so this should not occur; the guard costs nothing.
                 continue
-            ext_id = corr_to_ext.get(int(corrs[i]))
             gnode = int(gnodes[i])
-            if ext_id is None and gnode == 0:
-                continue  # untagged eager kernel -- not a collective we can attribute
+            ext_id = attribute(int(corrs[i]), gnode)
+            if ext_id is None:
+                continue
             out.append(
                 {
-                    "external_id": ext_id or 0,
+                    "external_id": ext_id,
                     "start_ns": int(starts[i]),
                     "end_ns": int(ends[i]),
                     "graph_node_id": gnode,
-                    "name": name,
+                    "name": str(names[i]),
                 }
             )
     return out

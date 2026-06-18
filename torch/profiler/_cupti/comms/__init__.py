@@ -16,12 +16,22 @@ Service-specific serializers (e.g. the torchcomms ``clog`` format, the ncclx ana
 from torch.profiler._cupti.comms.flight_recorder import FlightRecorderPlugin
 from torch.profiler._cupti.comms.hang_detector import HangDetectorPlugin
 from torch.profiler._cupti.comms.hook import _GraphCommAnchor, CommMonitorHook
+from torch.profiler._cupti.comms.measure import (
+    CollectiveMeasurer,
+    disable_symm_mem_dispatch,
+    enable_symm_mem_dispatch,
+    SymmMemDispatchMode,
+)
 from torch.profiler._cupti.comms.plugin import CommRecordPlugin
 
 
 __all__ = [
     "CommRecordPlugin",
     "CommMonitorHook",
+    "CollectiveMeasurer",
+    "SymmMemDispatchMode",
+    "enable_symm_mem_dispatch",
+    "disable_symm_mem_dispatch",
     "HangDetectorPlugin",
     "FlightRecorderPlugin",
 ]
