@@ -1694,7 +1694,7 @@ class CppVecOverrides(CppOverrides):
         # a and b are integer type
         _t = f"decltype({b})"
         b = f"{_t}::set({_t}(1), {b}, {cexpr_index(V.kernel.num_elems)})"
-        return f"{a} / {b}"
+        return f"trunc_divide_integral({a}, {b})"
 
     @staticmethod
     def minimum(a, b):

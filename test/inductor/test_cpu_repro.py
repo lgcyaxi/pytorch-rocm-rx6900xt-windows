@@ -2467,6 +2467,11 @@ class CPUReproTests(TestCase):
                 self.assertTrue(detected)
                 return None
 
+        x2 = torch.randint(0, 10, size=(1,))
+        y2 = torch.zeros((1,), dtype=torch.int32)
+        ret = run_division(x2, y2, rounding_mode="trunc")
+        self.assertTrue(ret is None)
+
         x2 = torch.randint(0, 10, size=(3, 4))
         y2 = torch.zeros((3, 4), dtype=torch.int32)
         ret = run_division(x2, y2, rounding_mode="trunc")
