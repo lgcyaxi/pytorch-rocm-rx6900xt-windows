@@ -3367,6 +3367,16 @@
       ]
     }
   ],
+  "GB7151": [
+    {
+      "Gb_type": "generator function over a skipped function",
+      "Context": "str(self.vt)",
+      "Explanation": "Cannot trace a generator whose underlying function is skipped by Dynamo (e.g. defined in a skip-listed module), since its body cannot be symbolically traced.",
+      "Hints": [
+        "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    }
+  ],
   "GB0233": [
     {
       "Gb_type": "Attempted to use strided NestedTensor",
@@ -4827,6 +4837,16 @@
       "Explanation": "Expected init leaves.",
       "Hints": [
         "This is likely to be a Dynamo bug. Please report an issue to PyTorch."
+      ]
+    }
+  ],
+  "GB4399": [
+    {
+      "Gb_type": "untraceable user-defined __str__",
+      "Context": "Could not trace __str__ override for {type(self.value).__name__}",
+      "Explanation": "Dynamo could not safely trace this user-defined __str__ override.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ],

@@ -1023,10 +1023,7 @@ def error_inputs_linspace(op, device, **kwargs):
         error_regex="received an invalid combination of arguments - got \\(int, int, float",
     )
     yield ErrorInput(
-        SampleInput(
-            torch.tensor([[1, 1], [1, 1]], device=device),
-            args=(torch.tensor([[3, 3], [3, 3]], device=device), 1),
-        ),
+        SampleInput(torch.tensor([1, 1], device=device), args=(torch.tensor([3, 3], device=device), 1)),
         error_type=RuntimeError,
         error_regex="only supports 0-dimensional start and end tensors"
     )
@@ -21430,6 +21427,8 @@ op_db: list[OpInfo] = [
                # JIT tests don't work with Tensor keyword arguments
                # https://github.com/pytorch/pytorch/issues/58507
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
+               # Not implemented on XPU
+               DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_cow_input', device_type='xpu'),
            )),
     OpInfo('histc',
            dtypes=floating_types_and(torch.bfloat16, torch.float16),
@@ -22560,8 +22559,6 @@ op_db: list[OpInfo] = [
            dtypes=floating_and_complex_types(),
            dtypesIfCUDA=floating_and_complex_types(),
            skips=(
-               # NotImplementedError: The operator 'aten::_linalg_svd.U' is not currently implemented for the MPS device
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', device_type='mps'),
                # Dispatches in Python to matrix_norm. Not sure how to make this test happy
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit',
                             dtypes=(torch.complex64, torch.float32,)),)
