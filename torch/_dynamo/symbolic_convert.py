@@ -1845,7 +1845,7 @@ class InstructionTranslatorBase(
             cg.extend_output(
                 [
                     *create_swap(2),
-                    create_instruction("LIST_APPEND", arg=1),
+                    *cg.create_list_append(),
                 ]
             )
             self.parent.push(UnknownVariable())
@@ -3816,6 +3816,8 @@ class InstructionTranslatorBase(
         from .variables.dicts import ConstDictVariable
         from .variables.lists import BaseListVariable
 
+        # TODO(dynamo-team): Refactor this to use sq_item / mp_ass_subscript
+
         item_var = None
         try:
             if isinstance(obj, BaseListVariable):
@@ -4172,6 +4174,33 @@ class InstructionTranslatorBase(
             return
 
         value = self._convert_value(value, flags & 0x03)
+
+        # For plain f"{obj}" (no conversion, empty format spec, default
+        # __format__), eagerly evaluate str() via generic_str to capture
+        # the current symbolic state.  This avoids deferring to
+        # StringFormatVariable whose reconstruct runs before mutations
+        # are replayed in the epilogue.
+        # Skip when __format__ is overridden since format(obj, "") may
+        # differ from str(obj) in that case.
+        if (
+            (flags & 0x03) == 0
+            and fmt_spec.is_python_constant()
+            and fmt_spec.as_python_constant() == ""
+        ):
+            realized = value.realize()
+            try:
+                py_type = realized.python_type()
+            except NotImplementedError:
+                py_type = None
+            if py_type is not None and py_type.__format__ is object.__format__:
+                try:
+                    from .variables.object_protocol import generic_str
+
+                    str_result = generic_str(self, realized)
+                    self.push(str_result)
+                    return
+                except Unsupported:
+                    pass
 
         fmt_var = VariableTracker.build(
             self, "{:" + fmt_spec.as_python_constant() + "}"

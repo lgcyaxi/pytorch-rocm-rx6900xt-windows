@@ -9,8 +9,6 @@ import itertools
 import threading
 from typing import Any, cast, TYPE_CHECKING, TypeAlias
 
-import sympy
-
 from torch import SymBool, SymInt
 
 
@@ -170,6 +168,8 @@ class IntVar(SymInt):
         max: int | None = None,
         optimization_hint: int | None = None,
     ) -> None:
+        import sympy
+
         from torch.fx.experimental.sym_node import _NO_HINT, SymNode
         from torch.utils._sympy.numbers import int_oo
         from torch.utils._sympy.value_ranges import ValueRanges
@@ -276,9 +276,9 @@ class TensorSpec:
     Example::
 
         B = ShapeVar("batch")
-        TensorSpec([B, None])  # rank 2, dim 0 dynamic
+        TensorSpec([B, STATIC])  # rank 2, dim 0 dynamic
         TensorSpec([B, 10])  # rank 2, dim 0 dynamic, dim 1 static=10
-        TensorSpec([B * 2 + 1, None])  # rank 2, dim 0 derived from B
+        TensorSpec([B * 2 + 1, STATIC])  # rank 2, dim 0 derived from B
     """
 
     def __init__(self, dims: Sequence[LeafIntSpec]) -> None:
@@ -328,7 +328,7 @@ class ObjectSpec:
 
     Example::
 
-        ObjectSpec({"weight": TensorSpec([ShapeVar("h"), None])})
+        ObjectSpec({"weight": TensorSpec([ShapeVar("h"), STATIC])})
         ObjectSpec({"inner": ObjectSpec({"weight": TensorSpec([ShapeVar("h")])})})
     """
 
@@ -380,9 +380,9 @@ class DictSpec:
 
     Example::
 
-        DictSpec({"x": TensorSpec([ShapeVar("h"), None])})
+        DictSpec({"x": TensorSpec([ShapeVar("h"), STATIC])})
         DictSpec({"config": DictSpec({"batch": IntVar()})})
-        DictSpec({0: TensorSpec([ShapeVar("h"), None])})
+        DictSpec({0: TensorSpec([ShapeVar("h"), STATIC])})
     """
 
     def __init__(
@@ -623,11 +623,27 @@ class ShapesSpec:
     into the shape env at compile time and asserted at runtime via the
     deferred-runtime-assert mechanism::
 
-        A = ShapeVar("a")
-        B = ShapeVar("b")
-        ShapesSpec(
-            params={"x": TensorSpec([A, None]), "y": TensorSpec([B, None])},
-            assumptions=[A + B > 10, A * 2 == B],
+        from torch.fx.experimental.dynamic_spec import (
+            ParamsSpec as PARAMS,
+            ShapesSpec,
+            ShapeVar as VAR,
+            TensorSpec as T,
+        )
+
+        batch = VAR("batch", min=2, max=128)
+        ep = torch.export.export(
+            mod,
+            (torch.randn(8, 3), torch.randn(16, 3)),
+            dynamic_shapes=ShapesSpec(
+                params=PARAMS(
+                    {
+                        "x": T([batch, 3]),
+                        "y": T([batch * 2, 3]),  # derived expression
+                    }
+                ),
+                assumptions=[batch % 2 == 0],
+            ),
+            strict=True,
         )
 
     ``globals`` is reserved for future use and will raise
@@ -693,3 +709,35 @@ class ShapesSpec:
             "params": None if self._params is None else self._params.to_jsonable(),
             "assumptions": [repr(a) for a in self._assumptions],
         }
+
+
+# Shared error message for rejecting `dynamic_shapes=ShapesSpec(...)`
+# combined with `prefer_deferred_runtime_asserts_over_guards=True`. Used
+# in multiple export entry points; lifted out so the wording can't drift.
+_SHAPES_SPEC_VS_DEFERRED_RUNTIME_ASSERTS_MSG = (
+    "`prefer_deferred_runtime_asserts_over_guards=True` cannot be "
+    "combined with `dynamic_shapes=ShapesSpec(...)`. ShapesSpec "
+    "currently uses unbacked symbols only, which already emit "
+    "runtime assertions; the flag has no effect."
+)
+
+
+def _coerce_to_shapes_spec(
+    x: Any,
+) -> ShapesSpec | None:
+    """Normalize a user-supplied dynamic-spec value to ``ShapesSpec | None``.
+
+    Accepts ``None``, an existing ``ShapesSpec``, a ``ParamsSpec``, or a plain
+    ``dict`` (the same shape ``ParamsSpec`` accepts). The dict and
+    ``ParamsSpec`` forms are auto-wrapped by ``ShapesSpec.__init__``.
+    """
+    if x is None:
+        return None
+    if isinstance(x, ShapesSpec):
+        return x
+    if isinstance(x, (dict, ParamsSpec)):
+        return ShapesSpec(x)
+    raise TypeError(
+        f"dynamic spec expects a dict, ShapesSpec, or ParamsSpec, "
+        f"got {type(x).__name__}"
+    )

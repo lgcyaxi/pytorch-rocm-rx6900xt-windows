@@ -359,7 +359,12 @@ batch_fusion = True
 # merge_splits_pass
 # mutate_cat_pass
 # split_cat_pass
-pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
+pre_grad_fusion_options: dict[str, dict[str, Any]] = {
+    "batch_linear_lhs": {
+        "devices": ("xpu",),
+        "min_fuse_set_size": 2,
+    },
+}
 
 # Post grad fusion and options, set to empty dict to disable fusion.
 # Call `torch._inductor.fx_passes.group_batch_fusion.list_group_batch_fusions(False)` to see available fusions.
@@ -622,7 +627,7 @@ max_autotune_gemm_backends = os.environ.get(
 
 # Configures the maximum number of NVIDIA Universal GEMM (NVGEMM) configs to profile
 # in max_autotune. By default it's 5, to keep compile time reasonable.
-# Set to None (or env var "none"/"all") to tune all configs.
+# Set to 0, None, or env var "none"/"all" to tune all configs.
 def _nvgemm_max_profiling_configs_default() -> int | None:
     env_val = os.environ.get("TORCHINDUCTOR_NVGEMM_MAX_PROFILING_CONFIGS", "5")
     if env_val.lower() in ("none", "all"):
@@ -861,6 +866,7 @@ warn_mix_layout = os.environ.get("TORCHINDUCTOR_WARN_MIX_LAYOUT") == "1"
 realize_reads_threshold = 4
 _realize_opcount_threshold_default = 30
 realize_opcount_threshold: int | None = None
+realize_opusers_threshold = 5
 # CPU kernels tolerate larger fused pointwise bodies than GPU kernels, and
 # materializing moderate CPU expressions can add expensive full-buffer traffic.
 realize_cpu_opcount_threshold = 50
@@ -2339,9 +2345,11 @@ class aot_inductor:
     # Embed generated kernel binary files into model.so
     embed_kernel_binary: bool | None = None
 
-    # Generate kernel files that support multiple archs
-    # For CUDA, this means generating fatbin files for kernels, and the fatbin files
-    # contains PTX and SASS for the current architecture.
+    # Generate kernel files that support multiple archs.
+    # For CUDA, this means generating fatbin files for kernels. The fatbin files
+    # contain PTX for the compile target architecture (config.cuda.arch, or the
+    # current GPU when unset), plus SASS for the compile target and compatible
+    # TORCH_CUDA_ARCH_LIST architectures.
     # For XPU, this means generating SPIR-V files for kernels, and the SPIR-V files
     # will be compiled to target different XPU architectures at runtime.
     emit_multi_arch_kernel: bool | None = None
@@ -2549,10 +2557,6 @@ class cuda(cutlass):
 
     # Whether to keep intermediate files dring compilation.
     enable_ptxas_info = False
-
-    # Configures the maximum number of NVIDIA Universal GEMM (NVGEMM) configs to profile in max_autotune.
-    # By default it's 5, to keep compile time to a reasonable level.
-    nvgemm_max_profiling_configs: int | None = 5
 
 
 @inherit_fields_from(cutlass)
@@ -2818,6 +2822,18 @@ class trace:
 
     log_autotuning_results = os.environ.get("LOG_AUTOTUNE_RESULTS", "0") == "1"
 
+    # Add Inductor kernel stack traces back into exported PyTorch profiler timelines.
+    provenance_tracking_to_timeline = (
+        os.environ.get("TORCH_COMPILE_DEBUG_EXTEND", "0") == "1"
+    )
+
+    # Maximum number of trace events to process in profiler timeline post-processing.
+    # If the trace exceeds this limit, provenance tracking will be skipped to avoid OOM.
+    # Set to 0 to disable this protection.
+    provenance_tracking_max_events: int = int(
+        os.environ.get("TORCH_COMPILE_DEBUG_MAX_EVENTS", "500000")
+    )
+
     # Save mapping info from inductor generated kernel to post_grad/pre_grad fx nodes
     # Levels:
     #   0 - disabled (default)
@@ -2831,6 +2847,12 @@ class trace:
             "INDUCTOR_PROVENANCE", os.environ.get("TORCH_COMPILE_DEBUG", "0")
         )
     )
+
+
+def effective_provenance_tracking_level() -> int:
+    if trace.provenance_tracking_to_timeline:
+        return max(trace.provenance_tracking_level, 1)
+    return trace.provenance_tracking_level
 
 
 _save_config_ignore: list[str] = [
