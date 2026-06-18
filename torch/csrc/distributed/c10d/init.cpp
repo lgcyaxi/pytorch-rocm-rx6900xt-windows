@@ -32,8 +32,8 @@
 
 #ifdef USE_C10D_NCCL
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
-#include <torch/csrc/distributed/c10d/NCCLXStub.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/nccl/NCCLXStub.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/intra_node_comm.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #endif
@@ -1233,6 +1233,38 @@ Example:
           &::c10d::Window::get_attr,
           py::arg("peer_rank"),
           py::call_guard<py::gil_scoped_release>());
+
+  py::enum_<::c10d::HookOpName>(module, "HookOpName")
+      .value("SEND", ::c10d::HookOpName::SEND)
+      .value("RECV", ::c10d::HookOpName::RECV)
+      .value("BROADCAST", ::c10d::HookOpName::BROADCAST)
+      .value("ALLREDUCE", ::c10d::HookOpName::ALLREDUCE)
+      .value("REDUCE", ::c10d::HookOpName::REDUCE)
+      .value("ALLGATHER", ::c10d::HookOpName::ALLGATHER)
+      .value("REDUCE_SCATTER", ::c10d::HookOpName::REDUCE_SCATTER)
+      .value("ALLTOALL", ::c10d::HookOpName::ALLTOALL)
+      .value("BARRIER", ::c10d::HookOpName::BARRIER)
+      .value("SCATTER", ::c10d::HookOpName::SCATTER)
+      .value("GATHER", ::c10d::HookOpName::GATHER)
+      .value("SPLIT", ::c10d::HookOpName::SPLIT)
+      .value("NEW_WINDOW", ::c10d::HookOpName::NEW_WINDOW)
+      .value("UNKNOWN", ::c10d::HookOpName::UNKNOWN);
+
+  py::class_<::c10d::PreHookArgs>(module, "PreHookArgs")
+      .def(py::init<>())
+      .def_readwrite("name", &::c10d::PreHookArgs::name)
+      .def_readwrite("async_op", &::c10d::PreHookArgs::async_op)
+      .def_readwrite("input_tensors", &::c10d::PreHookArgs::input_tensors)
+      .def_readwrite("output_tensors", &::c10d::PreHookArgs::output_tensors)
+      .def_readwrite("root", &::c10d::PreHookArgs::root)
+      .def_readwrite("op_id", &::c10d::PreHookArgs::op_id);
+
+  py::class_<::c10d::PostHookArgs>(module, "PostHookArgs")
+      .def(py::init<>())
+      .def_readwrite("name", &::c10d::PostHookArgs::name)
+      .def_readwrite("async_op", &::c10d::PostHookArgs::async_op)
+      .def_readwrite("work", &::c10d::PostHookArgs::work)
+      .def_readwrite("op_id", &::c10d::PostHookArgs::op_id);
 
   py::class_<::c10d::DistributedBackendOptions>(
       module, "_DistributedBackendOptions")
@@ -3042,6 +3074,36 @@ Arguments:
               py::arg("tensor") = std::nullopt,
               py::call_guard<py::gil_scoped_release>(),
               "Create a new one-sided communication window")
+          .def(
+              "register_abort_hook",
+              &::c10d::ProcessGroup::registerAbortHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register an abort hook, called before abort on timeout/error")
+          .def(
+              "unregister_abort_hook",
+              &::c10d::ProcessGroup::unregisterAbortHook,
+              py::arg("hook_id"))
+          .def(
+              "register_pre_hook",
+              &::c10d::ProcessGroup::registerPreHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register a pre-hook, called before each collective is issued")
+          .def(
+              "unregister_pre_hook",
+              &::c10d::ProcessGroup::unregisterPreHook,
+              py::arg("hook_id"))
+          .def(
+              "register_post_hook",
+              &::c10d::ProcessGroup::registerPostHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register a post-hook, called after each collective is issued")
+          .def(
+              "unregister_post_hook",
+              &::c10d::ProcessGroup::unregisterPostHook,
+              py::arg("hook_id"))
           .def("boxed", [](c10::intrusive_ptr<::c10d::ProcessGroup> self) {
             return torch::jit::toPyObject(c10::IValue(std::move(self)));
           })
@@ -3153,6 +3215,16 @@ Arguments:
               py::call_guard<py::gil_scoped_release>(),
               "Create a new one-sided communication window")
           .def(
+              "register_abort_hook",
+              &::c10d::Backend::registerAbortHook,
+              py::arg("hook_id"),
+              py::arg("hook"),
+              "Register an abort hook, called before abort on timeout/error")
+          .def(
+              "unregister_abort_hook",
+              &::c10d::Backend::unregisterAbortHook,
+              py::arg("hook_id"))
+          .def(
               "broadcast",
               &::c10d::Backend::broadcast,
               py::arg("tensors"),
@@ -3250,8 +3322,18 @@ Arguments:
               py::arg("opts") = ::c10d::AllgatherOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
+              "all_gather_single",
+              &::c10d::Backend::all_gather_single,
+              py::arg("output"),
+              py::arg("input"),
+              py::arg("opts") = ::c10d::AllgatherOptions(),
+              py::call_guard<py::gil_scoped_release>())
+          // Deprecated alias of all_gather_single, kept for backward
+          // compatibility. Bound to all_gather_single to avoid referencing the
+          // deprecated C++ method.
+          .def(
               "_allgather_base",
-              &::c10d::Backend::_allgather_base,
+              &::c10d::Backend::all_gather_single,
               py::arg("output"),
               py::arg("input"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
@@ -3364,15 +3446,37 @@ Arguments:
               py::arg("timeout") = ::c10d::kUnsetTimeout,
               py::call_guard<py::gil_scoped_release>())
           .def(
+              "reduce_scatter_single",
+              &::c10d::Backend::reduce_scatter_single,
+              py::arg("outputTensor"),
+              py::arg("inputTensor"),
+              py::arg("opts") = ::c10d::ReduceScatterOptions(),
+              py::call_guard<py::gil_scoped_release>())
+          // Deprecated alias of reduce_scatter_single, kept for backward
+          // compatibility. Bound to reduce_scatter_single to avoid referencing
+          // the deprecated C++ method.
+          .def(
               "_reduce_scatter_base",
-              &::c10d::Backend::_reduce_scatter_base,
+              &::c10d::Backend::reduce_scatter_single,
               py::arg("outputTensor"),
               py::arg("inputTensor"),
               py::arg("opts") = ::c10d::ReduceScatterOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
+              "all_to_all_single",
+              &::c10d::Backend::all_to_all_single,
+              py::arg("output_tensor"),
+              py::arg("input_tensor"),
+              py::arg("output_split_sizes"),
+              py::arg("input_split_sizes"),
+              py::arg("opts") = ::c10d::AllToAllOptions(),
+              py::call_guard<py::gil_scoped_release>())
+          // Deprecated alias of all_to_all_single, kept for backward
+          // compatibility. Bound to all_to_all_single to avoid referencing the
+          // deprecated C++ method.
+          .def(
               "alltoall_base",
-              &::c10d::Backend::alltoall_base,
+              &::c10d::Backend::all_to_all_single,
               py::arg("output_tensor"),
               py::arg("input_tensor"),
               py::arg("output_split_sizes"),
@@ -3389,7 +3493,7 @@ Arguments:
                  std::chrono::milliseconds timeout) {
                 ::c10d::AllToAllOptions opts;
                 opts.timeout = timeout;
-                return self.alltoall_base(
+                return self.all_to_all_single(
                     output, input, outputSplitSizes, inputSplitSizes, opts);
               },
               py::arg("output"),
