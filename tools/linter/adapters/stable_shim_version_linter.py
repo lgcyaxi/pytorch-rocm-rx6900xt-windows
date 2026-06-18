@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,79 @@ from tools.linter.adapters._stable_shim_utils import (
 LINTER_CODE = "STABLE_SHIM_VERSION"
 
 
+_MERGE_BASE_RESULT: tuple[str | None, BaseException | None] | None = None
+
+
+def _get_origin_main_merge_base() -> str:
+    """Fetch origin/main and return its merge-base with HEAD.
+
+    Cached per process so a multi-file lint run only fetches once, on the
+    success path AND on the failure path -- so a single bad fetch does not get
+    retried per file (would be O(N * 600s) in the worst case).
+
+    Tolerates a benign race: when multiple lintrunner processes fetch in
+    parallel, git may fail with a lock error while another process advances
+    origin/main. Rather than enumerate every lock-error message, we always
+    verify origin/main resolves locally after a fetch failure. If it does,
+    the local ref is at least as fresh as what we asked for and is safe for
+    computing the merge-base. If it does not resolve, the failure was real
+    and we raise.
+    """
+    global _MERGE_BASE_RESULT
+    if _MERGE_BASE_RESULT is not None:
+        sha, err = _MERGE_BASE_RESULT
+        if err is not None:
+            raise err
+        assert sha is not None
+        return sha
+
+    try:
+        sha = _compute_origin_main_merge_base()
+        _MERGE_BASE_RESULT = (sha, None)
+        return sha
+    except BaseException as e:
+        _MERGE_BASE_RESULT = (None, e)
+        raise
+
+
+def _compute_origin_main_merge_base() -> str:
+    fetch = subprocess.run(
+        ["git", "fetch", "origin", "main"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if fetch.returncode != 0:
+        verify = subprocess.run(
+            ["git", "rev-parse", "--verify", "origin/main"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if verify.returncode != 0:
+            raise RuntimeError(
+                f"Failed to fetch origin/main and no usable local copy exists. "
+                f"Fetch error: {(fetch.stderr or '').strip()}"
+            )
+        logging.debug(
+            "git fetch origin main failed but local origin/main is valid; "
+            "continuing with the existing ref"
+        )
+
+    mb = subprocess.run(
+        ["git", "merge-base", "HEAD", "origin/main"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if mb.returncode != 0:
+        raise RuntimeError(
+            f"Failed to find merge-base with origin/main. "
+            f"Error: {mb.stderr.strip()}"
+        )
+    return mb.stdout.strip()
+
+
 def get_added_lines(filename: str) -> set[int]:
     """
     Get the line numbers of added lines in:
@@ -42,9 +116,7 @@ def get_added_lines(filename: str) -> set[int]:
     Returns:
         Set of line numbers (1-indexed) that are new additions.
     """
-    import subprocess
-
-    added_lines = set()
+    added_lines: set[int] = set()
 
     def parse_diff(diff_output: str) -> set[int]:
         """Parse git diff output and return line numbers of added lines."""
@@ -76,32 +148,8 @@ def get_added_lines(filename: str) -> set[int]:
         if result.returncode == 0:
             added_lines.update(parse_diff(result.stdout))
 
-        # Get merge-base with origin/main to check all PR commits
-        result = subprocess.run(
-            ["git", "fetch", "origin", "main"],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to fetch origin. Error: {result.stderr.strip()}"
-            )
+        merge_base = _get_origin_main_merge_base()
 
-        result = subprocess.run(
-            ["git", "merge-base", "HEAD", "origin/main"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to find merge-base with origin/main. "
-                f"Make sure origin/main exists (run 'git fetch origin main'). "
-                f"Error: {result.stderr.strip()}"
-            )
-
-        merge_base = result.stdout.strip()
         result = subprocess.run(
             ["git", "diff", f"{merge_base}..HEAD", filename],
             capture_output=True,
