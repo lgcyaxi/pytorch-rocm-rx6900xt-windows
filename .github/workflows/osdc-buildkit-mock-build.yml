@@ -1,6 +1,6 @@
 name: OSDC BuildKit Mock Build
 
-# Smoke test: build a tiny mock Docker image on a regular OSDC (multi-tenant)
+# Smoke test: build a small mock Docker image on a regular OSDC (multi-tenant)
 # runner via the cluster's remote BuildKit, then discard the output
 # (push=false). This validates the runner -> BuildKit path end to end; it does
 # NOT publish an image.
