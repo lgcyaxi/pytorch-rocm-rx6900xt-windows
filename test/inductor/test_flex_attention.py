@@ -2423,12 +2423,12 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         torch._dynamo.reset()
         gc.collect()
         if torch.cuda.is_available():
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
         torch.accelerator.empty_cache()
         torch._dynamo.reset()
         gc.collect()
         if torch.cuda.is_available():
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
         torch.accelerator.empty_cache()
 
     @supported_platform
@@ -4756,6 +4756,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
     def test_backward_fake_symbolic_query_key_batch_metadata(self, device):
         from torch._dynamo.source import LocalSource
         from torch._higher_order_ops.flex_attention import (
+            _permute_strides,
             flex_attention_backward_fake_tensor_mode,
         )
         from torch._subclasses.fake_tensor import FakeTensorMode
@@ -4803,22 +4804,83 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
                 )
             return grad_key, grad_value
 
-        query = fakeify(torch.empty(B, H, S, D, device=device), "query", "batch")
-        key = fakeify(torch.empty(B, H, S, D, device=device), "key", "batch")
-        value = fakeify(torch.empty(B, H, S, D, device=device), "value", "batch")
-        out = fakeify(torch.empty(B, H, S, D, device=device), "out", "batch")
-        grad_out = fakeify(torch.empty(B, H, S, D, device=device), "grad_out", "batch")
-        logsumexp = fakeify(torch.empty(B, H, S, device=device), "logsumexp", "batch")
-        grad_logsumexp = fakeify(
-            torch.empty(B, H, S, device=device), "grad_logsumexp", "batch"
-        )
+        def make_fake_inputs(Bq, Bkv, *, shared_batch=False, key_value_factory=None):
+            shape_id = "batch" if shared_batch else None
+            query = fakeify(torch.empty(Bq, H, S, D, device=device), "query", shape_id)
+            if key_value_factory is None:
+                key_real = torch.empty(Bkv, H, S, D, device=device)
+                value_real = torch.empty(Bkv, H, S, D, device=device)
+            else:
+                key_real = key_value_factory(Bkv)
+                value_real = key_value_factory(Bkv)
+            key = fakeify(key_real, "key", shape_id)
+            value = fakeify(value_real, "value", shape_id)
+            out = fakeify(torch.empty(Bq, H, S, D, device=device), "out", shape_id)
+            grad_out = fakeify(
+                torch.empty(Bq, H, S, D, device=device), "grad_out", shape_id
+            )
+            logsumexp = fakeify(
+                torch.empty(Bq, H, S, device=device), "logsumexp", shape_id
+            )
+            grad_logsumexp = fakeify(
+                torch.empty(Bq, H, S, device=device), "grad_logsumexp", shape_id
+            )
+            return (
+                query,
+                key,
+                value,
+                out,
+                logsumexp,
+                grad_out,
+                grad_logsumexp,
+                key_real,
+                value_real,
+            )
 
-        grad_key, grad_value = run(
-            query, key, value, out, logsumexp, grad_out, grad_logsumexp
-        )
+        args = make_fake_inputs(B, B, shared_batch=True)
+        grad_key, grad_value = run(*args[:7])
 
-        self.assertEqual(grad_key.shape, key.shape)
-        self.assertEqual(grad_value.shape, value.shape)
+        self.assertEqual(grad_key.shape, args[1].shape)
+        self.assertEqual(grad_value.shape, args[2].shape)
+
+        def transposed_batch_tensor(B):
+            return torch.empty(H, S, D, B, device=device).permute(3, 0, 1, 2)
+
+        args = make_fake_inputs(1, 1, key_value_factory=transposed_batch_tensor)
+        grad_key, grad_value = run(*args[:7])
+        key_real, value_real = args[7:]
+        expected_key = _permute_strides(
+            key_real.new_empty((1, H, S, D)), key_real.stride()
+        )
+        expected_value = _permute_strides(
+            value_real.new_empty((1, H, S, D)), value_real.stride()
+        )
+        self.assertEqual(grad_key.shape, args[1].shape)
+        self.assertEqual(grad_value.shape, args[2].shape)
+        self.assertEqual(grad_key.stride(), expected_key.stride())
+        self.assertEqual(grad_value.stride(), expected_value.stride())
+
+        args = make_fake_inputs(B, 1, key_value_factory=transposed_batch_tensor)
+        grad_key, grad_value = run(*args[:7])
+        key_real, value_real = args[7:]
+        expected_key = torch.sum(
+            _permute_strides(key_real.new_empty((B, H, S, D)), key_real.stride()),
+            dim=0,
+            keepdim=True,
+        )
+        expected_value = torch.sum(
+            _permute_strides(value_real.new_empty((B, H, S, D)), value_real.stride()),
+            dim=0,
+            keepdim=True,
+        )
+        self.assertEqual(grad_key.shape, args[1].shape)
+        self.assertEqual(grad_value.shape, args[2].shape)
+        self.assertEqual(grad_key.stride(), expected_key.stride())
+        self.assertEqual(grad_value.stride(), expected_value.stride())
+
+        args = make_fake_inputs(B, 2)
+        with self.assertRaisesRegex(RuntimeError, "batch must match"):
+            run(*args[:7])
 
     @supported_platform
     @skip_on_cpu
@@ -5831,10 +5893,8 @@ class GraphModule(torch.nn.Module):
     @supported_platform
     @skip_on_cpu
     @expected_not_implemented_on_mps  # backward Triton lowering
-    def test_direct_backward_inductor_supports_scalar_score_mod_buffers(self, device):
-        def score_mod(score, b, h, m, n, head_dim):
-            # Explicit HOP captures are recorded in subgraph_inps even when the
-            # score graph does not use them.
+    def test_direct_backward_inductor_batch_broadcast_matches_eager(self, device):
+        def score_mod(score, b, h, m, n):
             return score
 
         def mask_mod(b, h, m, n):
@@ -5842,19 +5902,26 @@ class GraphModule(torch.nn.Module):
 
         block_mask = create_block_mask(
             mask_mod,
-            B=2,
-            H=2,
+            B=4,
+            H=None,
             Q_LEN=128,
             KV_LEN=128,
             device=device,
         )
         scale = 1.0 / 16**0.5
         dtype = torch.float32
-        q = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        k = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        v = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        backward_grad = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
-        static_head_dim = q.shape[-1]
+        q = torch.randn((4, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((1, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((1, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        q_ref, k_ref, v_ref = query_key_value_clones(q, k, v)
+        q_gold, k_gold, v_gold = query_key_value_clones(q, k, v, torch.float64)
+
+        sdpa_partial = create_attention(score_mod, block_mask)
+        golden_out = sdpa_partial(q_gold, k_gold, v_gold)
+        ref_out = sdpa_partial(q_ref, k_ref, v_ref)
+        backward_grad = torch.randn_like(q)
+        golden_out.backward(backward_grad.to(torch.float64))
+        ref_out.backward(backward_grad)
 
         out, logsumexp = flex_attention_fwd(
             q,
@@ -5865,8 +5932,7 @@ class GraphModule(torch.nn.Module):
             scale,
         )
 
-        @torch.compile(fullgraph=True)
-        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
+        def eager_bw(query, key, value, fwd_out, lse, grad_out):
             return torch.ops.higher_order.flex_attention_backward(
                 query,
                 key,
@@ -5880,11 +5946,23 @@ class GraphModule(torch.nn.Module):
                 block_mask.as_tuple(),
                 scale,
                 {"BACKEND": "TRITON"},
-                (static_head_dim,),
+                (),
                 (),
             )
 
+        @torch.compile(fullgraph=True)
+        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
+            return eager_bw(query, key, value, fwd_out, lse, grad_out)
+
         with torch.no_grad():
+            _, ref_dk, ref_dv, _ = eager_bw(
+                q,
+                k,
+                v,
+                out.detach(),
+                logsumexp.detach(),
+                backward_grad,
+            )
             dq, dk, dv, _ = compiled_bw(
                 q,
                 k,
@@ -5894,9 +5972,110 @@ class GraphModule(torch.nn.Module):
                 backward_grad,
             )
 
-        self.assertEqual(dq.shape, q.shape)
+        fudge_factor = 10.0
+        self._check_equal(q_gold.grad, q_ref.grad, dq, fudge_factor, "Grad_Query")
+        self._check_equal(k_gold.grad, k_ref.grad, dk, fudge_factor, "Grad_Key")
+        self._check_equal(v_gold.grad, v_ref.grad, dv, fudge_factor, "Grad_Value")
         self.assertEqual(dk.shape, k.shape)
         self.assertEqual(dv.shape, v.shape)
+        self.assertEqual(dk.stride(), ref_dk.stride())
+        self.assertEqual(dv.stride(), ref_dv.stride())
+
+    @supported_platform
+    @skip_on_cpu
+    @expected_not_implemented_on_mps  # backward Triton lowering
+    def test_direct_backward_inductor_supports_scalar_mask_mod_buffers(self, device):
+        def score_mod(score, b, h, m, n):
+            return score
+
+        def base_mask_mod(b, h, m, n):
+            return m >= n
+
+        def mask_mod(b, h, m, n, shift):
+            return (m + shift) >= n
+
+        base_block_mask = create_block_mask(
+            base_mask_mod,
+            B=2,
+            H=2,
+            Q_LEN=128,
+            KV_LEN=128,
+            device=device,
+        )
+        block_mask = BlockMask.from_kv_blocks(
+            base_block_mask.kv_num_blocks,
+            base_block_mask.kv_indices,
+            base_block_mask.full_kv_num_blocks,
+            base_block_mask.full_kv_indices,
+            BLOCK_SIZE=base_block_mask.BLOCK_SIZE,
+            mask_mod=mask_mod,
+            seq_lengths=base_block_mask.seq_lengths,
+        )
+        scale = 1.0 / 16**0.5
+        dtype = torch.float32
+        q = torch.randn((2, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((2, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((2, 2, 128, 16), dtype=dtype, device=device, requires_grad=True)
+        q_ref, k_ref, v_ref = query_key_value_clones(q, k, v)
+        q_gold, k_gold, v_gold = query_key_value_clones(q, k, v, torch.float64)
+
+        ref_attention = create_attention(score_mod, base_block_mask)
+        golden_out = ref_attention(q_gold, k_gold, v_gold)
+        ref_out = ref_attention(q_ref, k_ref, v_ref)
+        backward_grad = torch.randn((2, 2, 128, 16), dtype=dtype, device=device)
+        golden_out.backward(backward_grad.to(torch.float64))
+        ref_out.backward(backward_grad)
+        static_shift = 0
+
+        out, logsumexp, _ = flex_attention_hop(
+            q,
+            k,
+            v,
+            _identity,
+            block_mask.as_tuple(),
+            scale,
+            {},
+            (),
+            (static_shift,),
+        )
+
+        def eager_bw(query, key, value, fwd_out, lse, grad_out):
+            return torch.ops.higher_order.flex_attention_backward(
+                query,
+                key,
+                value,
+                fwd_out,
+                lse,
+                grad_out,
+                None,
+                score_mod,
+                None,
+                block_mask.as_tuple(),
+                scale,
+                {"BACKEND": "TRITON"},
+                (),
+                (static_shift,),
+            )
+
+        @torch.compile(fullgraph=True)
+        def compiled_bw(query, key, value, fwd_out, lse, grad_out):
+            return eager_bw(query, key, value, fwd_out, lse, grad_out)
+
+        with torch.no_grad():
+            dq, dk, dv, buffer_grads = compiled_bw(
+                q,
+                k,
+                v,
+                out.detach(),
+                logsumexp.detach(),
+                backward_grad,
+            )
+
+        fudge_factor = 10.0
+        self._check_equal(q_gold.grad, q_ref.grad, dq, fudge_factor, "Grad_Query")
+        self._check_equal(k_gold.grad, k_ref.grad, dk, fudge_factor, "Grad_Key")
+        self._check_equal(v_gold.grad, v_ref.grad, dv, fudge_factor, "Grad_Value")
+        self.assertEqual(buffer_grads, ())
 
     @supported_platform
     def test_tensor_subclass_dispatch_order(self, device):
