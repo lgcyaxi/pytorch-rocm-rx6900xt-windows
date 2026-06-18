@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 # consumers (e.g. those probing the monitor import).
 try:
     from cupti.cupti import (  # pyrefly: ignore[missing-import]
+        Driver_api_trace_cbid,
         ExternalCorrelationKind,
         Runtime_api_trace_cbid,
     )
@@ -197,11 +198,11 @@ def _configure_ctypes(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_uint64),
         ]
         lib.cuptiActivityPopExternalCorrelationId_v2.restype = ctypes.c_int
-    # Collection-time noise filter: cuptiActivityEnableRuntimeApi(cbid, 0) stops CUPTI
-    # generating RUNTIME records for that cbid (kineto disables cudaGetDevice/etc. this way
-    # to shrink buffers). The subscriber-scoped _v2 form is required on the UDR path (the
-    # global one returns CUPTI_ERROR_NOT_COMPATIBLE while a UDR subscriber is active, like
-    # the timestamp / ext-correlation APIs); the global form is kept as a fallback.
+    # Collection-time noise filter: cuptiActivityEnableRuntimeApi_v2(sub, cbid, 0) stops
+    # CUPTI generating RUNTIME records for that cbid (kineto disables cudaGetDevice/etc.
+    # this way to shrink buffers). Only the subscriber-scoped _v2 form is bound: the
+    # monitor is always on the UDR path, where the global form returns
+    # CUPTI_ERROR_NOT_COMPATIBLE (like the timestamp / ext-correlation APIs).
     if hasattr(lib, "cuptiActivityEnableRuntimeApi_v2"):
         lib.cuptiActivityEnableRuntimeApi_v2.argtypes = [
             ctypes.c_void_p,  # CUpti_SubscriberHandle subscriber
@@ -209,9 +210,15 @@ def _configure_ctypes(lib: ctypes.CDLL) -> None:
             ctypes.c_uint8,  # enable
         ]
         lib.cuptiActivityEnableRuntimeApi_v2.restype = ctypes.c_int
-    if hasattr(lib, "cuptiActivityEnableRuntimeApi"):
-        lib.cuptiActivityEnableRuntimeApi.argtypes = [ctypes.c_uint32, ctypes.c_uint8]
-        lib.cuptiActivityEnableRuntimeApi.restype = ctypes.c_int
+    # Same noise filter for the DRIVER API (the v2 monitor enables DRIVER as a carrier,
+    # so its noise cbids would otherwise fill the UDR buffers).
+    if hasattr(lib, "cuptiActivityEnableDriverApi_v2"):
+        lib.cuptiActivityEnableDriverApi_v2.argtypes = [
+            ctypes.c_void_p,  # CUpti_SubscriberHandle subscriber
+            ctypes.c_uint32,  # CUpti_driver_api_trace_cbid
+            ctypes.c_uint8,  # enable
+        ]
+        lib.cuptiActivityEnableDriverApi_v2.restype = ctypes.c_int
 
 
 # --- v2 user-defined-record ctypes structs --------------------------------
@@ -277,6 +284,29 @@ def _noisy_runtime_cbids() -> list[int]:
         prefix, _, ver = name.rpartition("_v")
         base = prefix if prefix and ver.isdigit() else name
         if base in _NOISY_RUNTIME_API_NAMES:
+            out.append(int(member.value))
+    return out
+
+
+# Noisy driver-API cbids. The v2 monitor enables DRIVER as a carrier (NCCL launches
+# collective kernels via the driver API), so these would otherwise fill the UDR buffers.
+# Driver cbid names are unversioned, so -- unlike the runtime names -- they resolve by
+# direct name (no _vNNNN suffix). See also the post-decode allowlist (_DRIVER_REGISTERED
+# in monitor_trace), which keeps any other unregistered driver api out of the trace.
+_NOISY_DRIVER_API_NAMES = (
+    "cuKernelGetAttribute",
+    "cuDevicePrimaryCtxGetState",
+    "cuCtxGetCurrent",
+)
+
+
+def _noisy_driver_cbids() -> list[int]:
+    """The cbid values for :data:`_NOISY_DRIVER_API_NAMES`, resolved by direct name
+    (driver cbid names carry no version suffix). Empty when the enum is unavailable."""
+    out: list[int] = []
+    for name in _NOISY_DRIVER_API_NAMES:
+        member = getattr(Driver_api_trace_cbid, name, None)
+        if member is not None:
             out.append(int(member.value))
     return out
 
@@ -483,27 +513,32 @@ class _PyLibCupti:
         )
         if getattr(kind, "name", None) == "RUNTIME":
             self.disable_noisy_runtime_apis(sub_handle)
+        elif getattr(kind, "name", None) == "DRIVER":
+            self.disable_noisy_driver_apis(sub_handle)
 
     def disable_noisy_runtime_apis(self, sub_handle: int) -> None:
         """Best-effort: stop CUPTI emitting RUNTIME records for the noise-only cbids
-        (cudaGetDevice/SetDevice/GetLastError) so they don't fill the UDR buffers. Prefers
-        the subscriber-scoped _v2 entry (required on the UDR path) and falls back to the
-        global one; a no-op if neither is present (the post-decode blocklist still keeps
-        them out of the chrome trace)."""
+        (cudaGetDevice/SetDevice/GetLastError) so they don't fill the UDR buffers, via the
+        subscriber-scoped _v2 entry (the UDR path's form). A no-op if it is absent (the
+        post-decode blocklist still keeps them out of the chrome trace)."""
         cbids = _noisy_runtime_cbids()
-        if not cbids:
-            return
         fn_v2 = getattr(self._lib, "cuptiActivityEnableRuntimeApi_v2", None)
-        fn = getattr(self._lib, "cuptiActivityEnableRuntimeApi", None)
+        if not cbids or fn_v2 is None:
+            return
         for cbid in cbids:
-            if fn_v2 is not None:
-                fn_v2(
-                    ctypes.c_void_p(sub_handle),
-                    ctypes.c_uint32(cbid),
-                    ctypes.c_uint8(0),
-                )
-            elif fn is not None:
-                fn(ctypes.c_uint32(cbid), ctypes.c_uint8(0))
+            fn_v2(ctypes.c_void_p(sub_handle), ctypes.c_uint32(cbid), ctypes.c_uint8(0))
+
+    def disable_noisy_driver_apis(self, sub_handle: int) -> None:
+        """Best-effort: stop CUPTI emitting DRIVER records for the noise-only cbids
+        (cuKernelGetAttribute/cuDevicePrimaryCtxGetState/cuCtxGetCurrent) so they don't
+        fill the UDR buffers, via the subscriber-scoped _v2 entry (the UDR path's form). A
+        no-op if it is absent (the post-decode driver allowlist still keeps them out)."""
+        cbids = _noisy_driver_cbids()
+        fn_v2 = getattr(self._lib, "cuptiActivityEnableDriverApi_v2", None)
+        if not cbids or fn_v2 is None:
+            return
+        for cbid in cbids:
+            fn_v2(ctypes.c_void_p(sub_handle), ctypes.c_uint32(cbid), ctypes.c_uint8(0))
 
     def activity_disable(self, sub_handle: int, kind: ActivityKind) -> None:
         self._check(
