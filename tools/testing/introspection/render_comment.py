@@ -82,6 +82,26 @@ def _section(
     return lines
 
 
+def _fmt_duration(elapsed_s: float | None) -> str | None:
+    if elapsed_s is None:
+        return None
+    s = int(round(elapsed_s))
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+def _platforms_block(job_names: list[str], elapsed_s: float | None) -> list[str]:
+    """A dropdown listing every platform/config the diff was computed against (the
+    `per_job` keys), plus how long testintro took when available."""
+    dur = _fmt_duration(elapsed_s)
+    suffix = f" · testintro ran in {dur}" if dur else ""
+    lines = [
+        f"<details>\n<summary>Platforms considered ({len(job_names)}){suffix}</summary>\n"
+    ]
+    lines += [f"- `{j}`" for j in sorted(job_names)]
+    lines.append("\n</details>")
+    return lines
+
+
 def render(res: dict) -> str:
     added, removed, job_names = diff_mod.invert_per_job(res)
     all_jobs = set(job_names)
@@ -92,7 +112,9 @@ def render(res: dict) -> str:
         f"— **+{len(added)} added, −{len(removed)} removed**"
     )
     if not added and not removed:
-        return header + "\n\nNo tests added or removed."
+        parts = [header, "", "No tests added or removed.", ""]
+        parts += _platforms_block(job_names, res.get("elapsed_s"))
+        return "\n".join(parts)
 
     parts = [header, ""]
     if res.get("broad"):
@@ -108,6 +130,7 @@ def render(res: dict) -> str:
     rem_link = _linker(res.get("removed_loc", {}), repo, pr, res["from"], "L")
     parts += _section("➕ Added", added, all_jobs, add_link)
     parts += _section("➖ Removed", removed, all_jobs, rem_link)
+    parts += _platforms_block(job_names, res.get("elapsed_s"))
 
     # Footnotes: how much was compared (scope is identical across jobs) + any files
     # that couldn't be collected at one of the refs. The broad case is already

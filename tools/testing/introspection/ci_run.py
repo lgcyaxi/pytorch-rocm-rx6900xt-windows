@@ -21,11 +21,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from tools.testing.introspection import diff as diff_mod, platforms
 
 
 def main() -> int:
+    t0 = time.perf_counter()
     pr = int(os.environ["PR_NUMBER"])
     head = os.environ["HEAD_SHA"]
     base_ref = os.environ["BASE_REF"]
@@ -67,6 +69,7 @@ def main() -> int:
             "broad": broad,
             **diff_mod.diff(jobs, merge_base, head, locations=True),
         }
+        result["elapsed_s"] = round(time.perf_counter() - t0, 1)
 
     with open(out, "w") as f:
         json.dump(result, f)

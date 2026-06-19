@@ -87,6 +87,14 @@ class TestRenderComment(TestCase):
         )
         self.assertIn(f"[`test/test_x.py::C::test_plain`]({blob})", md)
 
+    def test_render_platforms_and_runtime(self):
+        res = dict(self.RES, elapsed_s=222.0)
+        md = render_comment.render(res)
+        self.assertIn("Platforms considered (2)", md)
+        self.assertIn("testintro ran in 3m 42s", md)  # 222s
+        self.assertIn("`linux-cpu/default`", md)
+        self.assertIn("`linux-cuda-sm80/default`", md)
+
     def test_render_broad_note(self):
         res = dict(self.RES, broad=True)
         md = render_comment.render(res)
@@ -106,7 +114,10 @@ class TestRenderComment(TestCase):
                 }
             },
         }
-        self.assertIn("No tests added or removed", render_comment.render(empty))
+        md = render_comment.render(empty)
+        self.assertIn("No tests added or removed", md)
+        # Platforms-considered dropdown shows even when nothing changed.
+        self.assertIn("Platforms considered (1)", md)
 
 
 class TestPostComment(TestCase):

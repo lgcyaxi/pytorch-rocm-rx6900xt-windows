@@ -242,9 +242,9 @@ jobs:
       build-environment: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.build-environment }}
       docker-image: ${{ needs.linux-jammy-py3_10-gcc11-build.outputs.docker-image }}
       runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
-      # mps is validated against a real Mac (the descriptor stubs the macOS-only
-      # probes); xpu simulation is pending validation on real Intel-GPU hardware.
-      platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm,macos-mps"
+      # All six registry platforms are validated: cpu/cuda/rocm against pytest
+      # --collect-only, mps on a real Mac, xpu on real Intel-GPU (linux.idc.xpu).
+      platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm,macos-mps,linux-xpu"
     secrets: inherit
 
   # TEMPORARY (pre-land testing only): posts the test-diff comment from the PR branch
