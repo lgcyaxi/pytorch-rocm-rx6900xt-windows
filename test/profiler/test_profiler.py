@@ -490,7 +490,7 @@ with profile(activities=[ProfilerActivity.CUDA]):
                 "-c",
                 """
 import torch
-from torch.profiler import _cupti_monitor
+from torch.profiler._cupti import monitor as _cupti_monitor
 
 _cupti_monitor.enable_hes_early()
 assert _cupti_monitor.is_hes_enabled()
@@ -506,7 +506,7 @@ assert _cupti_monitor.is_hes_enabled()
                 "-c",
                 """
 import torch
-from torch.profiler import _cupti_monitor
+from torch.profiler._cupti import monitor as _cupti_monitor
 
 torch.randn(1, device="cuda")
 _cupti_monitor.enable_hes_early()
@@ -524,7 +524,7 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
     def test_cupti_monitor_collection_raw_dump_smoke(self):
-        from torch.profiler import _cupti_monitor
+        from torch.profiler._cupti import monitor as _cupti_monitor
 
         with TemporaryDirectoryName() as out_dir:
             self.assertIsNone(_cupti_monitor.get_monitor())
@@ -562,7 +562,7 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
     def test_cupti_monitor_collection_repeated_lifecycle(self):
-        from torch.profiler import _cupti_monitor
+        from torch.profiler._cupti import monitor as _cupti_monitor
 
         for _ in range(2):
             with TemporaryDirectoryName() as out_dir:
@@ -842,10 +842,10 @@ class TestProfiler(TestCase):
         import ctypes
 
         pyprof = torch._C._profiler
-        pyprof._cupti_monitor_reset_buffers()
-        self.addCleanup(pyprof._cupti_monitor_reset_buffers)
+        pyprof._cupti_monitor.reset_buffers()
+        self.addCleanup(pyprof._cupti_monitor.reset_buffers)
         buffer_size = 64 * 1024
-        pyprof._cupti_monitor_configure_buffers(buffer_size)
+        pyprof._cupti_monitor.configure_buffers(buffer_size)
 
         if version == 1:
             request_t = ctypes.CFUNCTYPE(
@@ -878,10 +878,10 @@ class TestProfiler(TestCase):
                 ctypes.c_void_p,
             )
         request = request_t(
-            pyprof._cupti_monitor_buffer_request_callback_address(version)
+            pyprof._cupti_monitor.buffer_request_callback_address(version)
         )
         complete = complete_t(
-            pyprof._cupti_monitor_buffer_complete_callback_address(version)
+            pyprof._cupti_monitor.buffer_complete_callback_address(version)
         )
 
         def do_request():
@@ -908,26 +908,26 @@ class TestProfiler(TestCase):
         # First request has an empty free list, so it allocates.
         ptr_a, size_a = do_request()
         self.assertEqual(size_a, buffer_size)
-        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 1)
+        self.assertEqual(pyprof._cupti_monitor.allocated_buffers(), 1)
 
         # Complete it, drain it, and return it to the pool.
         do_complete(ptr_a)
-        self.assertEqual(pyprof._cupti_monitor_pending_buffers(), 1)
-        item = pyprof._cupti_monitor_get_completed()
+        self.assertEqual(pyprof._cupti_monitor.pending_buffers(), 1)
+        item = pyprof._cupti_monitor.get_completed()
         # 5th field is layout_epoch, 0 here (no reconfiguration in this test).
         self.assertEqual(item, (ptr_a, 4096, expected_ctx, expected_stream, 0))
-        self.assertEqual(pyprof._cupti_monitor_pending_buffers(), 0)
-        pyprof._cupti_monitor_return_buffer(ptr_a)
+        self.assertEqual(pyprof._cupti_monitor.pending_buffers(), 0)
+        pyprof._cupti_monitor.return_buffer(ptr_a)
 
         # The next request reuses the freed buffer: same pointer, no new alloc.
         ptr_b, _ = do_request()
         self.assertEqual(ptr_b, ptr_a)
-        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 1)
+        self.assertEqual(pyprof._cupti_monitor.allocated_buffers(), 1)
 
         # A second concurrently-outstanding buffer forces a fresh allocation.
         ptr_c, _ = do_request()
         self.assertNotEqual(ptr_c, ptr_b)
-        self.assertEqual(pyprof._cupti_monitor_allocated_buffers(), 2)
+        self.assertEqual(pyprof._cupti_monitor.allocated_buffers(), 2)
 
     @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
     def test_cupti_monitor_v2_record_layout_capture(self):
@@ -941,9 +941,9 @@ class TestProfiler(TestCase):
         import ctypes
 
         pyprof = torch._C._profiler
-        pyprof._cupti_monitor_reset_buffers()
-        self.addCleanup(pyprof._cupti_monitor_reset_buffers)
-        pyprof._cupti_monitor_configure_buffers(64 * 1024)
+        pyprof._cupti_monitor.reset_buffers()
+        self.addCleanup(pyprof._cupti_monitor.reset_buffers)
+        pyprof._cupti_monitor.configure_buffers(64 * 1024)
 
         class FieldEntry(ctypes.Structure):
             _fields_ = [
@@ -1006,8 +1006,8 @@ class TestProfiler(TestCase):
             ctypes.c_size_t,
             ctypes.c_void_p,
         )
-        request = request_t(pyprof._cupti_monitor_buffer_request_callback_address(2))
-        complete = complete_t(pyprof._cupti_monitor_buffer_complete_callback_address(2))
+        request = request_t(pyprof._cupti_monitor.buffer_request_callback_address(2))
+        complete = complete_t(pyprof._cupti_monitor.buffer_complete_callback_address(2))
 
         buf = ctypes.c_void_p()
         size = ctypes.c_size_t()
@@ -1020,18 +1020,18 @@ class TestProfiler(TestCase):
             ctypes.cast(ctypes.pointer(info), ctypes.c_void_p),
         )
         # Drain the completed buffer so the pool is tidy for the reset cleanup.
-        item = pyprof._cupti_monitor_get_completed()
-        pyprof._cupti_monitor_return_buffer(item[0])
+        item = pyprof._cupti_monitor.get_completed()
+        pyprof._cupti_monitor.return_buffer(item[0])
         # Captured under the initial epoch 0, and the buffer is tagged with it.
         self.assertEqual(item[4], 0)
         self.assertEqual(
-            pyprof._cupti_monitor_record_layouts(0),
+            pyprof._cupti_monitor.record_layouts(0),
             [(9, 16, [(0, 0, 4), (5, 8, 8)])],
         )
 
         # Reconfiguring opens a new epoch with a different layout; the old epoch's
         # layout is retained so buffers still queued under it decode correctly.
-        self.assertEqual(pyprof._cupti_monitor_next_layout_epoch(), 1)
+        self.assertEqual(pyprof._cupti_monitor.next_layout_epoch(), 1)
         entries_b = (FieldEntry * 1)(FieldEntry(ctypes.sizeof(FieldEntry), 0, 0, 4, 4))
         layout_b = RecordLayout(
             ctypes.sizeof(RecordLayout),
@@ -1054,16 +1054,16 @@ class TestProfiler(TestCase):
             8,
             ctypes.cast(ctypes.pointer(info_b), ctypes.c_void_p),
         )
-        item_b = pyprof._cupti_monitor_get_completed()
-        pyprof._cupti_monitor_return_buffer(item_b[0])
+        item_b = pyprof._cupti_monitor.get_completed()
+        pyprof._cupti_monitor.return_buffer(item_b[0])
         self.assertEqual(item_b[4], 1)
         self.assertEqual(
-            pyprof._cupti_monitor_record_layouts(1),
+            pyprof._cupti_monitor.record_layouts(1),
             [(3, 8, [(0, 0, 4)])],
         )
         # Epoch 0 still holds the original layout.
         self.assertEqual(
-            pyprof._cupti_monitor_record_layouts(0),
+            pyprof._cupti_monitor.record_layouts(0),
             [(9, 16, [(0, 0, 4), (5, 8, 8)])],
         )
 
@@ -2384,8 +2384,13 @@ class TestProfiler(TestCase):
 
     def test_profiler_correlation_id(self):
         """
-        We expect the correlation_id to be unique across multiple invocation of the profiler,
-        So we will reuse id_uniqueness_set.
+        We expect the correlation_id of CPU operator events to be unique across
+        multiple invocations of the profiler, so we will reuse id_uniqueness_set.
+        Only cpu_op events are checked: with CUDA available, profile() also
+        collects CUDA activities, and CUPTI's device-enumeration calls at startup
+        (cudaGetDeviceCount, etc.) are recorded as cuda_runtime events whose
+        correlation ids come from a separate counter (also starting at 1) and
+        would otherwise collide with the operator ids.
         """
         id_uniqueness_set = set()
         model = torch.nn.Sequential(
@@ -2401,7 +2406,8 @@ class TestProfiler(TestCase):
                 model(inputs)
             for event in prof.profiler.kineto_results.events():
                 corr_id = event.correlation_id()
-                if (corr_id) and event.device_type() == DeviceType.CPU:
+                is_cpu = event.device_type() == DeviceType.CPU
+                if corr_id and is_cpu and event.activity_type() == "cpu_op":
                     self.assertTrue(corr_id not in id_uniqueness_set)
                     id_uniqueness_set.add(corr_id)
                     self.assertTrue(corr_id < uint32_max)
