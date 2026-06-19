@@ -118,37 +118,50 @@ def _full_path_worker(rank, world_size, q):
         if rank != 0:
             return
 
+        import numpy as np
+
         def rows(kind):
+            out = []
             for cols in captured.get(kind, []):
                 n = len(next(iter(cols.values())))
                 for i in range(n):
-                    yield {f: col[i] for f, col in cols.items()}
+                    out.append({f: col[i] for f, col in cols.items()})
+            return out
 
-        timed = [
-            {
-                "correlation_id": int(r[int(Kernel.CORRELATION_ID)]),
-                "graph_node_id": int(r[int(Kernel.GRAPH_NODE_ID)]),
-                "start_ns": 0,
-                "name": r[int(Kernel.NAME)],
-            }
-            for r in rows(K)
-        ]
-        ext_events = [
-            {
-                "external_id": int(r[int(ExternalCorrelation.EXTERNAL_ID)]),
-                "correlation_id": int(r[int(ExternalCorrelation.CORRELATION_ID)]),
-                "external_kind": int(r[int(ExternalCorrelation.EXTERNAL_KIND)]),
-            }
-            for r in rows(EC)
-        ]
-        if not timed:
+        kernel_rows = rows(K)
+        ext_rows = rows(EC)
+        if not kernel_rows:
             q.put({"skip": "monitor collected no kernels (needs libcupti>=13.3)"})
             return
-        _attach_metadata(timed, ext_events, ext_meta, None)
+        names = [r[int(Kernel.NAME)] for r in kernel_rows]
+        columns = {
+            "kernel": {
+                "correlation_id": np.array(
+                    [int(r[int(Kernel.CORRELATION_ID)]) for r in kernel_rows],
+                    dtype=np.int64,
+                ),
+                "graph_node_id": np.array(
+                    [int(r[int(Kernel.GRAPH_NODE_ID)]) for r in kernel_rows],
+                    dtype=np.int64,
+                ),
+            },
+            "external_correlation": {
+                "external_id": np.array(
+                    [int(r[int(ExternalCorrelation.EXTERNAL_ID)]) for r in ext_rows],
+                    dtype=np.int64,
+                ),
+                "correlation_id": np.array(
+                    [int(r[int(ExternalCorrelation.CORRELATION_ID)]) for r in ext_rows],
+                    dtype=np.int64,
+                ),
+            },
+        }
+        _attach_metadata(columns, ext_meta, None)
+        meta = columns["kernel"].get("metadata")
         tagged = [
-            json.loads(e["metadata"])
-            for e in timed
-            if "metadata" in e and "ncclDevKernel" in e["name"]
+            json.loads(meta[i])
+            for i, name in enumerate(names)
+            if meta is not None and meta[i] is not None and "ncclDevKernel" in name
         ]
         q.put({"pushed": ext_id, "blob": ext_meta.get(ext_id), "tagged": tagged})
     finally:

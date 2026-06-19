@@ -229,6 +229,13 @@ class CuptiMonitorObserver:
         monitor (identity if clock alignment is unavailable)."""
         return self._monitor.convert_time(value) if self._monitor is not None else value
 
+    def convert_time_array(self, values: Any) -> Any:
+        """Vectorized :meth:`convert_time` over a whole column -- passthrough to the
+        monitor (identity if clock alignment is unavailable)."""
+        if self._monitor is None:
+            return values
+        return self._monitor.convert_time_array(values)
+
     def close(self) -> None:
         """Unregister from the monitor. Idempotent."""
         if self._obs is not None and self._monitor is not None:

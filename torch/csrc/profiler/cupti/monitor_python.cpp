@@ -111,6 +111,33 @@ void initCuptiMonitorBindings(py::module& m) {
       py::arg("get_next_record_fn"),
       py::arg("fence_kind") = 0,
       py::arg("fence_end_field") = -1);
+  // Drop noisy runtime/driver records by cbid in the decoder. filters: {kind:
+  // (keep_mode, [cbids])} -- keep_mode True keeps only those cbids (driver
+  // allowlist), False drops them (runtime blocklist). cbid_field_id is the cbid
+  // field in the record.
+  cupti_monitor.def(
+      "set_cbid_filter",
+      [](int cbid_field_id, const py::dict& filters) {
+        std::unordered_map<
+            uint32_t,
+            std::pair<bool, std::unordered_set<uint32_t>>>
+            converted;
+        converted.reserve(filters.size());
+        for (auto item : filters) {
+          auto kind = item.first.cast<uint32_t>();
+          auto spec = item.second.cast<py::tuple>();
+          bool keep_mode = spec[0].cast<bool>();
+          std::unordered_set<uint32_t> cbids;
+          for (auto c : spec[1].cast<py::iterable>()) {
+            cbids.insert(c.cast<uint32_t>());
+          }
+          converted.emplace(kind, std::make_pair(keep_mode, std::move(cbids)));
+        }
+        CuptiMonitorDecoder::get().set_cbid_filter(
+            cbid_field_id, std::move(converted));
+      },
+      py::arg("cbid_field_id"),
+      py::arg("filters"));
   cupti_monitor.def(
       "start_decoder", []() { CuptiMonitorDecoder::get().start(); });
   cupti_monitor.def(
@@ -130,12 +157,15 @@ void initCuptiMonitorBindings(py::module& m) {
          const py::list& record_layouts,
          size_t iters) {
         std::vector<torch::profiler::impl::CuptiRecordLayout> layouts;
+        layouts.reserve(record_layouts.size());
         for (const auto& entry : record_layouts) {
           auto t = entry.cast<py::tuple>();
           torch::profiler::impl::CuptiRecordLayout layout;
           layout.kind = t[0].cast<uint32_t>();
           layout.record_size = t[1].cast<size_t>();
-          for (const auto& f : t[2].cast<py::list>()) {
+          auto fields = t[2].cast<py::list>();
+          layout.fields.reserve(fields.size());
+          for (const auto& f : fields) {
             auto ft = f.cast<py::tuple>();
             layout.fields.push_back(
                 {ft[0].cast<int>(),

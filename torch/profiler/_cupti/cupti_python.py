@@ -511,9 +511,18 @@ class _PyLibCupti:
             ),
             "cuptiActivityEnable_v2",
         )
-        if getattr(kind, "name", None) == "RUNTIME":
+        # ``kind`` is passed as a plain int (the monitor keys its selection by int), so
+        # the old ``kind.name`` check never matched and these were dead code. Compare the
+        # kind value instead. The disable is best-effort: the per-cbid runtime/driver
+        # activity filter returns CUPTI_ERROR_NOT_COMPATIBLE under the user-defined-record
+        # subscriber (a no-op on the monitor's UDR path), so the post-decode blocklist in
+        # monitor_trace is what actually keeps the noise out of the trace.
+        from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
+
+        k = int(kind)
+        if k == int(ActivityKind.RUNTIME):
             self.disable_noisy_runtime_apis(sub_handle)
-        elif getattr(kind, "name", None) == "DRIVER":
+        elif k == int(ActivityKind.DRIVER):
             self.disable_noisy_driver_apis(sub_handle)
 
     def disable_noisy_runtime_apis(self, sub_handle: int) -> None:

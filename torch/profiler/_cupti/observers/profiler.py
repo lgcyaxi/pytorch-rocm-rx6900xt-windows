@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Any, TYPE_CHECKING
 
+import numpy as np
 from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
 import torch
@@ -205,13 +206,17 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         enable_cuda_sync: bool = False,
     ) -> None:
         self._lock = threading.Lock()
-        # Timestamped events (have "start_ns"), bucketed into windows by start time.
-        self._events: list[dict[str, Any]] = []
-        # Untimestamped events -- EXTERNAL_CORRELATION, the correlation_id ->
-        # external_id metadata for the eager annotation join. They carry no time to
-        # bucket by, so every finalized window includes whatever is currently buffered
-        # (a harmless superset for the join) and clears them.
-        self._ext_events: list[dict[str, Any]] = []
+        # Decoded activity is kept COLUMNAR end to end: each delivered buffer becomes a
+        # frame ``(kind_str, {column_name: np.ndarray})`` rather than a list of per-record
+        # dicts, so windowing is a boolean mask and the chrome-trace build is vectorized
+        # (no O(records) Python dict churn). Timed frames (kinds with a start_ns column)
+        # are bucketed into windows by start time.
+        self._timed_frames: list[tuple[str, dict[str, Any]]] = []
+        # Untimestamped frames -- EXTERNAL_CORRELATION (the correlation_id -> external_id
+        # join input) and CUDA_EVENT (the wait_on join input). They carry no time to
+        # bucket by, so every finalized window consumes whatever is currently buffered
+        # (a harmless superset for the joins) and clears them.
+        self._ext_frames: list[tuple[str, dict[str, Any]]] = []
         # {external_id: opaque blob} drained from the metadata store alongside the
         # records (see CuptiMonitor.take_external_metadata). Joined onto events by
         # correlation_id -> external_id -> blob at finalize, the same chain as the
@@ -260,60 +265,68 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         return self.convert_time(self.now_native_ns())
 
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
-        # Worker thread: build chrome-trace event dicts and accumulate them. Only while
-        # a window is open or still pending export -- otherwise drop the columns rather
-        # than pay the O(records) build for activity no window will ever consume.
+        # Worker thread: turn each kind's raw columns into a named-column frame (times
+        # converted, symbols demangled, graph annotations resolved -- all while the
+        # active-id chain is still live) and accumulate it. Only while a window is open
+        # or still pending export -- otherwise drop the columns rather than pay the
+        # build for activity no window will ever consume.
         if not columns:
             return
         with self._lock:
             active = self._open_start is not None or bool(self._windows)
         if not active:
             return
-        events: list[dict[str, Any]] = []
+        convert = self.convert_time_array
+        timed: list[tuple[str, dict[str, Any]]] = []
+        ext: list[tuple[str, dict[str, Any]]] = []
         for kind, cols in columns.items():
-            events.extend(
-                events_from_columns(
-                    int(kind),
-                    cols,
-                    convert_time=self.convert_time,
-                    annotation_resolver=self._resolver,
-                )
-            )
-        if not events:
+            spec = _COLUMN_BUILDERS.get(int(kind))
+            if spec is None:
+                continue
+            kind_str, builder, is_timed = spec
+            frame = builder(cols, convert, self._resolver)
+            if frame is None or _named_len(frame) == 0:
+                continue
+            (timed if is_timed else ext).append((kind_str, frame))
+        if not timed and not ext:
             return
-        timed = [e for e in events if "start_ns" in e]
-        ext = [e for e in events if "start_ns" not in e]
-        self._annotate_user_external_ids(ext)
+        for kind_str, frame in ext:
+            if kind_str == "external_correlation":
+                self._resolve_user_external_ids(frame)
         meta = (
             self._monitor.take_external_metadata() if self._monitor is not None else {}
         )
         with self._lock:
-            self._events.extend(timed)
-            self._ext_events.extend(ext)
+            self._timed_frames.extend(timed)
+            self._ext_frames.extend(ext)
             if meta:
                 self._ext_metadata.update(meta)
 
-    def _annotate_user_external_ids(self, ext_events: list[dict[str, Any]]) -> None:
-        """Stamp each EXTERNAL_CORRELATION event with ``user_external_id``: the
+    def _resolve_user_external_ids(self, frame: dict[str, Any]) -> None:
+        """Stamp each EXTERNAL_CORRELATION row's ``user_external_id`` column with the
         innermost ENCLOSING id that names a region, via the monitor's active-id chain,
-        so a kernel nested below a named region (e.g. a collective inside it) still
-        gets that region's name in the trace -- the single-kind record only carries
-        the innermost id. Resolved here at dispatch while the chain is live; the
-        metadata join keeps using the raw innermost ``external_id`` (a collective's id
-        keys its blob). No-op without a monitor or any named region active."""
+        so a kernel nested below a named region (e.g. a collective inside it) still gets
+        that region's name in the trace -- the single-kind record only carries the
+        innermost id. Resolved here at dispatch while the chain is live. The column
+        defaults to the raw ``external_id`` (set by the builder); this overrides only
+        the rows that resolve to an enclosing named region. No-op without a monitor or
+        any named region active."""
         if self._monitor is None:
             return
         names = set(self.annotation_names())
         if not names:
             return
         chain = self._monitor.external_id_chain
-        for e in ext_events:
-            if e.get("kind") != "external_correlation":
-                continue
-            eid = e["external_id"]
-            e["user_external_id"] = next(
-                (c for c in reversed(chain(eid)) if c in names), eid
-            )
+        resolved = frame["user_external_id"].tolist()
+        cache: dict[int, int] = {}
+        for i, eid in enumerate(frame["external_id"].tolist()):
+            mapped = cache.get(eid)
+            if mapped is None:
+                mapped = cache[eid] = next(
+                    (c for c in reversed(chain(eid)) if c in names), eid
+                )
+            resolved[i] = mapped
+        frame["user_external_id"] = np.asarray(resolved, dtype=np.int64)
 
     def push_annotation(self, name: str) -> int | None:
         # Record the calling thread (for trace-lane naming) on top of the base
@@ -426,35 +439,54 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
 
     def _window_watermark_ns(self) -> int:
         with self._lock:
-            return max((e["start_ns"] for e in self._events), default=-1)
+            return max(
+                (
+                    int(frame["start_ns"].max())
+                    for _, frame in self._timed_frames
+                    if len(frame["start_ns"])
+                ),
+                default=-1,
+            )
 
     def _finalize_window(self, window_id: int, boundary_ns: int) -> None:
         # Runs on the poll thread: the window's records are all in hand, so BUILD its
-        # trace-window dict (events in [start, boundary)) in memory and drop the
-        # consumed events. Does NOT write -- writing is a foreground concern
-        # (set_export / join), so a deferred write can never outlive the caller's
-        # (temporary) output directory.
+        # trace-window dict (rows in [start, boundary)) in memory and drop the consumed
+        # rows. Does NOT write -- writing is a foreground concern (set_export / join),
+        # so a deferred write can never outlive the caller's (temporary) output dir.
         with self._lock:
             w = self._windows.get(window_id)
             if w is None:
                 return
             start = w["start"]
-            timed = [e for e in self._events if start <= e["start_ns"] < boundary_ns]
-            self._events = [e for e in self._events if e["start_ns"] >= boundary_ns]
-            # Untimestamped external-correlation events ride along (the join needs
-            # them); consume the buffered ones with this window.
-            ext, self._ext_events = self._ext_events, []
+            in_window: list[tuple[str, dict[str, Any]]] = []
+            keep: list[tuple[str, dict[str, Any]]] = []
+            for kind_str, frame in self._timed_frames:
+                s = frame["start_ns"]
+                in_mask = (s >= start) & (s < boundary_ns)
+                if in_mask.any():
+                    in_window.append((kind_str, _slice_frame(frame, in_mask)))
+                # Rows at/after the boundary belong to a later window; rows before
+                # ``start`` are prepare-phase noise and dropped (as the dict path did).
+                keep_mask = s >= boundary_ns
+                if keep_mask.any():
+                    keep.append((kind_str, _slice_frame(frame, keep_mask)))
+            self._timed_frames = keep
+            # Untimestamped frames (external-correlation / cuda-event) ride along (the
+            # joins need them); consume the buffered ones with this window.
+            ext, self._ext_frames = self._ext_frames, []
             meta, self._ext_metadata = self._ext_metadata, {}
-        # Attach the opaque metadata blob onto the events it annotates (no lock: the
-        # timed/ext lists are this thread's now). correlation_id -> external_id (from
-        # the window's EXTERNAL_CORRELATION records) -> blob.
-        _attach_metadata(timed, ext, meta, self._metadata_resolver)
+        columns = _concat_frames_by_kind(in_window + ext)
+        # Attach the opaque per-collective blob as a "metadata" column on the GPU-op
+        # kinds (no lock: these columns are this thread's now). correlation_id ->
+        # external_id (from the window's EXTERNAL_CORRELATION columns) -> blob, plus the
+        # graph-node resolver for captured collectives. No-op without comms metadata.
+        _attach_metadata(columns, meta, self._metadata_resolver)
         with self._lock:
             w = self._windows.get(window_id)
             if w is None:
                 return
             w["built"] = {
-                "events": timed + ext,
+                "columns": columns,
                 "user_annotations": w["annotations"],
                 "thread_resource_map": w["thread_map"],
                 "start_ns": start,
@@ -478,307 +510,294 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                 os.remove(cpu)
 
 
-# --- columns -> chrome-trace event dicts -------------------------------------
-# Turn the per-kind columns the monitor delivers into the event dicts
-# monitor_trace splices into the chrome trace. Owns the per-kind event shape, the
-# symbol demangling, the clock conversion, and the graph-annotation resolution --
-# all ProfilerObserver/presentation concerns (the monitor only produces columns).
+# --- raw columns -> named-column frames --------------------------------------
+# Turn the per-kind columns the monitor delivers ({field_id: array}) into a frame
+# of named numpy columns the chrome-trace merge consumes directly -- no per-record
+# dict ever materializes. Owns the per-kind column shape, the symbol demangling,
+# the clock conversion, and the graph-annotation resolution (all done here, on the
+# worker thread, while the active-id chain is live). The monitor only produces the
+# raw columns; monitor_trace._trace_window_entries vectorizes these into events.
 
 
-def events_from_columns(
-    kind: int,
-    cols: dict[int, Any],
-    *,
-    convert_time: Callable[[int], int],
-    annotation_resolver: AnnotationResolver | None,
-) -> list[dict[str, Any]]:
-    """Turn one kind's columns (``{field_id: column}``) into chrome-trace event
-    dicts. Returns [] for kinds this builder doesn't render. A None resolver means
-    no graph-node naming (every annotation resolves to None)."""
-    builder = _BUILDERS.get(kind)
-    if builder is None:
-        return []
-    resolver = annotation_resolver or (lambda *_: None)
-    return builder(cols, convert_time, resolver)
+_ANNOTATION_MISS = object()
 
 
-def _col_len(cols: dict[int, Any]) -> int:
-    return len(next(iter(cols.values()))) if cols else 0
+def _named_len(frame: dict[str, Any]) -> int:
+    for col in frame.values():
+        return len(col)
+    return 0
+
+
+def _slice_frame(frame: dict[str, Any], mask: Any) -> dict[str, Any]:
+    return {name: col[mask] for name, col in frame.items()}
+
+
+def _concat_frames_by_kind(
+    frames: list[tuple[str, dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Group same-kind frames and concatenate their columns. Same-kind frames share a
+    column set (one builder produced them), so a per-name concatenate is well defined;
+    a single frame is passed through without a copy."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for kind_str, frame in frames:
+        grouped.setdefault(kind_str, []).append(frame)
+    out: dict[str, dict[str, Any]] = {}
+    for kind_str, group in grouped.items():
+        if len(group) == 1:
+            out[kind_str] = group[0]
+        else:
+            out[kind_str] = {
+                name: np.concatenate([g[name] for g in group]) for name in group[0]
+            }
+    return out
 
 
 def _attach_metadata(
-    timed: list[dict[str, Any]],
-    ext_events: list[dict[str, Any]],
+    columns: dict[str, dict[str, Any]],
     external_metadata: dict[int, str],
-    metadata_resolver: Callable[[int], str | None] | None,
+    metadata_resolver: Any,
 ) -> None:
-    """Attach the opaque per-annotation blob onto each timed event, by two routes:
+    """Attach the opaque per-collective blob as a ``metadata`` object column on the
+    GPU-op kinds (kernel / gpu_memcpy / gpu_memset), by two routes:
 
-    1. Eager: ``correlation_id -> external_id`` (from the window's
-       EXTERNAL_CORRELATION records) ``-> blob``, the same chain the eager name
-       join uses. This is the path for eager (non-graph) collectives, where the
-       push produced an EXTERNAL_CORRELATION record linking the id to the launched
-       kernel. (The monitor is the sole CUPTI subscriber and sole external-
-       correlation pusher, so every such record is ours -- no kind filtering.)
+    1. Eager: ``correlation_id -> external_id`` (from the window's EXTERNAL_CORRELATION
+       columns) ``-> blob`` -- the same chain the eager name join uses (the monitor is
+       the sole external-correlation pusher, so every record is ours).
     2. Graph: a CUDA-graph-captured collective has no external-correlation link on
-       replay -- the kernel runs with fresh correlation ids and no host push -- so
-       it is resolved by ``graph_node_id`` through ``metadata_resolver``. That is
-       the same mechanism (and stack-managed registry) that resolves graph-node
-       annotation NAMES: it already carries the stable executable-graph node ids
-       across replays and owns their lifecycle, so no separate cache or reclamation
-       is needed here.
+       replay, so it is resolved by ``graph_node_id`` through ``metadata_resolver`` --
+       the same stack-managed registry that resolves graph-node annotation NAMES.
 
-    The blob rides as ``event["metadata"]`` (the producer's opaque string -- the
-    consumer parses it); events without a match are left untouched. No-op when
-    neither route is available, so the non-collective path pays nothing."""
+    Mutates ``columns`` in place. No-op (and no column added) when neither route is
+    available, so the non-collective path pays nothing."""
     if not external_metadata and metadata_resolver is None:
         return
-    # Scope to ids we actually have a blob for: an op may carry one
-    # EXTERNAL_CORRELATION record per active kind (e.g. a tracer region annotation
-    # too), and only the comms collective ids are in external_metadata -- so this
-    # both picks the right record and avoids a region id shadowing the collective.
-    corr_to_ext = (
-        {
-            e["correlation_id"]: e["external_id"]
-            for e in ext_events
-            if e["external_id"] in external_metadata
-        }
-        if external_metadata
-        else {}
-    )
-    for ev in timed:
-        if external_metadata:
-            ext_id = corr_to_ext.get(ev.get("correlation_id"))
-            if ext_id is not None:
-                blob = external_metadata.get(ext_id)
-                if blob is not None:
-                    ev["metadata"] = blob
-                    continue  # eager hit; don't also consult the graph resolver
-        if metadata_resolver is not None:
-            node = ev.get("graph_node_id") or 0
-            if node:
-                blob = metadata_resolver(node)
-                if blob is not None:
-                    ev["metadata"] = blob
-
-
-def _kernel_events(cols, convert_time, resolver):
-    events = []
-    for i in range(_col_len(cols)):
-        graph_node_id = int(cols[Kernel.GRAPH_NODE_ID.id][i])
-        correlation_id = int(cols[Kernel.CORRELATION_ID.id][i])
-        events.append(
-            {
-                "kind": "kernel",
-                "device_id": int(cols[Kernel.DEVICE_ID.id][i]),
-                "context_id": int(cols[Kernel.CONTEXT_ID.id][i]),
-                "stream_id": int(cols[Kernel.STREAM_ID.id][i]),
-                "correlation_id": correlation_id,
-                "graph_node_id": graph_node_id,
-                "graph_id": int(cols[Kernel.GRAPH_ID.id][i]),
-                "start_ns": convert_time(int(cols[Kernel.START.id][i])),
-                "end_ns": convert_time(int(cols[Kernel.END.id][i])),
-                "annotation": resolver(
-                    graph_node_id, ActivityKind.CONCURRENT_KERNEL, correlation_id
-                ),
-                "name": _demangle_symbol(cols[Kernel.NAME.id][i]),
-                # Launch config (kineto-parity fields): grid/block dims, registers, shared
-                # memory and priority -- per-kernel info not recoverable elsewhere for eager.
-                "grid": [
-                    int(cols[Kernel.GRID_X.id][i]),
-                    int(cols[Kernel.GRID_Y.id][i]),
-                    int(cols[Kernel.GRID_Z.id][i]),
-                ],
-                "block": [
-                    int(cols[Kernel.BLOCK_X.id][i]),
-                    int(cols[Kernel.BLOCK_Y.id][i]),
-                    int(cols[Kernel.BLOCK_Z.id][i]),
-                ],
-                "registers_per_thread": int(cols[Kernel.REGISTERS_PER_THREAD.id][i]),
-                "static_shared_memory": int(cols[Kernel.STATIC_SHARED_MEMORY.id][i]),
-                "dynamic_shared_memory": int(cols[Kernel.DYNAMIC_SHARED_MEMORY.id][i]),
-                "priority": int(cols[Kernel.LAUNCH_PRIORITY.id][i]),
-                # queued is CUPTI's command-buffer enqueue time (needs the
-                # subscriber latency-timestamp attr); 0 when unavailable.
-                "queued": convert_time(int(cols[Kernel.QUEUED.id][i])),
-                "channel": int(cols[Kernel.CHANNEL_ID.id][i]),
-                "channel_type": int(cols[Kernel.CHANNEL_TYPE.id][i]),
-            }
-        )
-    return events
-
-
-def _memcpy_events(cols, convert_time, resolver):
-    events = []
-    for i in range(_col_len(cols)):
-        graph_node_id = int(cols[Memcpy.GRAPH_NODE_ID.id][i])
-        correlation_id = int(cols[Memcpy.CORRELATION_ID.id][i])
-        events.append(
-            {
-                "kind": "gpu_memcpy",
-                "device_id": int(cols[Memcpy.DEVICE_ID.id][i]),
-                "context_id": int(cols[Memcpy.CONTEXT_ID.id][i]),
-                "stream_id": int(cols[Memcpy.STREAM_ID.id][i]),
-                "correlation_id": correlation_id,
-                "graph_node_id": graph_node_id,
-                "graph_id": int(cols[Memcpy.GRAPH_ID.id][i]),
-                "start_ns": convert_time(int(cols[Memcpy.START.id][i])),
-                "end_ns": convert_time(int(cols[Memcpy.END.id][i])),
-                "bytes": int(cols[Memcpy.BYTES.id][i]),
-                "copy_kind": int(cols[Memcpy.COPY_KIND.id][i]),
-                "src_kind": int(cols[Memcpy.SRC_KIND.id][i]),
-                "dst_kind": int(cols[Memcpy.DST_KIND.id][i]),
-                "flags": int(cols[Memcpy.FLAGS.id][i]),
-                "annotation": resolver(
-                    graph_node_id, ActivityKind.MEMCPY, correlation_id
-                ),
-                "name": "Memcpy",
-            }
-        )
-    return events
-
-
-def _memset_events(cols, convert_time, resolver):
-    events = []
-    for i in range(_col_len(cols)):
-        graph_node_id = int(cols[Memset.GRAPH_NODE_ID.id][i])
-        correlation_id = int(cols[Memset.CORRELATION_ID.id][i])
-        events.append(
-            {
-                "kind": "gpu_memset",
-                "device_id": int(cols[Memset.DEVICE_ID.id][i]),
-                "context_id": int(cols[Memset.CONTEXT_ID.id][i]),
-                "stream_id": int(cols[Memset.STREAM_ID.id][i]),
-                "correlation_id": correlation_id,
-                "graph_node_id": graph_node_id,
-                "graph_id": int(cols[Memset.GRAPH_ID.id][i]),
-                "start_ns": convert_time(int(cols[Memset.START.id][i])),
-                "end_ns": convert_time(int(cols[Memset.END.id][i])),
-                "bytes": int(cols[Memset.BYTES.id][i]),
-                "value": int(cols[Memset.VALUE.id][i]),
-                "memory_kind": int(cols[Memset.MEMORY_KIND.id][i]),
-                "flags": int(cols[Memset.FLAGS.id][i]),
-                "annotation": resolver(
-                    graph_node_id, ActivityKind.MEMSET, correlation_id
-                ),
-                "name": "Memset",
-            }
-        )
-    return events
-
-
-def _api_events(kind_name):
-    def build(cols, convert_time, resolver):
-        del resolver
-        events = []
-        for i in range(_col_len(cols)):
-            cbid = int(cols[Api.CBID.id][i])
-            events.append(
-                {
-                    "kind": kind_name,
-                    "cbid": cbid,
-                    "start_ns": convert_time(int(cols[Api.START.id][i])),
-                    "end_ns": convert_time(int(cols[Api.END.id][i])),
-                    "process_id": int(cols[Api.PROCESS_ID.id][i]),
-                    "thread_id": int(cols[Api.THREAD_ID.id][i]),
-                    "correlation_id": int(cols[Api.CORRELATION_ID.id][i]),
-                    "name": f"cbid_{cbid}",
-                }
+    # Scope to ids we have a blob for: an op may carry one EXTERNAL_CORRELATION record
+    # per active kind (e.g. a tracer region too), and only collective ids are in
+    # external_metadata -- so this both picks the right record and avoids a region id
+    # shadowing the collective.
+    corr_to_ext: dict[int, int] = {}
+    ext = columns.get("external_correlation")
+    if external_metadata and ext is not None:
+        corr_to_ext = {
+            corr: external_id
+            for corr, external_id in zip(
+                ext["correlation_id"].tolist(), ext["external_id"].tolist()
             )
-        return events
+            if external_id in external_metadata
+        }
+    for kind_str in ("kernel", "gpu_memcpy", "gpu_memset"):
+        c = columns.get(kind_str)
+        if not c or not len(c["correlation_id"]):
+            continue
+        corr_l = c["correlation_id"].tolist()
+        gnid_l = c["graph_node_id"].tolist()
+        meta = np.empty(len(corr_l), dtype=object)
+        meta[:] = None
+        for i in range(len(corr_l)):
+            if external_metadata:
+                external_id = corr_to_ext.get(corr_l[i])
+                if external_id is not None:
+                    blob = external_metadata.get(external_id)
+                    if blob is not None:
+                        meta[i] = blob
+                        continue  # eager hit; don't also consult the graph resolver
+            if metadata_resolver is not None:
+                node = gnid_l[i] or 0
+                if node:
+                    blob = metadata_resolver(node)
+                    if blob is not None:
+                        meta[i] = blob
+        c["metadata"] = meta
 
-    return build
+
+def _demangle_column(names: Any) -> Any:
+    out = np.empty(len(names), dtype=object)
+    for i, raw in enumerate(names.tolist()):
+        out[i] = _demangle_symbol(raw)
+    return out
 
 
-def _external_correlation_events(cols, convert_time, resolver):
-    del convert_time, resolver
-    events = []
-    for i in range(_col_len(cols)):
-        events.append(
-            {
-                "kind": "external_correlation",
-                "external_kind": int(cols[ExternalCorrelation.EXTERNAL_KIND.id][i]),
-                "external_id": int(cols[ExternalCorrelation.EXTERNAL_ID.id][i]),
-                "correlation_id": int(cols[ExternalCorrelation.CORRELATION_ID.id][i]),
-                "name": "external_correlation",
-            }
-        )
-    return events
+def _resolve_annotation_column(resolver, gnid: Any, kind: int, corr: Any) -> Any:
+    """Per-row graph annotation as an object column. Resolution is memoized over the
+    distinct (graph_node_id, correlation_id) keys -- graph replays reuse a handful of
+    node ids, so this collapses to a few resolver calls. None resolver (no graph
+    naming) -> an all-None column with no calls."""
+    n = len(gnid)
+    out = np.empty(n, dtype=object)
+    if resolver is None:
+        out[:] = None
+        return out
+    cache: dict[tuple[int, int], Any] = {}
+    gl = gnid.tolist()
+    cl = corr.tolist()
+    for i in range(n):
+        key = (gl[i], cl[i])
+        val = cache.get(key, _ANNOTATION_MISS)
+        if val is _ANNOTATION_MISS:
+            val = cache[key] = resolver(gl[i], kind, cl[i])
+        out[i] = val
+    return out
 
 
-def _overhead_events(cols, convert_time, resolver):
+def _kernel_columns(cols, convert, resolver):
+    gnid = cols[Kernel.GRAPH_NODE_ID.id].astype(np.int64)
+    corr = cols[Kernel.CORRELATION_ID.id].astype(np.int64)
+    return {
+        "start_ns": convert(cols[Kernel.START.id]),
+        "end_ns": convert(cols[Kernel.END.id]),
+        "device_id": cols[Kernel.DEVICE_ID.id].astype(np.int64),
+        "context_id": cols[Kernel.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[Kernel.STREAM_ID.id].astype(np.int64),
+        "correlation_id": corr,
+        "graph_node_id": gnid,
+        "graph_id": cols[Kernel.GRAPH_ID.id].astype(np.int64),
+        "name": _demangle_column(cols[Kernel.NAME.id]),
+        "annotation": _resolve_annotation_column(
+            resolver, gnid, int(ActivityKind.CONCURRENT_KERNEL), corr
+        ),
+        "grid_x": cols[Kernel.GRID_X.id].astype(np.int64),
+        "grid_y": cols[Kernel.GRID_Y.id].astype(np.int64),
+        "grid_z": cols[Kernel.GRID_Z.id].astype(np.int64),
+        "block_x": cols[Kernel.BLOCK_X.id].astype(np.int64),
+        "block_y": cols[Kernel.BLOCK_Y.id].astype(np.int64),
+        "block_z": cols[Kernel.BLOCK_Z.id].astype(np.int64),
+        "registers_per_thread": cols[Kernel.REGISTERS_PER_THREAD.id].astype(np.int64),
+        "static_shared_memory": cols[Kernel.STATIC_SHARED_MEMORY.id].astype(np.int64),
+        "dynamic_shared_memory": cols[Kernel.DYNAMIC_SHARED_MEMORY.id].astype(np.int64),
+        "priority": cols[Kernel.LAUNCH_PRIORITY.id].astype(np.int64),
+        "queued": convert(cols[Kernel.QUEUED.id]),
+        "channel": cols[Kernel.CHANNEL_ID.id].astype(np.int64),
+        "channel_type": cols[Kernel.CHANNEL_TYPE.id].astype(np.int64),
+    }
+
+
+def _memcpy_columns(cols, convert, resolver):
+    gnid = cols[Memcpy.GRAPH_NODE_ID.id].astype(np.int64)
+    corr = cols[Memcpy.CORRELATION_ID.id].astype(np.int64)
+    return {
+        "start_ns": convert(cols[Memcpy.START.id]),
+        "end_ns": convert(cols[Memcpy.END.id]),
+        "device_id": cols[Memcpy.DEVICE_ID.id].astype(np.int64),
+        "context_id": cols[Memcpy.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[Memcpy.STREAM_ID.id].astype(np.int64),
+        "correlation_id": corr,
+        "graph_node_id": gnid,
+        "graph_id": cols[Memcpy.GRAPH_ID.id].astype(np.int64),
+        "annotation": _resolve_annotation_column(
+            resolver, gnid, int(ActivityKind.MEMCPY), corr
+        ),
+        "bytes": cols[Memcpy.BYTES.id].astype(np.int64),
+        "copy_kind": cols[Memcpy.COPY_KIND.id].astype(np.int64),
+        "src_kind": cols[Memcpy.SRC_KIND.id].astype(np.int64),
+        "dst_kind": cols[Memcpy.DST_KIND.id].astype(np.int64),
+        "flags": cols[Memcpy.FLAGS.id].astype(np.int64),
+    }
+
+
+def _memset_columns(cols, convert, resolver):
+    gnid = cols[Memset.GRAPH_NODE_ID.id].astype(np.int64)
+    corr = cols[Memset.CORRELATION_ID.id].astype(np.int64)
+    return {
+        "start_ns": convert(cols[Memset.START.id]),
+        "end_ns": convert(cols[Memset.END.id]),
+        "device_id": cols[Memset.DEVICE_ID.id].astype(np.int64),
+        "context_id": cols[Memset.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[Memset.STREAM_ID.id].astype(np.int64),
+        "correlation_id": corr,
+        "graph_node_id": gnid,
+        "graph_id": cols[Memset.GRAPH_ID.id].astype(np.int64),
+        "annotation": _resolve_annotation_column(
+            resolver, gnid, int(ActivityKind.MEMSET), corr
+        ),
+        "bytes": cols[Memset.BYTES.id].astype(np.int64),
+        "value": cols[Memset.VALUE.id].astype(np.int64),
+        "memory_kind": cols[Memset.MEMORY_KIND.id].astype(np.int64),
+        "flags": cols[Memset.FLAGS.id].astype(np.int64),
+    }
+
+
+def _api_columns(cols, convert, resolver):
     del resolver
-    events = []
-    for i in range(_col_len(cols)):
-        overhead_kind = int(cols[Overhead.OVERHEAD_KIND.id][i])
-        events.append(
-            {
-                "kind": "overhead",
-                "object_id": 0,
-                "start_ns": convert_time(int(cols[Overhead.START.id][i])),
-                "end_ns": convert_time(int(cols[Overhead.END.id][i])),
-                "correlation_id": int(cols[Overhead.CORRELATION_ID.id][i]),
-                "name": OVERHEAD_KIND_NAMES.get(
-                    overhead_kind, f"overhead_{overhead_kind}"
-                ),
-            }
-        )
-    return events
+    return {
+        "cbid": cols[Api.CBID.id].astype(np.int64),
+        "start_ns": convert(cols[Api.START.id]),
+        "end_ns": convert(cols[Api.END.id]),
+        "process_id": cols[Api.PROCESS_ID.id].astype(np.int64),
+        "thread_id": cols[Api.THREAD_ID.id].astype(np.int64),
+        "correlation_id": cols[Api.CORRELATION_ID.id].astype(np.int64),
+    }
 
 
-def _sync_events(cols, convert_time, resolver):
+def _external_correlation_columns(cols, convert, resolver):
+    del convert, resolver
+    external_id = cols[ExternalCorrelation.EXTERNAL_ID.id].astype(np.int64)
+    return {
+        "external_kind": cols[ExternalCorrelation.EXTERNAL_KIND.id].astype(np.int64),
+        "external_id": external_id,
+        "correlation_id": cols[ExternalCorrelation.CORRELATION_ID.id].astype(np.int64),
+        # Default to the raw innermost id; _resolve_user_external_ids overrides the
+        # rows that resolve to an enclosing named region (chain is live at dispatch).
+        "user_external_id": external_id.copy(),
+    }
+
+
+def _overhead_columns(cols, convert, resolver):
     del resolver
-    events = []
-    for i in range(_col_len(cols)):
-        events.append(
-            {
-                "kind": "cuda_sync",
-                "sync_type": int(cols[Sync.TYPE.id][i]),
-                "start_ns": convert_time(int(cols[Sync.START.id][i])),
-                "end_ns": convert_time(int(cols[Sync.END.id][i])),
-                "context_id": int(cols[Sync.CONTEXT_ID.id][i]),
-                "stream_id": int(cols[Sync.STREAM_ID.id][i]),
-                "correlation_id": int(cols[Sync.CORRELATION_ID.id][i]),
-                "cuda_event_id": int(cols[Sync.CUDA_EVENT_ID.id][i]),
-                "cuda_event_sync_id": int(cols[Sync.CUDA_EVENT_SYNC_ID.id][i]),
-                "name": "cuda_sync",
-            }
-        )
-    return events
+    kinds = cols[Overhead.OVERHEAD_KIND.id].astype(np.int64)
+    names = np.empty(len(kinds), dtype=object)
+    for i, k in enumerate(kinds.tolist()):
+        names[i] = OVERHEAD_KIND_NAMES.get(k, f"overhead_{k}")
+    return {
+        "start_ns": convert(cols[Overhead.START.id]),
+        "end_ns": convert(cols[Overhead.END.id]),
+        "correlation_id": cols[Overhead.CORRELATION_ID.id].astype(np.int64),
+        "name": names,
+    }
 
 
-def _cuda_event_events(cols, convert_time, resolver):
-    # No start_ns -> routed to the untimestamped join-input buffer (like
-    # external_correlation). Resolves a Sync's cuda_event_sync_id to the cudaEventRecord
-    # correlation id for the wait_on join in monitor_trace.
-    del convert_time, resolver
-    events = []
-    for i in range(_col_len(cols)):
-        events.append(
-            {
-                "kind": "cuda_event",
-                "cuda_event_sync_id": int(cols[CudaEvent.CUDA_EVENT_SYNC_ID.id][i]),
-                "correlation_id": int(cols[CudaEvent.CORRELATION_ID.id][i]),
-                "device_id": int(cols[CudaEvent.DEVICE_ID.id][i]),
-                "context_id": int(cols[CudaEvent.CONTEXT_ID.id][i]),
-                "stream_id": int(cols[CudaEvent.STREAM_ID.id][i]),
-                "event_id": int(cols[CudaEvent.EVENT_ID.id][i]),
-                "name": "cuda_event",
-            }
-        )
-    return events
+def _sync_columns(cols, convert, resolver):
+    del resolver
+    return {
+        "sync_type": cols[Sync.TYPE.id].astype(np.int64),
+        "start_ns": convert(cols[Sync.START.id]),
+        "end_ns": convert(cols[Sync.END.id]),
+        "context_id": cols[Sync.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[Sync.STREAM_ID.id].astype(np.int64),
+        "correlation_id": cols[Sync.CORRELATION_ID.id].astype(np.int64),
+        "cuda_event_id": cols[Sync.CUDA_EVENT_ID.id].astype(np.int64),
+        "cuda_event_sync_id": cols[Sync.CUDA_EVENT_SYNC_ID.id].astype(np.int64),
+    }
 
 
-_BUILDERS: dict[int, Callable[..., list[dict[str, Any]]]] = {
-    ActivityKind.CONCURRENT_KERNEL: _kernel_events,
-    ActivityKind.MEMCPY: _memcpy_events,
-    ActivityKind.MEMSET: _memset_events,
-    ActivityKind.RUNTIME: _api_events("cuda_runtime"),
-    ActivityKind.DRIVER: _api_events("cuda_driver"),
-    ActivityKind.EXTERNAL_CORRELATION: _external_correlation_events,
-    ActivityKind.OVERHEAD: _overhead_events,
-    ActivityKind.SYNCHRONIZATION: _sync_events,
-    ActivityKind.CUDA_EVENT: _cuda_event_events,
+def _cuda_event_columns(cols, convert, resolver):
+    del convert, resolver
+    return {
+        "cuda_event_sync_id": cols[CudaEvent.CUDA_EVENT_SYNC_ID.id].astype(np.int64),
+        "correlation_id": cols[CudaEvent.CORRELATION_ID.id].astype(np.int64),
+        "device_id": cols[CudaEvent.DEVICE_ID.id].astype(np.int64),
+        "context_id": cols[CudaEvent.CONTEXT_ID.id].astype(np.int64),
+        "stream_id": cols[CudaEvent.STREAM_ID.id].astype(np.int64),
+        "event_id": cols[CudaEvent.EVENT_ID.id].astype(np.int64),
+    }
+
+
+# kind -> (chrome-trace kind tag, column builder, is_timed). Timed kinds carry a
+# start_ns column and are bucketed into windows; untimed kinds (external_correlation,
+# cuda_event) are pure join inputs that ride along whatever window is finalized.
+_COLUMN_BUILDERS: dict[int, tuple[str, Any, bool]] = {
+    int(ActivityKind.CONCURRENT_KERNEL): ("kernel", _kernel_columns, True),
+    int(ActivityKind.MEMCPY): ("gpu_memcpy", _memcpy_columns, True),
+    int(ActivityKind.MEMSET): ("gpu_memset", _memset_columns, True),
+    int(ActivityKind.RUNTIME): ("cuda_runtime", _api_columns, True),
+    int(ActivityKind.DRIVER): ("cuda_driver", _api_columns, True),
+    int(ActivityKind.EXTERNAL_CORRELATION): (
+        "external_correlation",
+        _external_correlation_columns,
+        False,
+    ),
+    int(ActivityKind.OVERHEAD): ("overhead", _overhead_columns, True),
+    int(ActivityKind.SYNCHRONIZATION): ("cuda_sync", _sync_columns, True),
+    int(ActivityKind.CUDA_EVENT): ("cuda_event", _cuda_event_columns, False),
 }
 
 

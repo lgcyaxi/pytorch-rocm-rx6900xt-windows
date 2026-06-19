@@ -398,60 +398,142 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(m.drain_decoded(), ([], {}))
 
     def test_attach_metadata_join(self):
-        # The CollTrace-replacement join: a blob keyed by external_id is attached
-        # onto the timed events whose correlation_id maps (via the window's
-        # EXTERNAL_CORRELATION records -- all ours, the monitor is the sole pusher)
-        # to that external_id. Pure host-side.
+        # The CollTrace-replacement join: a blob keyed by external_id is attached as a
+        # "metadata" column onto the GPU-op kinds whose correlation_id maps (via the
+        # window's EXTERNAL_CORRELATION columns -- all ours, the monitor is the sole
+        # pusher) to that external_id. Pure host-side, columnar.
+        import numpy as np
+
         from torch.profiler._cupti.observers.profiler import _attach_metadata
 
-        timed = [
-            {"correlation_id": 100},  # -> ext 42 -> blob
-            {"correlation_id": 200},  # -> ext 43, no blob
-            {"correlation_id": 300},  # no ext mapping
-        ]
-        ext_events = [
-            {"external_id": 42, "correlation_id": 100},
-            {"external_id": 43, "correlation_id": 200},
-        ]
+        columns = {
+            "kernel": {
+                "correlation_id": np.array([100, 200, 300]),  # 100->ext 42->blob
+                "graph_node_id": np.array([0, 0, 0]),
+            },
+            "external_correlation": {
+                "correlation_id": np.array([100, 200]),
+                "external_id": np.array([42, 43]),
+            },
+        }
         blob = json.dumps({"func": "AllReduce", "count": 4096})
-        _attach_metadata(timed, ext_events, {42: blob}, None)
-        self.assertEqual(
-            json.loads(timed[0]["metadata"]), {"func": "AllReduce", "count": 4096}
-        )
-        self.assertNotIn("metadata", timed[1])  # external id has no blob
-        self.assertNotIn("metadata", timed[2])  # no correlation -> external mapping
+        _attach_metadata(columns, {42: blob}, None)
+        meta = columns["kernel"]["metadata"]
+        self.assertEqual(json.loads(meta[0]), {"func": "AllReduce", "count": 4096})
+        self.assertIsNone(meta[1])  # external id has no blob
+        self.assertIsNone(meta[2])  # no correlation -> external mapping
         # No metadata + no resolver is a no-op (the non-collective path pays nothing).
-        clean = [{"correlation_id": 100}]
-        _attach_metadata(clean, ext_events, {}, None)
-        self.assertNotIn("metadata", clean[0])
+        clean = {
+            "kernel": {
+                "correlation_id": np.array([100]),
+                "graph_node_id": np.array([0]),
+            },
+            "external_correlation": {
+                "correlation_id": np.array([100]),
+                "external_id": np.array([42]),
+            },
+        }
+        _attach_metadata(clean, {}, None)
+        self.assertNotIn("metadata", clean["kernel"])
 
     def test_attach_metadata_graph_resolver(self):
         # CUDA-graph-captured collectives have no replay-time external correlation;
         # their blob is resolved by graph_node_id via the metadata resolver (the same
-        # mechanism as graph annotation names). Pure host-side.
+        # mechanism as graph annotation names). Pure host-side, columnar.
+        import numpy as np
+
         from torch.profiler._cupti.observers.profiler import _attach_metadata
 
         blob = json.dumps({"func": "AllReduce"})
         registry = {7: blob}  # stack-managed graph_node_id -> blob
         resolver = registry.get
 
-        # Replay event: stable node 7, fresh correlation id, no EXTERNAL_CORRELATION
+        # Replay op: stable node 7, fresh correlation id, no EXTERNAL_CORRELATION
         # -> the eager join misses but the resolver hits.
-        replay = [{"correlation_id": 999, "graph_node_id": 7}]
-        _attach_metadata(replay, [], {}, resolver)
-        self.assertEqual(json.loads(replay[0]["metadata"]), {"func": "AllReduce"})
+        replay = {
+            "kernel": {
+                "correlation_id": np.array([999]),
+                "graph_node_id": np.array([7]),
+            }
+        }
+        _attach_metadata(replay, {}, resolver)
+        self.assertEqual(
+            json.loads(replay["kernel"]["metadata"][0]), {"func": "AllReduce"}
+        )
 
-        # Unknown node -> untouched.
-        other = [{"correlation_id": 1000, "graph_node_id": 8}]
-        _attach_metadata(other, [], {}, resolver)
-        self.assertNotIn("metadata", other[0])
+        # Unknown node -> no blob (None).
+        other = {
+            "kernel": {
+                "correlation_id": np.array([1000]),
+                "graph_node_id": np.array([8]),
+            }
+        }
+        _attach_metadata(other, {}, resolver)
+        self.assertIsNone(other["kernel"]["metadata"][0])
 
         # Eager wins over the resolver when both could resolve (and avoids calling it).
-        both = [{"correlation_id": 100, "graph_node_id": 7}]
-        ext_events = [{"external_id": 42, "correlation_id": 100}]
+        both = {
+            "kernel": {
+                "correlation_id": np.array([100]),
+                "graph_node_id": np.array([7]),
+            },
+            "external_correlation": {
+                "correlation_id": np.array([100]),
+                "external_id": np.array([42]),
+            },
+        }
         eager_blob = json.dumps({"func": "ReduceScatter"})
-        _attach_metadata(both, ext_events, {42: eager_blob}, resolver)
-        self.assertEqual(json.loads(both[0]["metadata"]), {"func": "ReduceScatter"})
+        _attach_metadata(both, {42: eager_blob}, resolver)
+        self.assertEqual(
+            json.loads(both["kernel"]["metadata"][0]), {"func": "ReduceScatter"}
+        )
+
+    def test_metadata_blob_rendered_into_trace_args(self):
+        # The comms descriptor blob attached as the "metadata" column is spread into the
+        # chrome-trace kernel args (so func/count/... show up), the same way a dict
+        # annotation is. Drives the columnar merge directly (no CUDA).
+        import numpy as np
+
+        from torch.profiler._cupti.monitor_trace import _trace_window_entries
+
+        def col(v):
+            return np.array([v], dtype=np.int64)
+
+        blob = json.dumps({"func": "AllReduce", "count": 4096})
+        columns = {
+            "kernel": {
+                "start_ns": col(1000),
+                "end_ns": col(2000),
+                "device_id": col(0),
+                "context_id": col(1),
+                "stream_id": col(7),
+                "correlation_id": col(5),
+                "graph_id": col(0),
+                "graph_node_id": col(0),
+                "name": np.array(["ncclDevKernel"], dtype=object),
+                "annotation": np.array([None], dtype=object),
+                "grid_x": col(1),
+                "grid_y": col(1),
+                "grid_z": col(1),
+                "block_x": col(1),
+                "block_y": col(1),
+                "block_z": col(1),
+                "registers_per_thread": col(0),
+                "static_shared_memory": col(0),
+                "dynamic_shared_memory": col(0),
+                "priority": col(0),
+                "queued": col(0),
+                "channel": col(0),
+                "channel_type": col(0),
+                "metadata": np.array([blob], dtype=object),
+            }
+        }
+        _, events = _trace_window_entries({"columns": columns}, base_ns=0)
+        kernels = [e for e in events if e.get("cat") == "kernel"]
+        self.assertEqual(len(kernels), 1)
+        args = kernels[0]["args"]
+        self.assertEqual(args["func"], "AllReduce")
+        self.assertEqual(args["count"], 4096)
 
     def test_metadata_store_explicit_id(self):
         # put_external(blob, external_id): an explicit non-zero id targets a specific
