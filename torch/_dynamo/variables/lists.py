@@ -193,25 +193,6 @@ class BaseListVariable(VariableTracker):
         """Sequence length for lists, tuples, and range objects."""
         return VariableTracker.build(tx, len(self.items))
 
-    def tp_iteritem_impl(
-        self, tx: "InstructionTranslatorBase", index: VariableTracker
-    ) -> tuple[VariableTracker, VariableTracker]:
-        # 3.15 _tp_iteritem slot.  list/tuple (and tuple subclasses like
-        # torch.Size) all share the same algorithm: index into self.items,
-        # bump the index, signal exhaustion with StopIteration.  Subclasses
-        # whose Python type does NOT install _tp_iteritem (range, deque)
-        # override this to fall back to the base "missing" behavior.
-        # ref: https://github.com/python/cpython/blob/f31a89bb9010/Objects/listobject.c#L3916-L3921 (list_iteritem)
-        # ref: https://github.com/python/cpython/blob/f31a89bb9010/Objects/tupleobject.c#L876-L885 (tuple_iteritem)
-        if not isinstance(self, (ListVariable, TupleVariable)):
-            return super().tp_iteritem_impl(tx, index)
-        i = index.as_python_constant()
-        if i < 0:
-            raise AssertionError(f"Invalid index {i}")
-        if i >= len(self.items):
-            raise_observed_exception(IndexError, tx)
-        return self.items[i], ConstantVariable.create(i + 1)
-
     def sq_contains(
         self, tx: "InstructionTranslatorBase", item: VariableTracker
     ) -> VariableTracker:
@@ -586,14 +567,17 @@ class RangeVariable(BaseListVariable):
     def python_type(self) -> type:
         return range
 
-    def start(self) -> Any:
-        return self.items[0].as_python_constant()
+    # range math needs concrete bounds; with assume_static_by_default=False a
+    # range object's start/stop/step are wrapped as symbolic ints, so specialize
+    # them (installing a guard) rather than assuming a plain constant.
+    def start(self) -> int:
+        return guard_if_dyn(self.items[0])
 
-    def stop(self) -> Any:
-        return self.items[1].as_python_constant()
+    def stop(self) -> int:
+        return guard_if_dyn(self.items[1])
 
-    def step(self) -> Any:
-        return self.items[2].as_python_constant()
+    def step(self) -> int:
+        return guard_if_dyn(self.items[2])
 
     def range_length(self) -> int:
         lo = self.start()
@@ -721,7 +705,8 @@ class RangeVariable(BaseListVariable):
     def unpack_var_sequence(
         self, tx: Optional["InstructionTranslatorBase"] = None
     ) -> list[VariableTracker]:
-        return [variables.ConstantVariable.create(x) for x in self.as_python_constant()]
+        rng = range(self.start(), self.stop(), self.step())
+        return [variables.ConstantVariable.create(x) for x in rng]
 
     def sq_length(self, tx: "InstructionTranslatorBase") -> VariableTracker:
         """Sequence length for range objects."""
