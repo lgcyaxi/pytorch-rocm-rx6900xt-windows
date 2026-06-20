@@ -15,7 +15,6 @@ import types
 import unittest
 import warnings
 from collections import namedtuple, OrderedDict
-from unittest.case import skipIf
 
 from common_utils import (
     check_vmap_fallback,
@@ -28,6 +27,7 @@ from common_utils import (
     is_valid_inplace_sample_input,
     opsToleranceOverride,
     skip,
+    skipIf,
     tol1,
     xfail,
     xfailIf,
@@ -69,9 +69,9 @@ from torch.testing._internal.common_utils import (
     markDynamoStrictTest,
     parametrize,
     run_tests,
-    skipIfRocm,
     skipIfTorchDynamo,
     subtest,
+    TEST_MPS,
     TEST_WITH_ROCM,
     TEST_WITH_TORCHDYNAMO,
     TestCase,
@@ -1224,9 +1224,13 @@ class TestVmapAPI(TestCase):
     def test_vmap_autocast_cpu(self):
         self._test_vmap_autocast("cpu")
 
-    @skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     def test_vmap_autocast_cuda(self):
         self._test_vmap_autocast("cuda")
+
+    @unittest.skipIf(not TEST_MPS, "MPS is unavailable")
+    def test_vmap_autocast_mps(self):
+        self._test_vmap_autocast("mps")
 
     def test_restore_vmap_pytree_input_output(self):
         def f(x, y):
@@ -4384,7 +4388,6 @@ class TestVmapOperatorsOpInfo(TestCase):
         xfail("torch.ops.aten._flash_attention_forward"),
     }
 
-    @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/164556")
     @with_tf32_off  # https://github.com/pytorch/pytorch/issues/86798
     @ops(
         op_db + additional_op_db + autograd_function_db + custom_op_db,
@@ -4441,6 +4444,8 @@ class TestVmapOperatorsOpInfo(TestCase):
                     ),
                 ),
                 xfail("native_group_norm"),
+                # https://github.com/pytorch/pytorch/issues/164556
+                skipIf("cholesky_solve", lambda *args: TEST_WITH_ROCM),
             }
         ),
     )
@@ -4504,11 +4509,9 @@ class TestVmapOperatorsOpInfo(TestCase):
                 xfail("put"),
                 xfail("quantile"),
                 xfail("renorm"),
-                xfail("squeeze_copy"),
                 xfail("resize_as_"),
                 xfail("take"),
                 xfail("tensor_split"),
-                xfail("transpose_copy"),
                 xfail("to_sparse"),
                 # TypeError: expected Tensor as element 0 in argument 0, but got float
                 xfail("item"),
@@ -4534,9 +4537,6 @@ class TestVmapOperatorsOpInfo(TestCase):
                 xfail("histc"),
                 xfail("as_strided"),
                 xfail("as_strided_copy"),
-                xfail("permute_copy"),
-                xfail("t_copy"),
-                xfail("unsqueeze_copy"),
                 xfail("istft"),
                 xfail("nonzero"),
                 xfail("nn.functional.fractional_max_pool2d"),
