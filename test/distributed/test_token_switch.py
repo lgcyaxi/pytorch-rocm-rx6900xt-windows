@@ -362,6 +362,95 @@ class TokenSwitchNCCLTest(MultiProcContinuousTest):
         )
         self.assertEqual(combined, expected)
 
+    @skip_if_lt_x_gpu(2)
+    def test_dispatch_expert_major(self):
+        """Expert-major layout: out_topk_weights is 1-D, out_topk_idx is absent."""
+        self._init()
+        ts = self.get_token_switch()
+        num_recv_tokens = self.world_size * NUM_TOKENS
+
+        topk_idx, topk_weights = _generate_topk(
+            self.rank, self.world_size, NUM_TOKENS, TOP_K, self.device
+        )
+        routing = ts.create_routing(topk_idx, layout="expert_major")
+
+        token_val = float(self.rank + 1)
+        tokens = torch.full(
+            (NUM_TOKENS, HIDDEN), token_val, dtype=torch.bfloat16, device=self.device
+        )
+        out_tokens = torch.zeros(
+            (num_recv_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device
+        )
+        # 1-D weights: one scalar per received slot (no topk dim).
+        out_topk_weights = torch.zeros(
+            num_recv_tokens, dtype=torch.float32, device=self.device
+        )
+
+        ts.dispatch(
+            routing,
+            tokens,
+            topk_weights,
+            out=(out_tokens, out_topk_weights, None),
+        )
+        torch.cuda.synchronize()
+
+        src_rank = (self.rank - 1) % self.world_size
+        expected_val = float(src_rank + 1)
+        received = out_tokens[:NUM_TOKENS].float()
+        self.assertTrue(
+            received.eq(expected_val).all(),
+            f"rank {self.rank}: expected {expected_val}, got {received[0, 0].item()}",
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_dispatch_combine_roundtrip_expert_major(self):
+        """Expert-major HT roundtrip: user applies 1-D weights before combine."""
+        self._init()
+        ts = self.get_token_switch()
+        num_recv_tokens = self.world_size * NUM_TOKENS
+
+        topk_idx, topk_weights = _generate_topk(
+            self.rank, self.world_size, NUM_TOKENS, TOP_K, self.device
+        )
+        routing = ts.create_routing(topk_idx, layout="expert_major")
+
+        token_val = float(self.rank + 1)
+        tokens = torch.full(
+            (NUM_TOKENS, HIDDEN), token_val, dtype=torch.bfloat16, device=self.device
+        )
+        out_tokens = torch.zeros(
+            (num_recv_tokens, HIDDEN), dtype=torch.bfloat16, device=self.device
+        )
+        out_topk_weights = torch.zeros(
+            num_recv_tokens, dtype=torch.float32, device=self.device
+        )
+
+        ts.dispatch(
+            routing,
+            tokens,
+            topk_weights,
+            out=(out_tokens, out_topk_weights, None),
+        )
+        torch.cuda.synchronize()
+
+        # HT+expert_major: multiply by weights before combine.
+        # out_topk_weights[:NUM_TOKENS] covers this rank's expert zone.
+        expert_tokens = out_tokens[:NUM_TOKENS].contiguous()
+        expert_weights = out_topk_weights[:NUM_TOKENS]
+        expert_tokens_weighted = (
+            expert_tokens.float().mul_(expert_weights[:, None])
+        ).to(torch.bfloat16).contiguous()
+
+        combined = torch.zeros(
+            (NUM_TOKENS, HIDDEN), dtype=torch.bfloat16, device=self.device
+        )
+        ts.combine(routing, expert_tokens_weighted, out=combined)
+        torch.cuda.synchronize()
+
+        # weights are 1/TOP_K = 1.0, so the roundtrip is lossless.
+        expected = torch.full((NUM_TOKENS, HIDDEN), token_val, dtype=torch.bfloat16)
+        self.assertEqual(combined.cpu(), expected)
+
 
 if __name__ == "__main__":
     run_tests()
