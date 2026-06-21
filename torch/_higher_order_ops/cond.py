@@ -240,18 +240,12 @@ def cond(
         raise RuntimeError("torch.cond requires dynamo support.")
 
     mode = _get_current_dispatch_mode()
-    if mode is not None:
+    if mode is not None and mode.supports_higher_order_operators:
         # HOP-aware modes can handle eager cond without Dynamo's wrapper compile.
-        result = NotImplemented
-        if type(mode) in cond_op.python_key_table:
-            handler = cond_op.python_key_table[type(mode)]
-            with _pop_mode_temporarily() as mode:
-                result = handler(mode, pred, true_fn, false_fn, operands)
-        elif mode.supports_higher_order_operators:
-            with _pop_mode_temporarily() as mode:
-                result = mode.__torch_dispatch__(
-                    cond_op, [], (pred, true_fn, false_fn, operands), {}
-                )
+        with _pop_mode_temporarily() as mode:
+            result = mode.__torch_dispatch__(
+                cond_op, [], (pred, true_fn, false_fn, operands), {}
+            )
         if result is not NotImplemented:
             return result
 
