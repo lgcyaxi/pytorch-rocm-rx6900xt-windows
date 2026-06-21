@@ -24,6 +24,13 @@ flaky_models = {
     "sam",
 }
 
+cuda_inductor_timm_training_flaky_models = {
+    # These CUDA TIMM training models can report eager_two_runs_differ before
+    # Dynamo runs.
+    "mobilenetv2_100",
+    "tf_efficientnet_b0",
+}
+
 
 def get_field(csv, model_name: str, field: str):
     try:
@@ -35,9 +42,16 @@ def get_field(csv, model_name: str, field: str):
 def check_accuracy(actual_csv, expected_csv, expected_filename):
     failed = []
     improved = []
+    flaky_models_for_expected = set(flaky_models)
+
+    if (
+        "rocm" not in expected_filename
+        and os.path.basename(expected_filename) == "inductor_timm_training.csv"
+    ):
+        flaky_models_for_expected.update(cuda_inductor_timm_training_flaky_models)
 
     if "rocm" in expected_filename:
-        flaky_models.update(
+        flaky_models_for_expected.update(
             {
                 "Background_Matting",
                 "mnasnet1_0",
@@ -74,7 +88,7 @@ def check_accuracy(actual_csv, expected_csv, expected_filename):
             status = "PASS" if expected_accuracy == "pass" else "XFAIL"
             print(f"{model:34}  {status}")
             continue
-        elif model in flaky_models:
+        elif model in flaky_models_for_expected:
             if accuracy == "pass":
                 # model passed but marked xfailed
                 status = "PASS_BUT_FLAKY:"
