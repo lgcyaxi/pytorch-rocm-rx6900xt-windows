@@ -557,9 +557,16 @@ def standalone_compile(
             return AOTCompiledArtifact(compiled_fn)
         artifacts = torch.compiler.save_cache_artifacts()
         if artifacts is None:
-            log.warning(
-                "standalone_compile artifact generation failed, cannot save. "
-                "Run with TORCH_LOGS=+torch._inductor.codecache to identify the problem"
+            # A None artifact is benign: it just means there is no bundled cache to
+            # persist, so a later reload re-runs normal compilation instead of taking a
+            # cache hit. It is also the EXPECTED outcome for several legitimate cases --
+            # caches intentionally disabled (force_disable_caches / fx_graph_cache), and
+            # uncacheable graphs such as control-flow HOPs (torch.cond / while_loop) whose
+            # lowering produces no bundled artifact even with caches on. Log at debug.
+            log.debug(
+                "standalone_compile produced no cache artifact. This is expected when "
+                "caches are disabled (force_disable_caches / fx_graph_cache) or for "
+                "uncacheable graphs such as control-flow HOPs (torch.cond / while_loop)"
             )
 
     return CacheCompiledArtifact(compiled_fn, artifacts)
