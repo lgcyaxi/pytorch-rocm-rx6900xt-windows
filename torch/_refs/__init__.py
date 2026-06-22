@@ -6607,10 +6607,7 @@ def normal_functional(self, mean=0, std=1, *, generator=None):
     )
     if self.stride() == res.stride():
         return res
-    perm, _ = utils.compute_elementwise_output_logical_to_physical_perm(self)
-    perm_shape = utils.apply_perm(self.shape, perm)
-    new_stride = utils.make_contiguous_strides_for(perm_shape)
-    new_stride = utils.apply_perm(new_stride, utils.invert_perm(perm))
+    new_stride = utils.compute_elementwise_output_strides(self)
     return res.as_strided(self.shape, new_stride)
 
 
