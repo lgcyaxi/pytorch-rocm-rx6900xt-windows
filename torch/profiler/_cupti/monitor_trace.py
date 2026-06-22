@@ -249,9 +249,8 @@ def _trace_window_entries(
     base_ns: int,
     cpu_thread_by_external_id: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    # Columnar: each kind is a dict of named numpy columns (built by the observer).
-    # Events are produced by bulk-converting the columns to Python lists once
-    # (np.ndarray.tolist) and zipping, instead of boxing every field per record.
+    # Columnar: each kind is a dict of named numpy columns. Events are built by bulk-
+    # converting the columns to lists once (tolist) and zipping, not boxing per record.
     columns = cast("dict[str, dict[str, Any]]", trace_window.get("columns", {}))
     cpu_thread_by_external_id = cpu_thread_by_external_id or {}
     thread_resource_map = cast(
@@ -324,10 +323,9 @@ def _trace_window_entries(
     need_overhead_metadata = False
 
     # --- GPU ops (kernel / memcpy / memset): one X event + a terminating ac2g flow ---
-    # Each kind builds its X events from a single dict literal per row (faster than
-    # incremental assignment) over the bulk-converted columns; the graph-id/node and
-    # annotation keys -- absent for plain eager kernels -- are patched on only when the
-    # column actually carries them.
+    # Each kind builds X events from one dict literal per row over the bulk-converted
+    # columns; graph-id/node and annotation keys (absent for eager kernels) are patched on
+    # only when the column carries them.
     for ks in ("kernel", "gpu_memcpy", "gpu_memset"):
         c = _col(ks)
         if c is None:
@@ -444,11 +442,9 @@ def _trace_window_entries(
                 }
                 for i in range(n)
             ]
-        # Graph ids, annotations, and the comms metadata blob are absent for plain
-        # eager kernels; patch them on only when the column has any, so the common path
-        # pays nothing per row. The metadata blob (a collective descriptor JSON) is
-        # spread into args like a dict annotation, so its fields (func, count, ...) show
-        # up in the chrome trace.
+        # Graph ids, annotations, and the comms metadata blob are absent for eager kernels;
+        # patch them on only when the column has any. The metadata blob (collective
+        # descriptor JSON) is spread into args so its fields show up in the chrome trace.
         gid = c["graph_id"]
         gnid = c["graph_node_id"]
         ann_l = c["annotation"].tolist()
@@ -719,9 +715,8 @@ def _gpu_user_annotation_events(
     if not ext or not len(ext["correlation_id"]):
         return []
 
-    # `user_external_id` is the innermost ENCLOSING named-region id, resolved at decode
-    # via the monitor's active-id chain (so a kernel nested below a region -- e.g. a
-    # collective -- maps to that region); it falls back to the raw external_id.
+    # `user_external_id` is the innermost ENCLOSING named-region id (resolved at decode via
+    # the monitor's active-id chain), falling back to the raw external_id.
     correlation_to_user_external = {
         corr: uext
         for corr, uext in zip(
