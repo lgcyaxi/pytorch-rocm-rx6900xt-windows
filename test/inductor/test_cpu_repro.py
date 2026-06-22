@@ -2467,14 +2467,29 @@ class CPUReproTests(TestCase):
                 self.assertTrue(detected)
                 return None
 
-        x2 = torch.randint(0, 10, size=(1,))
-        y2 = torch.zeros((1,), dtype=torch.int32)
-        ret = run_division(x2, y2, rounding_mode="trunc")
+        x1 = torch.randint(0, 10, size=(1,))
+        y1 = torch.zeros((1,), dtype=torch.int32)
+        ret = run_division(x1, y1, rounding_mode="trunc")
         self.assertTrue(ret is None)
 
         x2 = torch.randint(0, 10, size=(3, 4))
         y2 = torch.zeros((3, 4), dtype=torch.int32)
         ret = run_division(x2, y2, rounding_mode="trunc")
+        self.assertTrue(ret is None)
+
+        x3 = torch.tensor([-32768, -32768, -32768, -32768], dtype=torch.int16)
+        y3 = torch.tensor([-1, -1, -1, -1], dtype=torch.int16)
+        ret = run_division(x3, y3, rounding_mode="trunc")
+        self.assertTrue(ret[0] == 0 and ret[1] == 0 and ret[2] == 0 and ret[3] == 0)
+
+        x4 = torch.randint(0, 10, size=(1,))
+        ret = run_division(x4, 1, rounding_mode="trunc")
+        ret = run_division(x4, 0, rounding_mode="trunc")
+        self.assertTrue(ret is None)
+
+        x5 = torch.randint(0, 10, size=(1,))
+        y5 = torch.zeros((1,), dtype=torch.int32)
+        ret = run_division(x5, y5, rounding_mode="floor")
         self.assertTrue(ret is None)
 
     def test_no_op_squeeze(self):
