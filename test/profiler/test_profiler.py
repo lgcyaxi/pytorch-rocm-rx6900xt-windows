@@ -835,6 +835,69 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
+    def test_cupti_monitor_sync_export_default(self):
+        # Default: the cupti_monitor backend exports synchronously -- the merged file is
+        # on disk when export_chrome_trace returns, wait_for_exports is a no-op, and no
+        # background poll thread is spawned (the finalize runs on the calling thread).
+        cfg = _ExperimentalConfig(custom_profiler_config='{"backend":"cupti_monitor"}')
+        with TemporaryFileName(mode="w+") as trace_path:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                experimental_config=cfg,
+            ) as prof:
+                a = torch.randn(128, 128, device="cuda")
+                (a @ a).relu().sum().item()
+                torch.cuda.synchronize()
+            obs = prof._cupti_profiler_observer
+            self.assertIsNotNone(obs)
+            self.assertIsNone(obs._poll_thread)  # sync -> no background poller spawned
+            prof.export_chrome_trace(trace_path)
+            # Written before return (cupti_monitor writes gzipped at <path>.gz).
+            self.assertTrue(
+                os.path.exists(trace_path + ".gz") or os.path.exists(trace_path)
+            )
+            prof.wait_for_exports()  # no-op in sync mode
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
+    def test_cupti_monitor_async_export_defers(self):
+        # cupti_monitor_async_export=true hands the export off: a background poll thread
+        # is spawned and the file is written off-thread, joined by wait_for_exports.
+        cfg = _ExperimentalConfig(
+            custom_profiler_config=(
+                '{"backend":"cupti_monitor","cupti_monitor_async_export":true}'
+            ),
+        )
+        with TemporaryFileName(mode="w+") as trace_path:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                experimental_config=cfg,
+            ) as prof:
+                a = torch.randn(128, 128, device="cuda")
+                (a @ a).relu().sum().item()
+                torch.cuda.synchronize()
+            obs = prof._cupti_profiler_observer
+            self.assertIsNotNone(obs._poll_thread)  # async -> background poller running
+            prof.export_chrome_trace(trace_path)
+            prof.wait_for_exports()
+            self.assertTrue(
+                os.path.exists(trace_path + ".gz") or os.path.exists(trace_path)
+            )
+
+    def test_cupti_monitor_async_export_requires_backend(self):
+        # cupti_monitor_async_export is a cupti_monitor-only option: setting it without
+        # the backend is a misconfiguration, not a silent no-op. (Pure config
+        # validation -- raises at construction, no CUDA/cupti needed.)
+        with self.assertRaisesRegex(ValueError, "cupti_monitor_async_export"):
+            profile(
+                activities=[ProfilerActivity.CPU],
+                experimental_config=_ExperimentalConfig(
+                    custom_profiler_config='{"cupti_monitor_async_export":false}'
+                ),
+            )
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    @_isolated
     def test_cupti_monitor_record_shapes(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',

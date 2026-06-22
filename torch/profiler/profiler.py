@@ -282,9 +282,26 @@ class _KinetoProfile:
         # window closed at stop_trace, used by export_chrome_trace.
         self._cupti_profiler_observer: Any = None
         self._monitor_window_id: int | None = None
-        if self._use_cupti_monitor and ProfilerActivity.CPU not in self.activities:
+        # The cupti_monitor backend exports the chrome trace synchronously by default:
+        # export_chrome_trace finalizes + writes before returning (like the stock
+        # profiler), so the file is on disk on return and wait_for_exports is a no-op.
+        # Set {"cupti_monitor_async_export": true} to hand off instead -- the merge+write
+        # then runs off the training thread and wait_for_exports joins it. It is a
+        # cupti_monitor-only option; rejected elsewhere so a misplaced flag isn't a
+        # silent no-op.
+        self._cupti_async_export = False
+        if self._use_cupti_monitor:
+            if ProfilerActivity.CPU not in self.activities:
+                raise ValueError(
+                    "cupti_monitor profiler backend currently requires CPU activity"
+                )
+            self._cupti_async_export = bool(
+                self._custom_profiler_config.get("cupti_monitor_async_export", False)
+            )
+        elif "cupti_monitor_async_export" in self._custom_profiler_config:
             raise ValueError(
-                "cupti_monitor profiler backend currently requires CPU activity"
+                "cupti_monitor_async_export is only supported with the cupti_monitor "
+                "backend"
             )
 
     def start(self) -> None:
@@ -338,7 +355,10 @@ class _KinetoProfile:
             self._cupti_profiler_observer = ProfilerObserver(
                 enable_cuda_sync=bool(
                     self._custom_profiler_config.get("enable_cuda_sync_events")
-                )
+                ),
+                # Synchronous export finalizes on the calling thread (export_chrome_trace
+                # -> join), so skip the background poll thread entirely.
+                defer_export=self._cupti_async_export,
             )
             set_active_profiler_observer(self._cupti_profiler_observer)
         self.profiler._prepare_trace()
@@ -442,6 +462,12 @@ class _KinetoProfile:
             self._cupti_profiler_observer.set_export(
                 self._monitor_window_id, fp.name, path
             )
+            if not self._cupti_async_export:
+                # Synchronous: finalize (force-flush the tail + merge) and write now, so
+                # `path` exists on return and wait_for_exports() is a no-op.
+                self._cupti_profiler_observer.join()
+                self._cupti_profiler_observer = None
+                self._monitor_window_id = None
             return
         if use_python_export:
             self.profiler.export_chrome_trace(

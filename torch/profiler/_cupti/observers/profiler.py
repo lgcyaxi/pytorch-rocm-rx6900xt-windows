@@ -8,7 +8,7 @@ trace needs, and on ``drain()`` hands them back as a trace-window dict -- the
 exact shape ``monitor_trace.merge_trace_window_into_chrome_trace`` consumes to
 splice CUPTI activity into a stock Kineto chrome trace. The trace assembly is
 entirely ``monitor_trace``'s existing logic; this class is the collection,
-annotation join, and windowing around it.
+annotation join, and observation-window management around it.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from torch.profiler._cupti.observers.base import (
     CuptiMonitorObserver,
     ObserverAnnotationSettings,
 )
-from torch.profiler._cupti.observers.windowing import WindowFinalizerMixin
+from torch.profiler._cupti.observers.observation_window import WindowFinalizerMixin
 from torch.profiler._cupti.records import (
     Api,
     CudaEvent,
@@ -204,11 +204,12 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         annotation_resolver: AnnotationResolver | None = None,
         metadata_resolver: Callable[[int], str | None] | None = None,
         enable_cuda_sync: bool = False,
+        defer_export: bool = True,
     ) -> None:
         self._lock = threading.Lock()
         # Decoded activity is kept COLUMNAR end to end: each delivered buffer becomes a
         # frame ``(kind_str, {column_name: np.ndarray})`` rather than a list of per-record
-        # dicts, so windowing is a boolean mask and the chrome-trace build is vectorized
+        # dicts, so window bucketing is a boolean mask and the chrome-trace build is vectorized
         # (no O(records) Python dict churn). Timed frames (kinds with a start_ns column)
         # are bucketed into windows by start time.
         self._timed_frames: list[tuple[str, dict[str, Any]]] = []
@@ -254,8 +255,12 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
             ),
         )
         if self.available:
-            self._init_windowing(
-                poll_interval_ms=20, thread_name="cupti-profiler-export"
+            # defer_export=False (synchronous export) finalizes on the calling thread in
+            # join(), so the background poll thread is never needed -- don't spawn one.
+            self._init_observation_window(
+                poll_interval_ms=20,
+                thread_name="cupti-profiler-export",
+                auto_start_poller=defer_export,
             )
 
     def _boundary_clock_ns(self) -> int:
@@ -421,7 +426,7 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                     sync = bool(
                         self._boundaries
                     )  # stalled -> fall back to a forced drain
-            self._stop_windowing(sync=sync)
+            self._stop_observation_window(sync=sync)
         # Write every window whose output path was set. Writing happens here (and in
         # set_export) on the foreground -- never the poll thread -- so it stays inside
         # the caller's temp-dir lifetime.

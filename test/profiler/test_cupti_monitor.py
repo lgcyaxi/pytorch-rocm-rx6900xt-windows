@@ -15,7 +15,7 @@ import time
 import unittest
 
 import torch
-from torch.profiler._cupti.observers.windowing import WindowFinalizerMixin
+from torch.profiler._cupti.observers.observation_window import WindowFinalizerMixin
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_ROCM, TestCase
 from torch.utils._import_utils import _check_module_exists
 
@@ -823,7 +823,7 @@ class TestWindowFinalizer(TestCase):
             self.finalized: list[tuple[int, int, list[int]]] = []
             # Huge interval so the poll thread never fires mid-test; we drive
             # _poll_once() by hand for determinism.
-            self._init_windowing(poll_interval_ms=3_600_000)
+            self._init_observation_window(poll_interval_ms=3_600_000)
 
         def now_native_ns(self) -> int:
             return self._clock
@@ -854,7 +854,7 @@ class TestWindowFinalizer(TestCase):
         w._poll_once()
         self.assertEqual(w.finalized, [(0, 100, [10, 20])])
         self.assertEqual(w._buf, [150])  # consumed trimmed, tail kept
-        w._stop_windowing()
+        w._stop_observation_window()
 
     def test_boundaries_finalize_in_order_as_covered(self):
         w = self._Fake()
@@ -869,7 +869,7 @@ class TestWindowFinalizer(TestCase):
         w.deliver(250)
         w._poll_once()
         self.assertEqual(w.finalized[-1], (1, 200, [120]))
-        w._stop_windowing()
+        w._stop_observation_window()
 
     def test_drain_all_finalizes_remaining_uncovered(self):
         w = self._Fake()
@@ -880,7 +880,7 @@ class TestWindowFinalizer(TestCase):
         w.deliver(50)  # covers neither by watermark
         w._poll_once()
         self.assertEqual(w.finalized, [])
-        w._stop_windowing()  # drain_all -> finalize both regardless of watermark
+        w._stop_observation_window()  # drain_all -> finalize both regardless of watermark
         self.assertEqual([f[0] for f in w.finalized], [0, 1])
 
     def test_poll_thread_starts_once_and_stops(self):
@@ -892,7 +892,7 @@ class TestWindowFinalizer(TestCase):
         w._clock = 20
         w.mark_boundary()
         self.assertIs(w._poll_thread, t)  # not restarted
-        w._stop_windowing()
+        w._stop_observation_window()
         self.assertIsNone(w._poll_thread)
 
 

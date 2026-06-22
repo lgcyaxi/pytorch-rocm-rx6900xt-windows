@@ -62,32 +62,43 @@ class _PollThread(threading.Thread):
 
 class WindowFinalizerMixin:
     """Boundary queue + background poller + cover-and-finalize loop. See the module
-    docstring. Subclasses call :meth:`_init_windowing` in ``__init__`` and implement
+    docstring. Subclasses call :meth:`_init_observation_window` in ``__init__`` and implement
     ``_collect_delivered`` / ``_window_watermark_ns`` / ``_finalize_window``."""
 
-    def _init_windowing(
-        self, *, poll_interval_ms: int = 50, thread_name: str = "cupti-window-poller"
+    def _init_observation_window(
+        self,
+        *,
+        poll_interval_ms: int = 50,
+        thread_name: str = "cupti-window-poller",
+        auto_start_poller: bool = True,
     ) -> None:
+        # auto_start_poller=False: never spin up the background poll thread; the consumer
+        # finalizes synchronously via _stop_observation_window (e.g. a synchronous export, where
+        # the merge runs on the calling thread). mark_boundary still queues boundaries;
+        # they are drained by the explicit _stop_observation_window.
+        self._auto_start_poller = auto_start_poller
         self._win_lock = threading.Lock()
         # (window_id, boundary_ns) per ended window, oldest first; the poller pops one
         # once its boundary is covered by delivered records.
         self._boundaries: deque[tuple[int, int]] = deque()
         self._next_window_id = 0
-        self._poll_interval_s = max(1, int(poll_interval_ms)) / 1000.0
+        self._poll_interval_s = max(1, poll_interval_ms) / 1000.0
         self._poll_thread: _PollThread | None = None
         self._poll_thread_name = thread_name
 
     def mark_boundary(self) -> int:
         """Stamp the current native record clock as a window boundary and queue it for
         finalization once delivered records cover it. Returns the window id. Lazily
-        starts the background poller on the first call. Does NOT flush -- the caller
-        decides whether to nudge a (non-forced) flush so the poller sees the records."""
+        starts the background poller on the first call (unless auto_start_poller is
+        False, where finalization is the consumer's synchronous _stop_observation_window). Does
+        NOT flush -- the caller decides whether to nudge a (non-forced) flush so the
+        poller sees the records."""
         boundary = self._boundary_clock_ns()
         with self._win_lock:
             window_id = self._next_window_id
             self._next_window_id += 1
             self._boundaries.append((window_id, boundary))
-            if self._poll_thread is None:
+            if self._poll_thread is None and self._auto_start_poller:
                 self._poll_thread = _PollThread(
                     self._poll_once, self._poll_interval_s, self._poll_thread_name
                 )
@@ -111,7 +122,7 @@ class WindowFinalizerMixin:
         for window_id, boundary in ready:
             self._finalize_window(window_id, boundary)
 
-    def _stop_windowing(self, *, sync: bool = True) -> None:
+    def _stop_observation_window(self, *, sync: bool = True) -> None:
         """Stop the poller and finalize whatever remains. Idempotent. ``sync`` (the
         default) sync-flushes CUPTI in the final drain -- correct when this runs on
         the same thread as any other monitor flusher (e.g. teardown on the training
