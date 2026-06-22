@@ -1413,7 +1413,7 @@ class TestProfiler(TestCase):
                 pass
             leaked = sorted(m for m in sys.modules if m.startswith("torch.profiler._cupti"))
             assert not leaked, f"cupti chain imported without an active session: {leaked}"
-            assert torch.autograd.profiler._active_profiler_observer is None
+            assert torch.autograd.profiler._active_cupti_profiler_observer is None
             print("OK")
             """
         )
