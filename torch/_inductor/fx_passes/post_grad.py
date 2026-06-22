@@ -89,6 +89,127 @@ pass_patterns = [
 ]
 
 
+def _decompose_shard_dim_alltoall(gm: fx.GraphModule) -> None:
+    from torch.distributed.distributed_c10d import (
+        _get_group_size_by_name,
+        _resolve_process_group,
+        get_group_rank,
+        GroupName,
+    )
+
+    graph = gm.graph
+    target = torch.ops._dtensor.shard_dim_alltoall.default
+    decomposed = 0
+
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not target:
+            continue
+        if len(node.args) != 4:
+            continue
+
+        inp, gather_dim, shard_dim, group_name = node.args
+        if not isinstance(inp, fx.Node):
+            continue
+        if not isinstance(gather_dim, int) or not isinstance(shard_dim, int):
+            continue
+
+        inp_val = inp.meta.get("val")
+        if not isinstance(inp_val, torch.Tensor):
+            continue
+        if inp_val.dtype.is_complex:
+            continue
+
+        ndim = inp_val.dim()
+        gather_dim = gather_dim + ndim if gather_dim < 0 else gather_dim
+        shard_dim = shard_dim + ndim if shard_dim < 0 else shard_dim
+        if not (0 <= gather_dim < ndim and 0 <= shard_dim < ndim):
+            continue
+        if gather_dim == shard_dim:
+            continue
+
+        try:
+            group = (
+                _resolve_process_group(GroupName(group_name))
+                if isinstance(group_name, str)
+                else group_name
+            )
+            group_size = _get_group_size_by_name(group)
+            group_rank = get_group_rank(group, torch.distributed.get_rank())
+        except (RuntimeError, ValueError):
+            continue
+
+        input_shape: list[Any] = list(inp_val.shape)
+        shard_dim_size = input_shape[shard_dim]
+        full_chunk_size = (shard_dim_size + group_size - 1) // group_size
+        chunk_sizes = [
+            torch.sym_max(
+                0,
+                torch.sym_min(shard_dim_size, full_chunk_size * (rank + 1))
+                - torch.sym_min(shard_dim_size, full_chunk_size * rank),
+            )
+            for rank in range(group_size)
+        ]
+        local_shard_dim_size = chunk_sizes[group_rank]
+
+        recv_view_shape = [group_size, local_shard_dim_size] + [
+            size for dim, size in enumerate(input_shape) if dim != shard_dim
+        ]
+
+        post_view_shape: list[Any] = list(input_shape)
+        post_view_shape[shard_dim] = local_shard_dim_size
+        post_view_shape[gather_dim] = post_view_shape[gather_dim] * group_size
+
+        with graph.inserting_before(node):
+            pre_movedim = graph.call_function(
+                torch.ops.aten.movedim.int,
+                args=(inp, shard_dim, 0),
+            )
+            pre_contig = graph.call_function(
+                torch.ops.aten.contiguous.default,
+                args=(pre_movedim,),
+            )
+            all2all = graph.call_function(
+                torch.ops._c10d_functional.all_to_all_single.default,
+                args=(
+                    pre_contig,
+                    [local_shard_dim_size] * group_size,
+                    chunk_sizes,
+                    group_name,
+                ),
+            )
+            wait = graph.call_function(
+                torch.ops._c10d_functional.wait_tensor.default,
+                args=(all2all,),
+            )
+            recv_view = graph.call_function(
+                torch.ops.aten.view.default,
+                args=(wait, recv_view_shape),
+            )
+            chunk_movedim = graph.call_function(
+                torch.ops.aten.movedim.int,
+                args=(recv_view, 1, shard_dim + 1),
+            )
+            post_movedim = graph.call_function(
+                torch.ops.aten.movedim.int,
+                args=(chunk_movedim, 0, gather_dim),
+            )
+            post_contig = graph.call_function(
+                torch.ops.aten.contiguous.default,
+                args=(post_movedim,),
+            )
+            post_view = graph.call_function(
+                torch.ops.aten.view.default,
+                args=(post_contig, post_view_shape),
+            )
+
+        node.replace_all_uses_with(post_view)
+        graph.erase_node(node)
+        decomposed += 1
+
+    if decomposed:
+        counters["inductor"]["decompose_shard_dim_alltoall"] += decomposed
+
+
 def _remove_profiler_ops(graph: torch.fx.Graph) -> None:
     """
     Remove profiler ops (record_function) from the graph.
@@ -320,6 +441,12 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         from torch._inductor.fx_passes.decomp_comms import decomp_comms
 
         GraphTransformObserver(gm, "decomp_comms").apply_gm_pass(decomp_comms)
+
+    if config.decompose_shard_dim_alltoall_fx:
+        GraphTransformObserver(gm, "decompose_shard_dim_alltoall").apply_gm_pass(
+            _decompose_shard_dim_alltoall
+        )
+        fake_tensor_updater.incremental_update()
 
     collectives_bucketing: bool = False
 
