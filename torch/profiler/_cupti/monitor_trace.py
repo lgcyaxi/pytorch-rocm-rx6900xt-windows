@@ -10,9 +10,8 @@ from typing import Any, cast, TYPE_CHECKING
 import numpy as np
 
 
-# orjson serializes/parses ~3-8x faster than stdlib json on large traces and emits
-# bytes directly; it isn't a torch dependency (absent in CI), so use it when present
-# and fall back to json otherwise.
+# orjson serializes ~3-8x faster than stdlib json on large traces and emits bytes; not a
+# torch dep (absent in CI), so use it when present and fall back to json.
 try:
     import orjson as _orjson  # pyrefly: ignore[missing-import]
 except ImportError:
@@ -28,9 +27,8 @@ from cupti.cupti import (  # pyrefly: ignore[missing-import]
 )
 
 
-# Matches the value Kineto uses to round the trace base time down to a ~3-month
-# ("trimester") boundary in seconds; we reuse it to derive the default
-# baseTimeNanoseconds so monitor timestamps land in the same range as Kineto's.
+# The value Kineto uses to round the trace base time down to a ~3-month boundary (seconds);
+# reused to derive the default baseTimeNanoseconds so timestamps match Kineto's range.
 _TRIMONTH_SECONDS = 7889238
 
 
@@ -296,9 +294,8 @@ def _trace_window_entries(
     def _runtime_thread_id(
         process_id: int, correlation_id: int, normalized_thread_id: int
     ) -> int:
-        # normalized_thread_id is the raw CUPTI threadId already reduced to a signed
-        # 32-bit value (done vectorized at the call site -- ctypes.c_int32 per record is
-        # otherwise the hot cost on API-heavy windows).
+        # normalized_thread_id: the raw CUPTI threadId reduced to signed 32-bit, vectorized
+        # at the call site (ctypes.c_int32 per record is otherwise the hot cost).
         linked = cpu_thread_by_correlation_id.get(correlation_id)
         if linked is not None and linked[0] == process_id:
             return linked[1]
@@ -888,10 +885,8 @@ def merge_trace_window_into_chrome_trace(
     data["traceEvents"] = events
     data["traceName"] = trace_name or output_path
 
-    # Encode once and write the whole buffer: json.dump streaming through gzip's text
-    # wrapper re-encodes per chunk and is ~3-5x slower on large (tens-of-MB) traces.
-    # compresslevel=1 favors export throughput over file size (the export runs off the
-    # training thread, but this still cuts wait_for_exports / step-export latency).
+    # Encode once and write the whole buffer (json.dump streaming through gzip's text wrapper
+    # is ~3-5x slower on large traces). compresslevel=1 favors throughput over file size.
     if _orjson is not None:
         payload = _orjson.dumps(data)
     else:
