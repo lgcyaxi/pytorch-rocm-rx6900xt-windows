@@ -276,19 +276,16 @@ class _KinetoProfile:
         self._use_cupti_monitor = self._custom_profiler_config.get(
             "backend"
         ) == "cupti_monitor" or bool(self._custom_profiler_config.get("cupti_monitor"))
-        # The ProfilerObserver driving the shared CUPTI monitor for this session
-        # (created in prepare_trace; window opened at start_trace, closed at
-        # stop_trace, exported asynchronously). _monitor_window_id is the id of the
-        # window closed at stop_trace, used by export_chrome_trace.
+        # The ProfilerObserver driving the shared CUPTI monitor this session (created in
+        # prepare_trace; window opened at start, closed at stop). _monitor_window_id is the
+        # window closed at stop, used by export_chrome_trace.
         self._cupti_profiler_observer: Any = None
         self._monitor_window_id: int | None = None
-        # The cupti_monitor backend exports the chrome trace synchronously by default:
-        # export_chrome_trace finalizes + writes before returning (like the stock
-        # profiler), so the file is on disk on return and wait_for_exports is a no-op.
-        # Set {"cupti_monitor_async_export": true} to hand off instead -- the merge+write
-        # then runs off the training thread and wait_for_exports joins it. It is a
-        # cupti_monitor-only option; rejected elsewhere so a misplaced flag isn't a
-        # silent no-op.
+        # cupti_monitor exports synchronously by default (export_chrome_trace finalizes +
+        # writes before returning, like the stock profiler; wait_for_exports is a no-op).
+        # {"cupti_monitor_async_export": true} hands the merge+write off-thread, joined by
+        # wait_for_exports. cupti_monitor-only; rejected elsewhere so a misplaced flag isn't
+        # a silent no-op.
         self._cupti_async_export = False
         if self._use_cupti_monitor:
             if ProfilerActivity.CPU not in self.activities:
@@ -348,16 +345,14 @@ class _KinetoProfile:
             )
 
             self._monitor_trace_window = None
-            # Constructing the observer registers it with the shared CUPTI
-            # monitor and starts collection; mark it active so record_function
-            # user annotations route to it. cuda_sync events (SYNCHRONIZATION +
-            # CUDA_EVENT) are opt-in via the config, matching kineto's flag.
+            # Constructing the observer registers it with the shared monitor and starts
+            # collection; mark it active so record_function annotations route to it.
+            # cuda_sync events are opt-in via the config, matching kineto's flag.
             self._cupti_profiler_observer = ProfilerObserver(
                 enable_cuda_sync=bool(
                     self._custom_profiler_config.get("enable_cuda_sync_events")
                 ),
-                # Synchronous export finalizes on the calling thread (export_chrome_trace
-                # -> join), so skip the background poll thread entirely.
+                # Synchronous export finalizes on the calling thread, so skip the poll thread.
                 defer_export=self._cupti_async_export,
             )
             set_active_profiler_observer(self._cupti_profiler_observer)
@@ -424,11 +419,9 @@ class _KinetoProfile:
                 set_active_profiler_observer,
             )
 
-            # Close the trace window: stamp the end boundary (native clock, NO device
-            # sync) and queue it for deferred export. The observer's background poller
-            # writes the merged trace once the window's records are naturally delivered
-            # (see export_chrome_trace / wait_for_exports). The observer is kept alive
-            # past stop so it can finish that async write.
+            # Close the trace window (stamp the end boundary, native clock, no device sync)
+            # and queue it for deferred export. The observer is kept alive past stop so it
+            # can finish the async write (see export_chrome_trace / wait_for_exports).
             set_active_profiler_observer(None)
             if self._cupti_profiler_observer is not None:
                 self._monitor_window_id = self._cupti_profiler_observer.close_window()
@@ -448,12 +441,9 @@ class _KinetoProfile:
                 raise AssertionError(
                     "CUPTI monitor trace window must be closed before exporting"
                 )
-            # Fully deferred: capture the Kineto CPU trace now (cheap, no device sync)
-            # to a kept temp file, hand it + the output path to the observer, and
-            # return. The observer's background poller merges the CUPTI window into it
-            # and writes `path` once the window's GPU records are naturally delivered.
-            # The file therefore appears asynchronously -- call wait_for_exports() to
-            # block until it (and any other pending window) is written.
+            # Capture the Kineto CPU trace now (cheap, no device sync) to a temp file and
+            # hand it + the output path to the observer. Async: the poller merges + writes
+            # `path` once the GPU records are delivered; wait_for_exports() blocks for it.
             fp = tempfile.NamedTemporaryFile(  # noqa: SIM115
                 "w+t", suffix=".json", delete=False
             )
@@ -463,8 +453,7 @@ class _KinetoProfile:
                 self._monitor_window_id, fp.name, path
             )
             if not self._cupti_async_export:
-                # Synchronous: finalize (force-flush the tail + merge) and write now, so
-                # `path` exists on return and wait_for_exports() is a no-op.
+                # Synchronous: finalize + write now, so `path` exists on return.
                 self._cupti_profiler_observer.join()
                 self._cupti_profiler_observer = None
                 self._monitor_window_id = None
@@ -482,24 +471,20 @@ class _KinetoProfile:
             self.profiler.export_chrome_trace(path, self._trace_metadata)
 
     def wait_for_exports(self) -> None:
-        """Block until every deferred cupti_monitor chrome-trace export has been
-        written, then unregister the observer. No-op unless the cupti_monitor backend
-        is active. Call this on the training thread when you need the file(s) on disk
-        before proceeding (the backend writes them asynchronously after
-        export_chrome_trace returns); the finalize force-flushes CUPTI, which is safe
-        here because it serializes with any other monitor flushing on this thread."""
+        """Block until every deferred cupti_monitor export is written, then unregister the
+        observer. No-op unless the cupti_monitor backend is active. Call on the training
+        thread when you need the file(s) on disk; the finalize force-flushes CUPTI, safe here
+        since it serializes with other monitor flushing on this thread."""
         if self._use_cupti_monitor and self._cupti_profiler_observer is not None:
             self._cupti_profiler_observer.join()
             self._cupti_profiler_observer = None
             self._monitor_window_id = None
 
     def take_pending_cupti_export(self) -> Any:
-        """Detach this cycle's cupti_monitor ProfilerObserver (with its registered,
-        unwritten window) and hand it to the caller, so the deferred export can be
-        finalized + uploaded OFF the training thread. Returns the observer (call
-        ``obs.join(force=False)`` on a worker thread to finalize without a flush) or
-        None for non-cupti backends. After this, the profiler no longer owns the
-        observer (the next cycle creates a fresh one)."""
+        """Detach this cycle's cupti_monitor ProfilerObserver (with its unwritten window) so
+        the deferred export can be finalized + uploaded OFF the training thread. Returns the
+        observer (call ``obs.join(force=False)`` on a worker to finalize without a flush), or
+        None for non-cupti backends; the profiler no longer owns it afterward."""
         if not self._use_cupti_monitor:
             return None
         obs = self._cupti_profiler_observer
