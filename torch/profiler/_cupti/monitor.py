@@ -380,10 +380,7 @@ class CuptiMonitor:
             cast(int, self._subscriber), fn_addr, int(_FENCE_KIND), _FENCE_END_FIELD
         )
         # Drop noisy runtime/driver records in the native decoder by cbid -- CUPTI's own
-        # per-cbid activity filter is NOT_COMPATIBLE under user-defined records, so the
-        # noise (cudaGetDevice / cuDevicePrimaryCtxGetState / ...) would otherwise be
-        # decoded and only dropped at trace-build time. Runtime uses a drop blocklist,
-        # driver a keep allowlist (both identical to the trace builder's filtering).
+        # per-cbid activity filter is NOT_COMPATIBLE under user-defined records
         from .monitor_trace import driver_kept_cbids, runtime_dropped_cbids
 
         _cupti_monitor_native.set_cbid_filter(
