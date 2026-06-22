@@ -40,7 +40,6 @@ class _PollThread(threading.Thread):
         super().__init__(name=name, daemon=True)
         self._fn = fn
         self._interval_s = interval_s
-        # NB: not `_stop` -- that shadows threading.Thread's internal `_stop()`.
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -48,8 +47,6 @@ class _PollThread(threading.Thread):
             try:
                 self._fn()
             except Exception:
-                # A finalize failure must not kill the poller -- log and keep going so
-                # later windows still publish.
                 logger.exception("CUPTI window poll cycle failed")
 
     def stop(self) -> None:
@@ -69,8 +66,7 @@ class WindowFinalizerMixin:
         auto_start_poller: bool = True,
     ) -> None:
         # auto_start_poller=False: never spin up the poll thread; the consumer finalizes
-        # synchronously via _stop_observation_window (e.g. a synchronous export). Boundaries
-        # are still queued by mark_boundary, drained by the explicit stop.
+        # synchronously via _stop_observation_window (e.g. a synchronous export).
         self._auto_start_poller = auto_start_poller
         self._win_lock = threading.Lock()
         # (window_id, boundary_ns) per ended window, oldest first; the poller pops one
@@ -125,8 +121,6 @@ class WindowFinalizerMixin:
             thread.join(timeout=5.0)
             self._poll_thread = None
         self._poll_once(drain_all=True, sync=sync)
-
-    # --- subclass hooks ----------------------------------------------------
 
     def _boundary_clock_ns(self) -> int:
         """Clock a boundary is stamped in -- must match :meth:`_window_watermark_ns`.

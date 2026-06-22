@@ -113,8 +113,7 @@ class CuptiMonitorObserver:
         self._ann_lock = threading.Lock()
         self._ext_names: dict[int, str] = {}
         # Degrade gracefully (available == False) if the monitor can't be reached or
-        # registration fails (CUPTI subscribe rejected, libcupti lacks v2): the profiler
-        # must not crash because the optional monitor couldn't start.
+        # registration fails (CUPTI subscribe rejected, libcupti lacks v2)
         try:
             from torch.profiler._cupti.monitor import instance
 
@@ -156,8 +155,6 @@ class CuptiMonitorObserver:
         aug[int(ActivityKind.RUNTIME)] = {CORRELATION_FIELD[int(ActivityKind.RUNTIME)]}
         return aug
 
-    # --- user annotations (external-correlation) ---------------------------
-
     def push_annotation(self, name: str) -> int | None:
         """Push a global external-correlation id (mapped here to ``name``) so activity
         until the pop is attributed via ``correlation_id -> external_id -> name``. Eager
@@ -193,8 +190,6 @@ class CuptiMonitorObserver:
             if reset:
                 self._ext_names = {}
         return snapshot
-
-    # --- clock passthroughs -------------------------------------------------
 
     def now_ns(self) -> int:
         """Current time on the same unix-epoch clock as record timestamps --
