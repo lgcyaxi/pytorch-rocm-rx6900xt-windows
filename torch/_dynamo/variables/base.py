@@ -842,6 +842,10 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             from .object_protocol import generic_len
 
             return generic_len(tx, self)
+        elif name == "__str__" and not (args or kwargs):
+            from .object_protocol import generic_str
+
+            return generic_str(tx, self)
         elif name == "__repr__" and not args and not kwargs:
             return self.repr_impl(tx)
         elif name == "__iter__" and not args and not kwargs:
@@ -953,6 +957,14 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             return self.nb_divmod_impl(tx, args[0])
         elif name == "__rdivmod__":
             return self.nb_divmod_impl(tx, args[0], reverse=True)
+        elif name == "__pow__":
+            z = args[1] if len(args) == 2 else None
+            return self.nb_power_impl(tx, args[0], z, reverse=False)
+        elif name == "__rpow__":
+            z = args[1] if len(args) == 2 else None
+            return self.nb_power_impl(tx, args[0], z, reverse=True)
+        elif name == "__ipow__":
+            return self.nb_inplace_power_impl(tx, args[0], None)
         elif name == "__hash__" and not args and not kwargs:
             from .object_protocol import generic_hash
 
@@ -1229,31 +1241,6 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             hints=[*graph_break_hints.SUPPORTABLE],
         )
 
-    def tp_iteritem_impl(
-        self, tx: InstructionTranslatorBase, index: VariableTracker
-    ) -> tuple[VariableTracker, VariableTracker]:
-        """
-        Implements the 3.15 _tp_iteritem slot used by the virtual-iterator
-        FOR_ITER/SEND fast paths.
-
-        Mirrors CPython's slot signature: takes (self, index) and returns
-        (next_value, next_index).  Exhaustion is signaled by raising
-        StopIteration via raise_observed_exception, matching how the rest
-        of Dynamo signals iterator end.
-
-        ref: https://github.com/python/cpython/blob/f31a89bb901067dd105b00cfa90523cf7ffdbbdd/Include/object.h#L312-L313
-        """
-        unimplemented(
-            gb_type="Missing tp_iteritem",
-            context=f"_tp_iteritem on {self.python_type_name()}",
-            explanation=(
-                f"Dynamo does not support virtual iteration on "
-                f"{self.python_type_name()}."
-                " Add tp_iteritem_impl to this VariableTracker subclass."
-            ),
-            hints=[*graph_break_hints.SUPPORTABLE],
-        )
-
     def next_variable(self, tx: Any) -> VariableTracker:
         return self.tp_iternext_impl(tx)
 
@@ -1318,23 +1305,6 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         except NotImplementedError:
             return NO_SUCH_SUBOBJ
 
-    def is_python_equal(self, other: object) -> bool:
-        """
-        NB - Deliberately not overriding the __eq__ method because that can
-        disable the __hash__ for the vt itself.
-        """
-        unimplemented(
-            gb_type="Dynamo cannot determine the equality comparison of an object",
-            context=f"is_python_equal {self}",
-            explanation=f"Dynamo does not know the equality comparison of the underlying python object for {self}",
-            hints=[
-                (
-                    f"Consider using a different type of object as the dictionary key instead of {self.python_type()}."
-                ),
-                *graph_break_hints.SUPPORTABLE,
-            ],
-        )
-
     def nb_index_impl(
         self,
         tx: Any,
@@ -1370,6 +1340,22 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             context=f"{type(self).__name__} has tp_repr slot but no repr_impl override",
             explanation=f"The type {self.python_type_name()} has a tp_repr C slot but "
             "the corresponding VariableTracker doesn't implement repr_impl.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
+
+    def str_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        """Dynamo hook for VariableTrackers with dedicated str behavior.
+        Subclasses override this for the per-type str result; generic_str()
+        handles dispatch and repr fallback.
+        """
+        unimplemented(
+            gb_type="str_impl not implemented",
+            context=f"{type(self).__name__} has no str_impl override for {self.python_type_name()}",
+            explanation=f"Dynamo does not implement __str__ for {self.python_type_name()} "
+            f"in {type(self).__name__}.",
             hints=[*graph_break_hints.SUPPORTABLE],
         )
 
@@ -1581,6 +1567,35 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         """
         return variables.ConstantVariable(NotImplemented)
 
+    def nb_power_impl(
+        self,
+        tx: InstructionTranslatorBase,
+        other: VariableTracker,
+        z: VariableTracker | None,
+        reverse: bool = False,
+    ) -> VariableTracker:
+        return variables.ConstantVariable(NotImplemented)
+
+    def nb_power_z_impl(
+        self,
+        tx: InstructionTranslatorBase,
+        v: VariableTracker,
+        w: VariableTracker,
+    ) -> VariableTracker:
+        """tp_as_number->nb_power slot when self is the modulus (z) operand.
+
+        ``v`` is the base, ``w`` is the exponent, ``self`` is the modulus.
+        """
+        return variables.ConstantVariable(NotImplemented)
+
+    def nb_inplace_power_impl(
+        self,
+        tx: InstructionTranslatorBase,
+        other: VariableTracker,
+        z: VariableTracker | None,
+    ) -> VariableTracker:
+        return variables.ConstantVariable(NotImplemented)
+
     def nb_multiply_impl(
         self,
         tx: InstructionTranslatorBase,
@@ -1749,6 +1764,23 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             context=f"{type(self).__name__} has nb_absolute slot but no nb_absolute_impl override",
             explanation=f"The type {self.python_type_name()} has an nb_absolute C slot but "
             "the corresponding VariableTracker doesn't implement nb_absolute_impl.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
+
+    def nb_invert_impl(
+        self,
+        tx: Any,
+    ) -> VariableTracker:
+        """Mirrors CPython's tp_as_number->nb_invert slot.
+
+        Called when type_implements_nb_invert returns True for this type.
+        Subclasses override to provide the actual bitwise inversion.
+        """
+        unimplemented(
+            gb_type="nb_invert_impl not implemented",
+            context=f"{type(self).__name__} has nb_invert slot but no nb_invert_impl override",
+            explanation=f"The type {self.python_type_name()} has an nb_invert C slot but "
+            "the corresponding VariableTracker doesn't implement nb_invert_impl.",
             hints=[*graph_break_hints.SUPPORTABLE],
         )
 

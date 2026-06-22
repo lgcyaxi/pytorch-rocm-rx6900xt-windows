@@ -3,6 +3,8 @@
 import math as pymath
 import warnings
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 from .triton_compat import (
@@ -18,6 +20,20 @@ from .triton_compat import (
 
 _T = TypeVar("_T")
 _LOG_2_E: tl.constexpr = tl.constexpr(pymath.log2(pymath.e))
+_skip_gpu_driver_setup: ContextVar[bool] = ContextVar(
+    "_skip_gpu_driver_setup", default=False
+)
+
+
+@contextmanager
+def skip_gpu_driver_setup():
+    # Scoped no-op for set_driver_to_gpu(). ContextVar keeps nested/thread-local
+    # uses isolated.
+    token = _skip_gpu_driver_setup.set(True)
+    try:
+        yield
+    finally:
+        _skip_gpu_driver_setup.reset(token)
 
 
 def set_driver_to_cpu():
@@ -52,6 +68,9 @@ def _is_backend_active(name, backend):
 
 
 def set_driver_to_gpu():
+    if _skip_gpu_driver_setup.get():
+        return
+
     driver = triton.runtime.driver
     for name, backend in triton.backends.backends.items():
         if _is_backend_active(name, backend) and name != "cpu":
@@ -884,7 +903,8 @@ def constexpr_next_power_of_2(
     """
     A version triton.next_power_of_two that can be used within a kernel on constants.
     """
-    assert isinstance(n, tl.constexpr)
+    if not isinstance(n, tl.constexpr):
+        raise AssertionError(f"Expected tl.constexpr, got {type(n)}")
     return tl.constexpr(triton.next_power_of_2(n.value))
 
 

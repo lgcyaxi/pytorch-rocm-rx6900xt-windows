@@ -41,10 +41,8 @@
 #include <ATen/ops/all.h>
 #include <ATen/ops/arange.h>
 #include <ATen/ops/cat.h>
-#include <ATen/ops/cholesky.h>
 #include <ATen/ops/cholesky_inverse.h>
 #include <ATen/ops/cholesky_inverse_native.h>
-#include <ATen/ops/cholesky_native.h>
 #include <ATen/ops/cholesky_solve.h>
 #include <ATen/ops/cholesky_solve_native.h>
 #include <ATen/ops/clone.h>
@@ -782,6 +780,18 @@ TORCH_META_FUNC(lu_unpack)(const Tensor& LU, const Tensor& pivots, bool unpack_d
   const auto m = sizes.cend()[-2];
   const auto n = sizes.cend()[-1];
   const auto k = std::min(m, n);
+
+  if (unpack_pivots) {
+    // pivots is produced by lu_factor and must have shape (*LU.shape[:-2], min(m, n)).
+    // Without this check, a mismatched pivots tensor leads to out-of-bounds reads in
+    // the unpack_pivots kernel.
+    auto expected_pivots_sizes = LU.sizes().vec();
+    expected_pivots_sizes.pop_back();
+    expected_pivots_sizes.back() = k;
+    TORCH_CHECK_VALUE(pivots.sizes() == IntArrayRef(expected_pivots_sizes),
+        "Expected LU_pivots to have shape ", IntArrayRef(expected_pivots_sizes),
+        " but got ", pivots.sizes(), " instead.");
+  }
 
   // P.shape[-2:] == (m, m) (or size zero if pivot == False)
   sizes.end()[-1] = m;
@@ -1760,62 +1770,6 @@ Tensor& cholesky_solve_out(const Tensor& self, const Tensor& A, bool upper, Tens
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ cholesky ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 DEFINE_DISPATCH(cholesky_stub);
-
-Tensor cholesky(const Tensor &self, bool upper) {
-   TORCH_WARN_ONCE(
-    "torch.cholesky is deprecated in favor of torch.linalg.cholesky and will be ",
-    "removed in a future PyTorch release.\n",
-    "L = torch.cholesky(A)\n",
-    "should be replaced with\n",
-    "L = torch.linalg.cholesky(A)\n",
-    "and\n"
-    "U = torch.cholesky(A, upper=True)\n",
-    "should be replaced with\n",
-    "U = torch.linalg.cholesky(A).mH\n"
-    "This transform will produce equivalent results for all valid (symmetric positive definite) inputs."
-  );
-  if (self.numel() == 0) {
-    return at::empty_like(self, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
-  }
-  squareCheckInputs(self, "cholesky");
-
-  auto raw_cholesky_output = cloneBatchedColumnMajor(self);
-  auto info_shape = IntArrayRef(
-      self.sizes().cbegin(), self.sizes().cend() - 2); // self.shape[:-2]
-  auto info = at::empty({info_shape}, self.options().dtype(kInt));
-
-  // fill the raw_cholesky_output with the result
-  cholesky_stub(self.device().type(), raw_cholesky_output, info, upper);
-
-  at::_linalg_check_errors(info, "cholesky", self.dim() == 2);
-
-  if (upper) {
-    return raw_cholesky_output.triu_();
-  } else {
-    return raw_cholesky_output.tril_();
-  }
-}
-
-Tensor& cholesky_out(const Tensor &self, bool upper, Tensor &result) {
-   TORCH_WARN_ONCE(
-    "torch.cholesky is deprecated in favor of torch.linalg.cholesky and will be ",
-    "removed in a future PyTorch release.\n",
-    "L = torch.cholesky(A)\n",
-    "should be replaced with\n",
-    "L = torch.linalg.cholesky(A)\n",
-    "and\n"
-    "U = torch.cholesky(A, upper=True)\n",
-    "should be replaced with\n",
-    "U = torch.linalg.cholesky(A).mH\n"
-    "This transform will produce equivalent results for all valid (symmetric positive definite) inputs."
-  );
-  checkSameDevice("cholesky", result, self);
-  checkLinalgCompatibleDtype("cholesky", result, self);
-  Tensor result_tmp = at::cholesky(self, upper);
-  at::native::resize_output(result, result_tmp.sizes());
-  result.copy_(result_tmp);
-  return result;
-}
 
 TORCH_IMPL_FUNC(linalg_cholesky_ex_out)(const Tensor& A,
                                         bool upper,
@@ -3519,16 +3473,17 @@ static std::string get_default_lstsq_driver(std::optional<std::string_view> driv
     static std::unordered_set<std::string_view> allowed_drivers = {
       "gels", "gelsy", "gelsd", "gelss"
     };
-    if (input.device() == at::kCPU) {
+    // CUDA supports only the 'gels' driver; CPU and MPS support all four.
+    if (input.is_cuda()) {
+      TORCH_CHECK(
+        driver_str == "gels",
+        "torch.linalg.lstsq: `driver` other than `gels` is not supported on CUDA"
+      );
+    } else { // CPU and MPS
       TORCH_CHECK(
         allowed_drivers.find(driver_str) != allowed_drivers.end(),
         "torch.linalg.lstsq: parameter `driver` should be one of "
         "(gels, gelsy, gelsd, gelss)"
-      );
-    } else { // else if (input.is_cuda())
-      TORCH_CHECK(
-        driver_str == "gels",
-        "torch.linalg.lstsq: `driver` other than `gels` is not supported on CUDA"
       );
     }
   } else {
