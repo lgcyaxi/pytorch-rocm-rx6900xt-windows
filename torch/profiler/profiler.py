@@ -351,7 +351,7 @@ class _KinetoProfile:
             # Publish the observer so record_function routes annotations to it. The reference
             # lives in torch.autograd (not the cupti package), so record_function never
             # imports the cupti chain on a non-cupti run.
-            prof.set_active_profiler_observer(self._cupti_profiler_observer)
+            prof._set_active_cupti_profiler_observer(self._cupti_profiler_observer)
         self.profiler._prepare_trace()
 
     def start_trace(self) -> None:
@@ -414,7 +414,7 @@ class _KinetoProfile:
             # Unpublish the observer (record_function stops routing here) and close the trace
             # window (end boundary, native clock, no device sync), queuing it for deferred
             # export; the observer is kept alive past stop for the async write.
-            prof.set_active_profiler_observer(None)
+            prof._set_active_cupti_profiler_observer(None)
             if self._cupti_profiler_observer is not None:
                 self._monitor_window_id = self._cupti_profiler_observer.close_window()
         self.profiler.__exit__(None, None, None)
