@@ -1,14 +1,11 @@
 # mypy: allow-untyped-defs
 """Base class for CUPTI activity-monitor observers.
 
-An observer registers the activity kinds it wants with the shared CUPTI monitor
-(``torch.profiler._cupti.monitor.instance()``) and, on the monitor's worker
-thread, gets handed the columns the monitor demuxed from each completed buffer
-(``{ActivityKind: {field_id: column}}``) sliced to its selection. What it does
-with them is up to the subclass's ``_on_activities`` hook. This base handles
-registration, availability, teardown, the clock passthroughs, and the
-user-annotation push/pop every observer can use to attribute activity to named
-regions.
+An observer registers the activity kinds it wants with the shared CUPTI monitor and, on
+the monitor's worker thread, is handed the demuxed columns (``{ActivityKind: {field_id:
+column}}``) sliced to its selection -- what it does with them is the subclass's
+``_on_activities`` hook. This base handles registration, availability, teardown, the
+clock passthroughs, and the user-annotation push/pop for naming regions.
 """
 
 from __future__ import annotations
@@ -72,23 +69,17 @@ class ObserverAnnotationSettings:
 class CuptiMonitorObserver:
     """Base for observers backed by the shared CUPTI monitor.
 
-    Subclasses set up their state, then call ``super().__init__(activities)`` with
-    the activity kinds they want -- a set of kinds (meaning "all fields"), or a
-    field map ``{kind: iterable of field ids | "all"}``. Registration happens last
-    so the state is ready before the worker thread can deliver buffers. The monitor
-    demuxes every completed buffer to columns, so subclasses implement a single
-    hook, ``_on_activities(columns)`` -- where ``columns`` is ``{ActivityKind:
-    {field_id: column}}`` already sliced to this observer's selection -- and
-    typically a ``drain()`` for callers.
+    Subclasses set up state, then call ``super().__init__(activities)`` with the kinds they
+    want (a set, or a field map ``{kind: field ids | "all"}``) -- registration last, so
+    state is ready before the worker thread delivers buffers. They implement
+    ``_on_activities(columns)`` (``{ActivityKind: {field_id: column}}`` sliced to their
+    selection) and typically a ``drain()``.
 
-    Any observer can also bracket regions with ``push_annotation``/``pop_annotation``
-    (or ``annotate``): each push registers a global external-correlation id mapped
-    here to a name, so activity recorded until the matching pop can be attributed to
-    the region via ``correlation_id -> external_id -> name`` (eager only -- external
-    ids do not survive CUDA-graph capture/replay; under graphs, attribute by
-    ``graph_node_id`` instead). The push is the monitor's (global) concern; the
-    id->name mapping is the observer's.
-    """
+    Observers can also bracket regions with ``push_annotation``/``pop_annotation`` (or
+    ``annotate``): each push registers a global external-correlation id mapped here to a
+    name, attributing activity until the pop via ``correlation_id -> external_id -> name``
+    (eager only -- external ids don't survive graph capture; under graphs use
+    ``graph_node_id``)."""
 
     def __init__(
         self,
@@ -96,10 +87,9 @@ class CuptiMonitorObserver:
         *,
         annotations: ObserverAnnotationSettings | None = None,
     ) -> None:
-        # Region naming (see ObserverAnnotationSettings): a graph-node resolver (vectorized,
-        # custom or default) and/or the eager external-correlation join. Eager folds
-        # extra record kinds into the selection here -> per-record walk; graph naming
-        # is just a resolver, so it stays on the vectorized path.
+        # Region naming (see ObserverAnnotationSettings): a graph-node resolver and/or the
+        # eager external-correlation join. Eager folds extra record kinds in -> per-record
+        # walk; graph naming is just a resolver, staying on the vectorized path.
         if annotations is None:
             self._resolver: AnnotationResolver | None = None
             self._eager = False
@@ -113,21 +103,18 @@ class CuptiMonitorObserver:
             )
         if self._eager:
             activities = self._with_eager_fields(activities)
-        # frozenset of the requested kinds (a field map collapses to its keys) for
-        # the observer's own "is this kind mine?" checks; the full request (incl.
-        # any field selection) is handed to the monitor (the process-wide singleton).
+        # frozenset of requested kinds (a field map collapses to keys) for the observer's
+        # own "is this kind mine?" checks; the full request goes to the monitor singleton.
         self._activities: frozenset[int] = frozenset(activities)
         self._monitor: Any = None
         self._obs = None
-        # external_id -> user-annotation name, for the monitor's global
-        # external-correlation pushes. Guarded by _ann_lock (push runs on the
-        # caller's thread; a drain may read/reset it from another).
+        # external_id -> annotation name for the monitor's global pushes. Guarded by
+        # _ann_lock (push on the caller's thread; a drain may read/reset from another).
         self._ann_lock = threading.Lock()
         self._ext_names: dict[int, str] = {}
         # Degrade gracefully (available == False) if the monitor can't be reached or
-        # the registration fails -- e.g. the CUPTI subscribe is rejected because
-        # another subscriber (Kineto) holds it, or libcupti lacks the v2 API. The
-        # profiler must not crash because the optional monitor couldn't start.
+        # registration fails (CUPTI subscribe rejected, libcupti lacks v2): the profiler
+        # must not crash because the optional monitor couldn't start.
         try:
             from torch.profiler._cupti.monitor import instance
 
@@ -148,11 +135,9 @@ class CuptiMonitorObserver:
 
     @staticmethod
     def _with_eager_fields(activities: Any) -> dict[int, set[int]]:
-        """Augment a field map so the eager external-correlation join works: add each
-        kind's CORRELATION_ID, plus the EXTERNAL_CORRELATION record and RUNTIME (CUPTI
-        only emits the former when the correlated API kind is enabled; the RUNTIME
-        records themselves go unused -- it's just the carrier for the join). Expects a
-        ``{kind: fields}`` map (the eager path always selects fields)."""
+        """Augment a field map for the eager join: add each kind's CORRELATION_ID plus the
+        EXTERNAL_CORRELATION and RUNTIME records (CUPTI only emits the former when RUNTIME
+        is enabled; RUNTIME is just the carrier). Expects a ``{kind: fields}`` map."""
         from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
         from torch.profiler._cupti.records import CORRELATION_FIELD, ExternalCorrelation
@@ -174,11 +159,9 @@ class CuptiMonitorObserver:
     # --- user annotations (external-correlation) ---------------------------
 
     def push_annotation(self, name: str) -> int | None:
-        """Push a global external-correlation id (mapped here to ``name``) so
-        activity recorded until the matching pop is attributed to the region via
-        ``correlation_id -> external_id -> name``. Eager only -- external ids do not
-        survive CUDA-graph capture/replay. No-op returning None when the monitor is
-        unavailable."""
+        """Push a global external-correlation id (mapped here to ``name``) so activity
+        until the pop is attributed via ``correlation_id -> external_id -> name``. Eager
+        only. No-op returning None when the monitor is unavailable."""
         if not self.available or self._monitor is None:
             return None
         ext_id = self._monitor.push_external_correlation_id()
