@@ -16,7 +16,7 @@ from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 import torch
 
 from . import cupti_python
-from .records import Api, FIELD_REGISTRY, STRING_FIELDS, Sync
+from .records import Api, FIELD_REGISTRY, Kernel, STRING_FIELDS, Sync
 
 
 # A registration request: either a plain iterable of activity kinds (meaning "all
@@ -328,7 +328,7 @@ class CuptiMonitor:
             raise RuntimeError(
                 "CuptiMonitor requires libcupti >= "
                 f"{cupti_python.LIBCUPTI_MIN_VERSION}; loaded "
-                f"{cupti_python.find_cupti_library()} reports {version}"
+                f"{cupti_python.LIBCUPTI_SONAME} reports {version}"
             )
         native = _cupti_monitor_native
         request_addr = native.buffer_request_callback_address()
@@ -374,7 +374,7 @@ class CuptiMonitor:
         if not fn_addr:
             raise RuntimeError(
                 "libcupti is missing cuptiActivityGetNextRecord_v2 (need >= 13.2); "
-                f"loaded {cupti_python.find_cupti_library()}"
+                f"loaded {cupti_python.LIBCUPTI_SONAME}"
             )
         _cupti_monitor_native.configure_decoder(
             cast(int, self._subscriber), fn_addr, int(_FENCE_KIND), _FENCE_END_FIELD
@@ -694,11 +694,13 @@ class CuptiMonitor:
         if target != self._enabled:
             self._reconfigure(target)
             self._enabled = target
-        # queued/submitted need the per-subscriber latency-timestamp attribute. Enable
-        # it once, iff an observer selected the QUEUED kernel field (25) -- so the
-        # always-on timing path pays no latency-tracking overhead.
+        # queued needs the per-subscriber latency-timestamp attribute (which also gates
+        # submitted, not surfaced here). Enable it once, iff an observer selected the
+        # QUEUED kernel field -- so the always-on timing path pays no latency overhead.
         if self._subscriber is not None and not self._latency_enabled:
-            if 25 in target.get(int(ActivityKind.CONCURRENT_KERNEL), frozenset()):
+            if Kernel.QUEUED.id in target.get(
+                int(ActivityKind.CONCURRENT_KERNEL), frozenset()
+            ):
                 self._cupti.enable_kernel_latency_timestamps(self._subscriber, True)
                 self._latency_enabled = True
 
@@ -911,7 +913,7 @@ class CuptiMonitor:
             "session_start_calibrated_unix_ns": self._session_start_calibrated_unix_ns,
             "buffer_size": self.buffer_size,
             "flush_period_ns": int(self.flush_period_s * 1e9),
-            "libcupti_path": cupti_python.find_cupti_library(),
+            "libcupti": cupti_python.LIBCUPTI_SONAME,
         }
 
     def _flush_loop(self) -> None:

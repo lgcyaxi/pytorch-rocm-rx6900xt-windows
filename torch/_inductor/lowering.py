@@ -294,8 +294,8 @@ def decode_dtype(dtype: int | torch.dtype) -> torch.dtype:
     return dtype
 
 
-def is_integer_type(x: Any) -> TypeGuard[TensorBox | sympy.Expr | int]:
-    if isinstance(x, TensorBox):
+def is_integer_type(x: Any) -> TypeGuard[TensorBox | IRNode | sympy.Expr | int]:
+    if isinstance(x, (TensorBox, IRNode)):
         return is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     elif isinstance(x, sympy.Expr):
         return x.is_integer is True  # type: ignore[attr-defined]
@@ -303,8 +303,8 @@ def is_integer_type(x: Any) -> TypeGuard[TensorBox | sympy.Expr | int]:
         return isinstance(x, int)
 
 
-def is_boolean_type(x: Any) -> TypeGuard[TensorBox | bool]:
-    if isinstance(x, TensorBox):
+def is_boolean_type(x: Any) -> TypeGuard[TensorBox | IRNode | bool]:
+    if isinstance(x, (TensorBox, IRNode)):
         return is_boolean_dtype(x.get_dtype())
     else:
         return isinstance(x, bool)
@@ -8777,7 +8777,6 @@ def triton_kernel_wrap_(
     grid,
     tma_descriptor_metadata,
     kwargs,
-    launch_kwargs,
 ):
     from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
@@ -8787,7 +8786,6 @@ def triton_kernel_wrap_(
         grid=grid,
         tma_descriptor_metadata=tma_descriptor_metadata,
         kernel_args={**kwargs, **constant_args},
-        launch_kwargs=launch_kwargs,
     )
     return {key: val for key, val in kwargs.items() if isinstance(val, TensorBox)}
 
@@ -8962,8 +8960,8 @@ def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
         quack_config_keys = (
             default_gemm_config_key(
                 layout.device,
-                gemm_args[mat1_index].get_size()[0],
-                gemm_args[mat2_index].get_size()[1],
+                gemm_args[mat1_index].get_size()[-2],
+                gemm_args[mat2_index].get_size()[-1],
             ),
         )
     choices: list[Any] = []
