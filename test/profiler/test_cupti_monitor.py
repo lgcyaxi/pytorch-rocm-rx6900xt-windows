@@ -272,6 +272,7 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(list(outs[kernel][24]), ["my_kernel"])
         np.testing.assert_array_equal(outs[kernel][7], [7])
 
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_normalize_activities(self):
         # A registration request resolves to (kinds, per-kind field selection): a
         # bare kind iterable means "all fields"; a field map selects fields, with
@@ -296,6 +297,7 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(fields[kernel], frozenset({0, int(Kernel.START)}))
         self.assertEqual(fields[memcpy], all_memcpy)
 
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_buffer_size_from_env(self):
         # The per-buffer pool size is user-configurable: an explicit buffer_size
         # arg wins, otherwise TORCH_CUPTI_MONITOR_BUFFER_SIZE is honored, else the
@@ -312,6 +314,7 @@ class TestCuptiRecords(TestCase):
             # An explicit arg overrides the env var.
             self.assertEqual(CuptiMonitor(buffer_size=2048).buffer_size, 2048)
 
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_external_correlation_not_started(self):
         # External-correlation push/pop are no-ops until the monitor is started (no
         # subscriber yet), returning None rather than touching CUPTI's global stack.
@@ -340,6 +343,7 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(m.current_external_id(), 0)
         self.assertEqual(m.note_external_pop(), 0)  # empty -> 0
 
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_external_id_chain_and_gc(self):
         # The push-time active-id chain: with one kind CUPTI tags a kernel with only
         # the innermost id, so the monitor snapshots the full active stack per id and
