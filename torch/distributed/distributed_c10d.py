@@ -59,6 +59,31 @@ from .constants import default_pg_nccl_timeout, default_pg_timeout
 from .rendezvous import register_rendezvous_handler, rendezvous  # noqa: F401
 
 
+def _register_process_group_opaque_type() -> None:
+    from torch._library.opaque_object import (
+        is_opaque_type,
+        MemberType,
+        register_opaque_type,
+    )
+
+    if is_opaque_type(ProcessGroup):
+        return
+
+    register_opaque_type(
+        ProcessGroup,
+        typ="reference",
+        members={
+            "size": MemberType.USE_REAL,
+            "rank": MemberType.USE_REAL,
+            "_get_backend_name": MemberType.USE_REAL,
+            "group_name": MemberType.USE_REAL,
+            "group_desc": MemberType.USE_REAL,
+            "__eq__": MemberType.USE_REAL,
+            "__ne__": MemberType.USE_REAL,
+        },
+    )
+
+
 __all__ = [
     "Backend",
     "BackendConfig",
@@ -82,6 +107,7 @@ __all__ = [
     "gather_object",
     "get_backend_config",
     "get_backend",
+    "get_backend_impl",
     "get_default_backend_for_device",
     "get_rank",
     "get_world_size",
@@ -136,6 +162,7 @@ __all__ = [
     "reduce_scatter_single",
     "reduce_scatter_tensor",
     "get_node_local_rank",
+    "set_timeout",
     "split_group",
     "shrink_group",
     "record_comm",
@@ -1496,6 +1523,64 @@ def get_backend(group: ProcessGroup | None = None) -> Backend:
     return Backend(not_none(pg_store)[0])
 
 
+def get_backend_impl(
+    group: str | ProcessGroup | None = None,
+    device: torch.device | None = None,
+) -> torch._C._distributed_c10d.Backend:
+    r"""get_backend_impl(group=None, device=None) -> torch._C._distributed_c10d.Backend
+
+    Return the underlying backend implementation of the given process group.
+
+    This allows custom backends to expose backend-specific methods for
+    experimentation purposes.
+
+    .. warning::
+        This API bypasses ``torch.compile`` tracing and other hooks. Backend
+        methods are experimental and subject to breakage without warning.
+
+    Args:
+        group (str or ProcessGroup, optional): The process group or process
+            group name to work on. The default is the general main process
+            group. If another specific group is specified, the calling process
+            must be part of :attr:`group`.
+        device (:class:`torch.device`, optional): The device used to select a
+            backend implementation. If ``None``, this returns the bound device
+            backend or the single backend shared by the registered devices.
+            Default: ``None``.
+
+    Returns:
+        torch._C._distributed_c10d.Backend: The backend implementation for
+        the given process group and device.
+    """
+    if isinstance(group, str):
+        pg = _resolve_process_group(GroupName(group))
+    else:
+        pg = group or _get_default_group()
+
+    if _rank_not_in_group(pg):
+        raise ValueError("Invalid process group specified")
+
+    if device is not None:
+        return pg.get_backend(device)
+
+    bound_device_id = pg.bound_device_id
+    if bound_device_id is not None:
+        return pg.get_backend(bound_device_id)
+
+    devices = pg._device_types
+    if not devices:
+        return pg.get_backend(torch.device("cpu"))
+
+    backend_impl = pg.get_backend(devices[0])
+    for backend_device in devices[1:]:
+        if pg.get_backend(backend_device) is not backend_impl:
+            raise ValueError(
+                "Process group has multiple backend implementations; pass "
+                "the device argument to select one."
+            )
+    return backend_impl
+
+
 def get_default_backend_for_device(device: str | torch.device) -> str:
     """
     Return the default backend for the given device.
@@ -1615,25 +1700,43 @@ def _add_ephemeral_timeout_for_all_pgs(timeout: timedelta) -> None:
                 backend._add_ephemeral_timeout(timeout)
 
 
-def _set_pg_timeout(timeout: timedelta, group: ProcessGroup | None = None) -> None:
+def set_timeout(timeout: timedelta, group: ProcessGroup | None = None) -> None:
     """
-    Set the timeout for the given process group when users want to use a different timeout instead of
-    default values.
+    Set the default timeout for all future operations on a process group.
+
+    This overrides the timeout configured when the group was created (via
+    :func:`init_process_group` or :func:`new_group`). The new timeout is
+    forwarded to every backend registered with :attr:`group` -- for example both
+    the Gloo and NCCL backends of a group spanning CPU and CUDA devices. Backends
+    that do not support changing their timeout (such as MPI and UCC) emit a
+    warning and leave their timeout unchanged.
 
     Args:
-        timeout (timedelta): Timeout for operations executed against the process group which
-            users want to set. Default value is 10 minutes for NCCL and 30 minutes for other backends.
-            This is the duration after which collectives will be aborted asynchronously and the process will crash.
-            This is done since CUDA execution is async and it is no longer safe to continue executing user code since
-            failed async NCCL operations might result in subsequent CUDA operations running on corrupted data.
-            When TORCH_NCCL_BLOCKING_WAIT is set, the process will block and wait for this timeout.
+        timeout (timedelta): Timeout to set for operations executed against the
+            process group. The default configured at initialization time is 10
+            minutes for NCCL and 30 minutes for other backends. For NCCL this is
+            the duration after which collectives are aborted asynchronously and
+            the process crashes; this is necessary because CUDA execution is
+            async, so it is not safe to keep running user code once an async NCCL
+            operation has failed (subsequent CUDA operations might run on
+            corrupted data). When ``TORCH_NCCL_BLOCKING_WAIT`` is set, the process
+            blocks and waits for this timeout instead.
+        group (ProcessGroup, optional): The process group to work on. The default
+            is the general main process group. If another specific group is
+            specified, the calling process must be part of :attr:`group`.
 
-        group (ProcessGroup, optional): The process group to work on. The
-            default is the general main process group. If another specific group
-            is specified, the calling process must be part of :attr:`group`.
+    Raises:
+        ValueError: If the calling process is not part of :attr:`group`.
 
     Returns:
         None
+
+    Example::
+        >>> # xdoctest: +SKIP("need process group init")
+        >>> import torch.distributed as dist
+        >>> from datetime import timedelta
+        >>> # Shorten the timeout of the default process group to 30 seconds.
+        >>> dist.set_timeout(timedelta(seconds=30))
     """
     if group is None:
         group = _get_default_group()
@@ -1641,26 +1744,17 @@ def _set_pg_timeout(timeout: timedelta, group: ProcessGroup | None = None) -> No
         raise ValueError("Invalid process group specified")
     if not isinstance(group, ProcessGroup):
         raise AssertionError(f"Expected ProcessGroup, got {type(group)}")
-    devices = group._device_types
-    backends = set()
-    if torch.device("cpu") in devices and is_gloo_available():
-        backend = group._get_backend(torch.device("cpu"))
-        if isinstance(backend, ProcessGroupGloo):
-            backends.add(backend)
-    if torch.device("cuda") in devices:
-        backend = group._get_backend(torch.device("cuda"))
-        if is_nccl_available() and isinstance(backend, ProcessGroupNCCL):
-            backends.add(backend)  # type: ignore[arg-type]
-        elif is_gloo_available() and isinstance(backend, ProcessGroupGloo):
-            backends.add(backend)  # type: ignore[arg-type]
-        elif _use_torchcomms_enabled() and isinstance(backend, _BackendWrapper):
-            backends.add(backend)  # type: ignore[arg-type]
-    if len(backends) == 0:
-        warnings.warn(
-            "Set timeout is now only supported for either nccl or gloo.", stacklevel=2
-        )
-    for backend in backends:
-        backend._set_default_timeout(timeout)
+    group.set_timeout(timeout)
+
+
+@deprecated(
+    "`torch.distributed.distributed_c10d._set_pg_timeout` is deprecated, "
+    "please use `torch.distributed.set_timeout` instead",
+    category=FutureWarning,
+)
+def _set_pg_timeout(timeout: timedelta, group: ProcessGroup | None = None) -> None:
+    """Use set_timeout as this method is deprecated."""
+    set_timeout(timeout, group)
 
 
 @_exception_logger
@@ -2158,7 +2252,7 @@ def _new_process_group_helper(
             if not backend_class:
                 return GroupMember.NON_GROUP_MEMBER, None
             # create new process group with accurate rank and size
-            if pg.rank() == -1 and pg.size() == -1:
+            if group_rank == -1 and group_size == -1:
                 pg = ProcessGroup(
                     backend_prefix_store,
                     backend_class.rank(),

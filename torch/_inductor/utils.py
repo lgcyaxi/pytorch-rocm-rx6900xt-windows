@@ -1081,7 +1081,7 @@ def get_kernel_metadata(
                     continue
                 if hasattr(n.read_writes, "reads") and n.read_writes.reads is not None:
                     for r in n.read_writes.reads:
-                        # Remove the dupricated inputs
+                        # Remove the duplicated inputs
                         if r.name in all_reads:
                             continue
                         all_reads.add(r.name)
@@ -3232,11 +3232,10 @@ def get_max_numwarps() -> int:
         max_threads_per_block = props.max_threads_per_block
         if max_threads_per_block is None:
             raise AssertionError("expected max_threads_per_block to be set")
-    else:
-        # Defaults
-        warp_size = 32
-        max_threads_per_block = 1024
-    return max_threads_per_block // warp_size
+        return max_threads_per_block // warp_size
+
+    log.debug("CUDA is not available; defaulting max num warps to 32")
+    return 32
 
 
 def is_welford_reduction(reduction_type: str) -> bool:
@@ -4078,7 +4077,7 @@ def triton_type_to_torch(dtype: str) -> torch.dtype:
 
 def is_same_tensor(data: torch.Tensor, value: torch.Tensor) -> bool:
     return (
-        not data.is_mkldnn
+        not data.is_mkldnn  # type: ignore[bad-return]
         and data.size() == value.size()
         and data.stride() == value.stride()
         and data.dtype == value.dtype
