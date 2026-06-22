@@ -8523,6 +8523,34 @@ def meta_scaled_grouped_mm(
     )
 
 
+@register_meta([aten._scaled_grouped_mm_v2.default])
+def meta_scaled_grouped_mm_v2(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scale_a: list[torch.Tensor],
+    scale_recipe_a: list[int],
+    swizzle_a: list[int],
+    scale_b: list[torch.Tensor],
+    scale_recipe_b: list[int],
+    swizzle_b: list[int],
+    offs: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    contraction_dim: list[int] | None = None,
+    use_fast_accum: bool = False,
+):
+    """Shape inference only; recipe-independent validation lives in the C++
+    TORCH_META_FUNC (validate_scaled_grouped_mm_v2_inputs) and per-recipe
+    checks in the kernel. This Python meta exists because the structured C++
+    meta sizes its output via IntArrayRef, which specializes symbolic dims
+    under fake-tensor tracing (breaking mark_dynamic and unbacked symints).
+    Same pattern as meta_mm / meta_scaled_mm_v2. _create_grouped_mm_output_tensor
+    is sym-safe and produces the same CUDA padded / ROCm contiguous layout.
+    """
+    _out_dtype = out_dtype or torch.bfloat16
+    return _create_grouped_mm_output_tensor(mat_a, mat_b, offs, _out_dtype)
+
+
 @register_meta(aten._foreach_norm.Scalar)
 def meta_foreach_norm(tensors, ord=2, dtype=None):
     if float(ord) == float("inf"):
