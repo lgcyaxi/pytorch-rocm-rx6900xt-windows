@@ -31,7 +31,6 @@ from torch.testing._internal.common_utils import (
     TEST_FAIRSEQ,
     run_tests,
     parametrize,
-    subtest,
     freeze_rng_state,
     TEST_WITH_CROSSREF,
     slowTest,
@@ -4005,6 +4004,7 @@ class TestSDPAGpuOnly(NNTestCase):
                                                                  dropout_p: float, dtype: torch.dtype,
                                                                  scale: str):
         device_mod = getattr(torch, torch.device(device).type)
+
         def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, seed, offset, device=device):
             mask = torch.empty((batch_size, n_heads, q_len, kv_len), device=device, dtype=torch.float32)
             rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p, seed, offset)
