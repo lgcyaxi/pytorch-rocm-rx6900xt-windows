@@ -1,28 +1,24 @@
 # mypy: allow-untyped-defs
 """Shared window-finalization machinery for CUPTI monitor observers.
 
-An observer that publishes per *window* -- a span of activity ended by a boundary
-(a training step for the SubgraphTimer, a profiling window for the
-ProfilerObserver) -- stamps each boundary in CUPTI's native record clock and
-finalizes that window only once the records it covers have been *naturally*
-delivered. No device sync touches the measured timeline: CUPTI delivers buffers
-in fill order, so once a delivered record starts at/after a boundary, every
-record before that boundary is already in hand ("covered").
+An observer that publishes per *window* (a span ended by a boundary -- a training step, a
+profiling window) stamps each boundary in CUPTI's native record clock and finalizes the
+window only once its records are *naturally* delivered. No device sync touches the measured
+timeline: CUPTI delivers buffers in fill order, so once a delivered record starts at/after
+a boundary, every earlier record is in hand ("covered").
 
-This mixin owns the boundary queue, the background poll thread, the
-cover-detection loop, and teardown. The subclass supplies what differs between
-consumers (their buffer shape and bucketing):
+This mixin owns the boundary queue, the poll thread, the cover-detection loop, and
+teardown. The subclass supplies what differs between consumers:
 
-  * ``_collect_delivered(sync)`` -- pull the records the monitor has delivered
-    into the subclass's own buffer. ``sync`` is True only at teardown, where a
-    synchronous flush is harmless (collection is over, nothing left to perturb).
-  * ``_window_watermark_ns()`` -- the max delivered record start (native clock);
-    a boundary at/below this is covered.
-  * ``_finalize_window(window_id, boundary_ns)`` -- select that window's records,
-    emit/publish them, and drop them from the buffer.
+  * ``_collect_delivered(sync)`` -- pull delivered records into its buffer (``sync`` only
+    at teardown, where a synchronous flush is harmless).
+  * ``_window_watermark_ns()`` -- max delivered record start (native clock); a boundary
+    at/below this is covered.
+  * ``_finalize_window(window_id, boundary_ns)`` -- select, publish, and drop that
+    window's records.
 
-The clock source is ``now_native_ns()`` from :class:`CuptiMonitorObserver`, so
-boundaries are in the same unconverted timebase as the records' START/END.
+Boundaries use ``now_native_ns()`` from :class:`CuptiMonitorObserver`, the same timebase
+as records' START/END.
 """
 
 from __future__ import annotations
@@ -72,10 +68,9 @@ class WindowFinalizerMixin:
         thread_name: str = "cupti-window-poller",
         auto_start_poller: bool = True,
     ) -> None:
-        # auto_start_poller=False: never spin up the background poll thread; the consumer
-        # finalizes synchronously via _stop_observation_window (e.g. a synchronous export, where
-        # the merge runs on the calling thread). mark_boundary still queues boundaries;
-        # they are drained by the explicit _stop_observation_window.
+        # auto_start_poller=False: never spin up the poll thread; the consumer finalizes
+        # synchronously via _stop_observation_window (e.g. a synchronous export). Boundaries
+        # are still queued by mark_boundary, drained by the explicit stop.
         self._auto_start_poller = auto_start_poller
         self._win_lock = threading.Lock()
         # (window_id, boundary_ns) per ended window, oldest first; the poller pops one
@@ -87,12 +82,10 @@ class WindowFinalizerMixin:
         self._poll_thread_name = thread_name
 
     def mark_boundary(self) -> int:
-        """Stamp the current native record clock as a window boundary and queue it for
-        finalization once delivered records cover it. Returns the window id. Lazily
-        starts the background poller on the first call (unless auto_start_poller is
-        False, where finalization is the consumer's synchronous _stop_observation_window). Does
-        NOT flush -- the caller decides whether to nudge a (non-forced) flush so the
-        poller sees the records."""
+        """Stamp the native record clock as a window boundary and queue it for finalization
+        once delivered records cover it. Returns the window id. Lazily starts the poller on
+        the first call (unless auto_start_poller is False). Does NOT flush -- the caller
+        decides whether to nudge a flush so the poller sees the records."""
         boundary = self._boundary_clock_ns()
         with self._win_lock:
             window_id = self._next_window_id
@@ -106,11 +99,10 @@ class WindowFinalizerMixin:
         return window_id
 
     def _poll_once(self, drain_all: bool = False, *, sync: bool = False) -> None:
-        """One poll cycle: collect delivered records, then finalize every queued
-        boundary the delivered records now cover. ``drain_all`` (teardown) finalizes
-        every remaining boundary regardless of watermark. ``sync`` sync-flushes CUPTI
-        in the collect (only safe on the same thread as any other monitor flusher);
-        leave it False to rely on naturally-delivered records."""
+        """One poll cycle: collect delivered records, then finalize every queued boundary
+        they now cover. ``drain_all`` (teardown) finalizes every remaining boundary
+        regardless of watermark. ``sync`` sync-flushes CUPTI in the collect (only safe on
+        the monitor-flusher thread); leave False to rely on naturally-delivered records."""
         self._collect_delivered(sync=sync)
         watermark = self._window_watermark_ns()
         ready: list[tuple[int, int]] = []
@@ -123,11 +115,10 @@ class WindowFinalizerMixin:
             self._finalize_window(window_id, boundary)
 
     def _stop_observation_window(self, *, sync: bool = True) -> None:
-        """Stop the poller and finalize whatever remains. Idempotent. ``sync`` (the
-        default) sync-flushes CUPTI in the final drain -- correct when this runs on
-        the same thread as any other monitor flusher (e.g. teardown on the training
-        thread). Pass ``sync=False`` to finalize only what's already been naturally
-        delivered, when running off-thread where a flush would race the monitor."""
+        """Stop the poller and finalize whatever remains. Idempotent. ``sync`` (default)
+        sync-flushes CUPTI in the final drain -- correct on the monitor-flusher thread (e.g.
+        teardown on the training thread). ``sync=False`` finalizes only naturally-delivered
+        records, for off-thread use where a flush would race the monitor."""
         thread = self._poll_thread
         if thread is not None:
             thread.stop()
@@ -138,17 +129,15 @@ class WindowFinalizerMixin:
     # --- subclass hooks ----------------------------------------------------
 
     def _boundary_clock_ns(self) -> int:
-        """Clock a boundary is stamped in -- must match the clock
-        :meth:`_window_watermark_ns` reports. Default: CUPTI's native record clock
-        (matches raw record START/END). Override to a converted clock if the subclass
-        stores records converted -- then convert the boundary the same way, so the
-        comparison stays order-equivalent (convert_time is monotonic)."""
+        """Clock a boundary is stamped in -- must match :meth:`_window_watermark_ns`.
+        Default: CUPTI's native record clock (matches raw START/END). Override to a
+        converted clock if the subclass stores records converted (convert the boundary the
+        same way; convert_time is monotonic, so the comparison stays order-equivalent)."""
         return self.now_native_ns()
 
     if TYPE_CHECKING:
-        # now_native_ns is provided by the co-class CuptiMonitorObserver in the
-        # concrete observer's MRO; declared here only so the type checker sees it
-        # (a real def would shadow the co-class method at runtime).
+        # Provided by the co-class CuptiMonitorObserver in the MRO; declared here only for
+        # the type checker (a real def would shadow it at runtime).
         def now_native_ns(self) -> int: ...
 
     def _collect_delivered(self, *, sync: bool) -> None:
