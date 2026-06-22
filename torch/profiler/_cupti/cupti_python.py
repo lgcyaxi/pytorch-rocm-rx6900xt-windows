@@ -12,7 +12,6 @@ module without it raises ``ModuleNotFoundError`` (catchable by optional consumer
 from __future__ import annotations
 
 import ctypes
-import os
 from collections.abc import Iterable  # noqa: TC003
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -39,8 +38,12 @@ if TYPE_CHECKING:
     from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
 
-# Environment override for the libcupti to dlopen; see find_cupti_library().
-LIBCUPTI_PATH_ENV = "TORCH_CUPTI_MONITOR_LIBCUPTI_PATH"
+# libcupti soname for the supported CUDA major (the monitor's floor is 13.3). Loaded
+# by name so dlopen returns the copy already mapped into the process: torch front-loads
+# the nvidia-cuda-cupti wheel (torch._preload_cuda_deps) and cupti-python / kineto load
+# it otherwise, so every consumer shares one CUPTI -- a second instance would collide
+# with the stock profiler's subscriber (CUPTI_ERROR_MULTIPLE_SUBSCRIBERS).
+LIBCUPTI_SONAME = "libcupti.so.13"
 
 # CUPTI C-API result/flag constants (cupti_result.h / cupti_activity.h). These
 # are stable ABI values, so they are spelled out rather than resolved.
@@ -80,30 +83,6 @@ OVERHEAD_KIND_NAMES: dict[int, str] = {
     7 << 16: "Activity Buffer Request",
     8 << 16: "UVM Activity Init",
 }
-
-
-def find_cupti_library() -> str:
-    """Resolve the libcupti shared object to dlopen for the CUPTI v2 API.
-
-    Honors the LIBCUPTI_PATH_ENV override, otherwise resolves via cuda
-    pathfinder -- the same mechanism cupti-python and torch use, so we share the
-    single libcupti already loaded in the process. Diverging here (e.g.
-    preferring a newer site-packages wheel for the v2 API) would create a second
-    CUPTI instance that collides with the stock profiler's subscriber
-    (CUPTI_ERROR_MULTIPLE_SUBSCRIBERS). Reaching a different libcupti has to be
-    done at load time (e.g. LD_PRELOAD) so every consumer agrees on one.
-    """
-    override = os.environ.get(LIBCUPTI_PATH_ENV)
-    if override:
-        return override
-    from cuda.pathfinder import (  # pyrefly: ignore[missing-import]
-        load_nvidia_dynamic_lib,
-    )
-
-    path = load_nvidia_dynamic_lib("cupti").abs_path
-    if path is None:
-        raise RuntimeError("cuda pathfinder could not resolve a libcupti path")
-    return path
 
 
 def disabled_runtime_cbids() -> tuple[int, ...]:
@@ -514,6 +493,6 @@ def pylibcupti() -> _PyLibCupti:
     """The process-wide CUPTI Activity API wrapper: libcupti loaded and ctypes
     prototypes bound once. All libcupti calls go through this object -- callers
     never touch the CDLL or ctypes directly."""
-    lib = ctypes.CDLL(find_cupti_library())
+    lib = ctypes.CDLL(LIBCUPTI_SONAME)
     _configure_ctypes(lib)
     return _PyLibCupti(lib)
