@@ -680,9 +680,7 @@ _cupti_monitor.enable_hes_early()
                     thread.join()
 
             prof.export_chrome_trace(trace_path)
-            # cupti_monitor writes the trace deferred + gzipped at <path>.gz; wait for the
-            # async write, then read it (.gz when present, else the plain path).
-            prof.wait_for_exports()
+            # cupti_monitor writes the trace gzipped at <path>.gz (synchronously by default).
             gz = trace_path + ".gz"
             if os.path.exists(gz):
                 with gzip.open(gz, "rt") as f:
@@ -749,7 +747,6 @@ _cupti_monitor.enable_hes_early()
                     mlp(x)
                 torch.cuda.synchronize()
             prof.export_chrome_trace(trace_path)
-            prof.wait_for_exports()
             gz = trace_path + ".gz"
             if os.path.exists(gz):
                 with gzip.open(gz, "rt") as f:
@@ -793,8 +790,7 @@ _cupti_monitor.enable_hes_early()
                     _ = c.cpu()
                     torch.cuda.synchronize()
             prof.export_chrome_trace(trace_path)
-            # cupti_monitor writes the trace deferred + gzipped at <path>.gz.
-            prof.wait_for_exports()
+            # cupti_monitor writes the trace gzipped at <path>.gz (synchronously by default).
             gz = trace_path + ".gz"
             if os.path.exists(gz):
                 with gzip.open(gz, "rt") as f:
@@ -914,8 +910,7 @@ _cupti_monitor.enable_hes_early()
                     (a @ a).relu()
                     torch.cuda.synchronize()
                 prof.export_chrome_trace(trace_path)
-                # cupti_monitor writes the trace deferred + gzipped at <path>.gz.
-                prof.wait_for_exports()
+                # cupti_monitor writes the trace gzipped at <path>.gz (synchronously by default).
                 gz = trace_path + ".gz"
                 if os.path.exists(gz):
                     with gzip.open(gz, "rt") as f:
@@ -967,9 +962,8 @@ _cupti_monitor.enable_hes_early()
                         (a @ b).relu().sum()
                         torch.cuda.synchronize()
                     prof.export_chrome_trace(f.name)
-                    # cupti_monitor writes the trace deferred + gzipped at <name>.gz;
-                    # wait for it, then read the .gz (stock writes <name> directly).
-                    prof.wait_for_exports()
+                    # cupti_monitor writes the trace gzipped at <name>.gz (sync by default);
+                    # stock writes <name> directly.
                     gz = f.name + ".gz"
                     if os.path.exists(gz):
                         events = json.load(gzip.open(gz))["traceEvents"]
@@ -1064,8 +1058,8 @@ _cupti_monitor.enable_hes_early()
                 return g
 
             def summary(model, inp, mode, use_monitor):
-                # The cupti_monitor backend writes the trace gzipped at <path>.gz and
-                # asynchronously, so export then wait_for_exports then read the .gz.
+                # The cupti_monitor backend writes the trace gzipped at <path>.gz
+                # (synchronously by default), so export then read the .gz.
                 g = capture(model, inp) if mode == "graphed" else None
                 cfg = _ExperimentalConfig(
                     custom_profiler_config='{"backend":"cupti_monitor"}' if use_monitor else "")
@@ -1077,7 +1071,6 @@ _cupti_monitor.enable_hes_early()
                             g.replay() if mode == "graphed" else model(inp)
                         torch.cuda.synchronize()
                     prof.export_chrome_trace(f.name)
-                    prof.wait_for_exports()
                     gz = f.name + ".gz"
                     if os.path.exists(gz):
                         ev = json.load(gzip.open(gz))["traceEvents"]; os.remove(gz)
@@ -1250,7 +1243,6 @@ _cupti_monitor.enable_hes_early()
                         workload()
                     torch.cuda.synchronize()
                 prof.export_chrome_trace(f.name)
-                prof.wait_for_exports()
                 gz = f.name + ".gz"
                 path = gz if os.path.exists(gz) else f.name
                 ev = (json.load(gzip.open(gz)) if os.path.exists(gz)
