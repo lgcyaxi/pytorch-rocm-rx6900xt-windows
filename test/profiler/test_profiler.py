@@ -1405,6 +1405,31 @@ class TestProfiler(TestCase):
         self.assertNotEqual(ptr_c, ptr_b)
         self.assertEqual(pyprof._cupti_monitor.allocated_buffers(), 2)
 
+    def test_cupti_monitor_not_imported_without_active_session(self):
+        # The optional CUPTI monitor import chain (observers.profiler -> monitor ->
+        # cupti.cupti) must NOT be pulled in just by using record_function -- only an
+        # active cupti_monitor profile imports it. Otherwise a process whose cupti-python
+        # is too old for the monitor's symbols logs an import warning on every record
+        # region. Checked in a fresh subprocess so other tests' imports don't pollute
+        # sys.modules; needs no cupti-python.
+        script = textwrap.dedent(
+            """
+            import sys
+            import torch
+
+            with torch.autograd.profiler.record_function("r"):
+                pass
+            leaked = sorted(m for m in sys.modules if m.startswith("torch.profiler._cupti"))
+            assert not leaked, f"cupti chain imported without an active session: {leaked}"
+            assert torch.autograd.profiler._active_profiler_observer is None
+            print("OK")
+            """
+        )
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], stderr=subprocess.STDOUT
+        )
+        self.assertIn(b"OK", out)
+
     @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
     def test_cupti_monitor_v2_record_layout_capture(self):
         # The v2 complete callback parses the CUPTI user-defined record layout
