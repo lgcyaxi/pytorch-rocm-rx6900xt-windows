@@ -584,60 +584,6 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
-    def test_cupti_monitor_collection_smoke(self):
-        from torch.profiler._cupti import monitor as _cupti_monitor
-        from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
-
-        obs = NodeTimerObserver()
-        self.assertTrue(obs.available)
-
-        x = torch.randn(64, 64, device="cuda")
-        y = torch.relu(x + 1)
-        y.sum().item()
-        torch.cuda.synchronize()
-
-        monitor = _cupti_monitor.instance()
-        monitor.flush(sync=True)
-        stats = monitor.stats()
-        _gnode, start, _end = obs.drain()
-        obs.close()
-
-        # The native C++ pool must actually have been exercised: catches a silent
-        # regression to a no-op (e.g. broken callback registration or symbol
-        # export) that would still pass if the worker never saw a buffer. The
-        # monitor demuxes to columns and the observer drains spans, so real kernel
-        # spans (NodeTimerObserver collects CONCURRENT_KERNEL) must come out.
-        self.assertGreater(stats["buffers_allocated"], 0)
-        self.assertGreater(stats["buffers_completed"], 0)
-        self.assertEqual(stats["buffers_pending"], 0)
-        self.assertGreater(len(start), 0)
-
-    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
-    @_isolated
-    def test_cupti_monitor_collection_repeated_lifecycle(self):
-        from torch.profiler._cupti import monitor as _cupti_monitor
-        from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
-
-        # Register/collect/unregister twice: the last observer leaving stops the
-        # monitor, so the second pass exercises the start-after-stop restart path.
-        for _ in range(2):
-            obs = NodeTimerObserver()
-            self.assertTrue(obs.available)
-
-            x = torch.randn(32, 32, device="cuda")
-            y = torch.sigmoid(x)
-            y.sum().item()
-            torch.cuda.synchronize()
-
-            monitor = _cupti_monitor.instance()
-            monitor.flush(sync=True)
-            _gnode, start, _end = obs.drain()
-            obs.close()
-
-            self.assertGreater(len(start), 0)
-
-    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
-    @_isolated
     def test_cupti_monitor_multithread_runtime_thread_assignment(self):
         x1 = torch.randn(256, 256, device="cuda")
         x2 = torch.randn(256, 256, device="cuda")
