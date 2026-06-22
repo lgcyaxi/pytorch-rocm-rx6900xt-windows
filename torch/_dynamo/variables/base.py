@@ -1241,31 +1241,6 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             hints=[*graph_break_hints.SUPPORTABLE],
         )
 
-    def tp_iteritem_impl(
-        self, tx: InstructionTranslatorBase, index: VariableTracker
-    ) -> tuple[VariableTracker, VariableTracker]:
-        """
-        Implements the 3.15 _tp_iteritem slot used by the virtual-iterator
-        FOR_ITER/SEND fast paths.
-
-        Mirrors CPython's slot signature: takes (self, index) and returns
-        (next_value, next_index).  Exhaustion is signaled by raising
-        StopIteration via raise_observed_exception, matching how the rest
-        of Dynamo signals iterator end.
-
-        ref: https://github.com/python/cpython/blob/f31a89bb901067dd105b00cfa90523cf7ffdbbdd/Include/object.h#L312-L313
-        """
-        unimplemented(
-            gb_type="Missing tp_iteritem",
-            context=f"_tp_iteritem on {self.python_type_name()}",
-            explanation=(
-                f"Dynamo does not support virtual iteration on "
-                f"{self.python_type_name()}."
-                " Add tp_iteritem_impl to this VariableTracker subclass."
-            ),
-            hints=[*graph_break_hints.SUPPORTABLE],
-        )
-
     def next_variable(self, tx: Any) -> VariableTracker:
         return self.tp_iternext_impl(tx)
 
@@ -1329,23 +1304,6 @@ class VariableTracker(metaclass=VariableTrackerMeta):
             return self.as_python_constant()
         except NotImplementedError:
             return NO_SUCH_SUBOBJ
-
-    def is_python_equal(self, other: object) -> bool:
-        """
-        NB - Deliberately not overriding the __eq__ method because that can
-        disable the __hash__ for the vt itself.
-        """
-        unimplemented(
-            gb_type="Dynamo cannot determine the equality comparison of an object",
-            context=f"is_python_equal {self}",
-            explanation=f"Dynamo does not know the equality comparison of the underlying python object for {self}",
-            hints=[
-                (
-                    f"Consider using a different type of object as the dictionary key instead of {self.python_type()}."
-                ),
-                *graph_break_hints.SUPPORTABLE,
-            ],
-        )
 
     def nb_index_impl(
         self,

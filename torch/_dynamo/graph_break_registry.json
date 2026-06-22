@@ -799,7 +799,7 @@
     {
       "Gb_type": "Failed to mutate tensor data attribute",
       "Context": "setattr({obj}, {name}, {val})",
-      "Explanation": "Dyanmo only supports mutating `.data` of tensor created outside `torch.compile` region",
+      "Explanation": "Dynamo only supports mutating `.data` of tensor created outside `torch.compile` region",
       "Hints": [
         "Don't mutate `.data` on this tensor, or move ",
         "the mutation out of `torch.compile` region"
@@ -841,7 +841,7 @@
     {
       "Gb_type": "Failed to set tensor attribute",
       "Context": "setattr({obj}, {name}, {val})",
-      "Explanation": "Dyanmo doesn't support setting these tensor attributes",
+      "Explanation": "Dynamo doesn't support setting these tensor attributes",
       "Hints": [
         "Don't mutate attribute '{name}' on tensors, or ",
         "move the mutation out of `torch.compile` region"
@@ -3193,7 +3193,7 @@
     {
       "Gb_type": "Failed to mutate tensor data attribute to different dtype",
       "Context": "setattr({obj}, {name}, {val})",
-      "Explanation": "Dyanmo only supports mutating `.data` of tensor to a new one with the same dtype",
+      "Explanation": "Dynamo only supports mutating `.data` of tensor to a new one with the same dtype",
       "Hints": [
         "Don't mutate `.data` on this tensor, or move ",
         "the mutation out of `torch.compile` region"
@@ -3367,6 +3367,16 @@
       ]
     }
   ],
+  "GB7151": [
+    {
+      "Gb_type": "generator function over a skipped function",
+      "Context": "str(self.vt)",
+      "Explanation": "Cannot trace a generator whose underlying function is skipped by Dynamo (e.g. defined in a skip-listed module), since its body cannot be symbolically traced.",
+      "Hints": [
+        "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    }
+  ],
   "GB0233": [
     {
       "Gb_type": "Attempted to use strided NestedTensor",
@@ -3503,6 +3513,16 @@
       "Gb_type": "Attempted to call op with non-contiguous `out=` list of tensors",
       "Context": "self.value={self.value}, args={args}, kwargs={kwargs}",
       "Explanation": "Dynamo does not support this.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB8949": [
+    {
+      "Gb_type": "STORE_GLOBAL in non-module globals",
+      "Context": "name",
+      "Explanation": "Dynamo cannot safely replay global writes for an inlined function whose globals dict is not the registered module __dict__.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
@@ -3721,7 +3741,7 @@
     {
       "Gb_type": "TypedDict with optional keys",
       "Context": "str(self.value)",
-      "Explanation": "Dyanmo does not support tracing TypedDict with optional keys",
+      "Explanation": "Dynamo does not support tracing TypedDict with optional keys",
       "Hints": [
         "Avoid using TypedDict with optional keys",
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
@@ -3995,7 +4015,7 @@
     {
       "Gb_type": "Class attribute mutation when the __dict__ was already materialized",
       "Context": "str(self.value)",
-      "Explanation": "Dyanmo does not support tracing mutations on a class when its __dict__ is materialized",
+      "Explanation": "Dynamo does not support tracing mutations on a class when its __dict__ is materialized",
       "Hints": []
     }
   ],
@@ -4827,6 +4847,16 @@
       "Explanation": "Expected init leaves.",
       "Hints": [
         "This is likely to be a Dynamo bug. Please report an issue to PyTorch."
+      ]
+    }
+  ],
+  "GB4399": [
+    {
+      "Gb_type": "untraceable user-defined __str__",
+      "Context": "Could not trace __str__ override for {type(self.value).__name__}",
+      "Explanation": "Dynamo could not safely trace this user-defined __str__ override.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ],

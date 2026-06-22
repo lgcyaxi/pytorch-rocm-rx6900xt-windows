@@ -1203,6 +1203,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             if "maxlen" in bound_args.arguments:
                 maxlen = bound_args.arguments["maxlen"]
 
+            variables.lists.DequeVariable.validate_maxlen(tx, maxlen)
             return variables.lists.DequeVariable(
                 items, maxlen=maxlen, mutation_type=ValueMutationNew()
             )
@@ -1558,12 +1559,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
             return self.value.__name__
         return super().const_getattr(tx, name)
 
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, variables.UserDefinedClassVariable)
-            and self.value is other.value
-        )
-
     def reconstruct_pycode(self, codegen) -> str:
         if self.source:
             return self.source.reconstruct_pycode(codegen)
@@ -1892,6 +1887,69 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 gb_type="untraceable user-defined __repr__",
                 context=f"Could not trace __repr__ override for {type(self.value).__name__}",
                 explanation="Dynamo could not safely trace this user-defined __repr__ override.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+                skip_frame=True,
+            )
+
+    def str_impl(
+        self,
+        tx: "InstructionTranslatorBase",
+    ) -> VariableTracker:
+        from .object_protocol import generic_repr
+
+        type_attr = self.lookup_class_mro_attr("__str__")
+        if type_attr is NO_SUCH_SUBOBJ:
+            return super().str_impl(tx)
+        if type_attr is None:
+            raise_type_error(tx, "'NoneType' object is not callable")
+
+        method = self._maybe_get_baseclass_method("__str__")
+        if (
+            self._base_vt is not None
+            and self._base_methods is not None
+            and method in self._base_methods
+        ):
+            return self._base_vt.str_impl(tx)
+
+        if type(self.value).__str__ is object.__str__:
+            return generic_repr(tx, self)
+
+        if (
+            is_wrapper_or_member_descriptor(type_attr)
+            or torch._C._dynamo.utils.is_instancemethod(type_attr)  # type: ignore[attr-defined]
+            or is_cython_function(type_attr)
+        ):
+            try:
+                inspect.getattr_static(type(type_attr), "__get__")(
+                    type_attr, self.value, type(self.value)
+                )
+            except (AttributeError, TypeError) as e:
+                raise_observed_exception(type(e), tx, args=list(e.args))
+            else:
+                unimplemented(
+                    gb_type="untraceable user-defined __str__",
+                    context=f"Could not trace __str__ override for {type(self.value).__name__}",
+                    explanation="Dynamo could not safely trace this user-defined __str__ override.",
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                    skip_frame=True,
+                )
+
+        source = self.source and self.get_source_by_walking_mro(tx, "__str__")
+        method_var = self.resolve_type_attr(tx, "__str__", type_attr, source)
+        if not isinstance(method_var, variables.GetAttrVariable):
+            return method_var.call_function(tx, [], {})
+
+        try:
+            inspect.getattr_static(type(type_attr), "__get__")(
+                type_attr, self.value, type(self.value)
+            )
+        except (AttributeError, TypeError) as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+        else:
+            unimplemented(
+                gb_type="untraceable user-defined __str__",
+                context=f"Could not trace __str__ override for {type(self.value).__name__}",
+                explanation="Dynamo could not safely trace this user-defined __str__ override.",
                 hints=[*graph_break_hints.SUPPORTABLE],
                 skip_frame=True,
             )
@@ -3873,18 +3931,6 @@ class UserDefinedObjectVariable(UserDefinedVariable):
 
         return object_richcompare(self, tx, other, op)
 
-    def is_python_equal(self, other: object) -> bool:
-        if (
-            isinstance(other, VariableTracker)
-            and self.is_python_constant()
-            and other.is_python_constant()
-        ):
-            return self.as_python_constant() == other.as_python_constant()
-        # id check
-        if not isinstance(other, UserDefinedVariable):
-            return False
-        return self.value is other.value
-
     def call_tree_map_branch(
         self,
         tx: "InstructionTranslatorBase",
@@ -4144,18 +4190,6 @@ class FrozenDataClassVariable(UserDefinedObjectVariable):
             is_fake = is_fake or fake
             raw_hashes.append(RawHash(h))
         return hash(tuple(raw_hashes)), is_fake
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, FrozenDataClassVariable):
-            return False
-        if self.python_type() is not other.python_type():
-            return False
-        from dataclasses import fields as dc_fields
-
-        return all(
-            self._get_field_vt(f.name).is_python_equal(other._get_field_vt(f.name))
-            for f in dc_fields(self.value)  # type: ignore[arg-type]
-        )
 
 
 class SourcelessGraphModuleVariable(UserDefinedObjectVariable):
@@ -5084,13 +5118,6 @@ class UserDefinedSetVariable(UserDefinedObjectVariable):
             raise AssertionError("_base_vt must not be None in items")
         return self._base_vt.items  # pyrefly: ignore[missing-attribute]
 
-    def is_python_equal(self, other: object) -> bool:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in is_python_equal")
-        if isinstance(other, UserDefinedSetVariable):
-            other = other._base_vt
-        return self.as_python_constant() == other.as_python_constant()  # type: ignore[union-attr]
-
 
 class UserDefinedListVariable(UserDefinedObjectVariable):
     """
@@ -5316,12 +5343,6 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
             )
 
         return self._make_tree_map_result(new_items)
-
-    def is_python_equal(self, other: object) -> bool:
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None in is_python_equal")
-        other = other._base_vt if isinstance(other, UserDefinedTupleVariable) else other
-        return self._base_vt.is_python_equal(other)
 
 
 class NamedTupleVariable(UserDefinedTupleVariable):
