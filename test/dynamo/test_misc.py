@@ -15983,9 +15983,9 @@ with torch.library._scoped_library("mylib_ci", "FRAGMENT") as lib:
                 """\
 def forward(self, L_x_ : torch.Tensor):
     l_x_ = L_x_
-    a = l_x_.sin();  l_x_ = None
-    b = a.cos();  a = None
-    return (b,)""",
+    sin = l_x_.sin();  l_x_ = None
+    cos = sin.cos();  sin = None
+    return (cos,)""",
             )
 
     @torch._dynamo.config.patch(trace_autograd_ops=True)
