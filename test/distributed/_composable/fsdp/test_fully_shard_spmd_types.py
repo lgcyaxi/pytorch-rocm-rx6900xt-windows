@@ -437,8 +437,12 @@ class TestFullyShardSpmdTypes(TestCase):
             fully_shard(model, mesh=self.dense_type_mesh["dp"])
         self.assertExpectedInline(
             str(cm.exception),
-            "spmd_types parameters require a named SPMD mesh "
-            "(pass dp_mesh_dims to fully_shard)",
+            "spmd_types parameters require fully_shard() to be called with both "
+            "a named full DeviceMesh for FSDP storage and "
+            "dp_mesh_dims=DataParallelMeshDims(shard=..., replicate=...), "
+            "where shard names the mesh axis or axes FSDP shards parameters "
+            "across and replicate names the HSDP/DDP mesh axis or axes FSDP "
+            "replicates across.",
         )
 
     def test_fully_annotated_sparse_param_requires_sparse_storage_mesh(self):
@@ -487,9 +491,10 @@ class TestFullyShardSpmdTypes(TestCase):
                 ),
             )
         self.assertIn(
-            "annotations on axes that are not in the resolved typechecking mesh",
+            "parameter is annotated on axes",
             str(cm.exception),
         )
+        self.assertIn("Annotate only axes in the compute mesh", str(cm.exception))
 
     def test_partial_non_storage_annotations_require_current_mesh(self):
         """Partial non-storage annotations need a shared current mesh."""
