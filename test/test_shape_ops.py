@@ -18,7 +18,6 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     largeTensorTest,
     onlyAccelerator,
-    onlyCPU,
 )
 from torch.testing._internal.common_dtype import (
     all_passthru_types,
@@ -72,8 +71,7 @@ def _generate_input(shape, dtype, device, with_extremal):
 
 class TestShapeOps(TestCase):
     # TODO: update to work on CUDA, too
-    @onlyCPU
-    def test_unbind(self, device):
+    def test_unbind(self):
         x = torch.rand(2, 3, 4, 5)
         for dim in range(4):
             res = torch.unbind(x, dim)
@@ -86,8 +84,7 @@ class TestShapeOps(TestCase):
 
     # TODO: update to work on CUDA, too?
     @skipIfTorchDynamo("TorchDynamo fails with an unknown error")
-    @onlyCPU
-    def test_tolist(self, device):
+    def test_tolist(self):
         list0D = []
         tensor0D = torch.tensor(list0D)
         self.assertEqual(tensor0D.tolist(), list0D)
@@ -109,6 +106,32 @@ class TestShapeOps(TestCase):
         self.assertFalse(tensorNonContig.is_contiguous())
         self.assertEqual(tensorNonContig.tolist(), [[3, 4], [7, 8]])
 
+    def test_diagonal_multidim(self):
+        x = torch.randn(10, 11, 12, 13)
+        xn = x.numpy()
+        for args in [(2, 2, 3), (2,), (-2, 1, 2), (0, -2, -1)]:
+            result = torch.diagonal(x, *args)
+            expected = xn.diagonal(*args)
+            self.assertEqual(expected.shape, result.shape)
+            self.assertEqual(expected, result)
+        # test non-contiguous
+        xp = x.permute(1, 2, 3, 0)
+        result = torch.diagonal(xp, 0, -2, -1)
+        expected = xp.numpy().diagonal(0, -2, -1)
+        self.assertEqual(expected.shape, result.shape)
+        self.assertEqual(expected, result)
+
+    @unittest.expectedFailure
+    def test_flip_unsupported_dtype(self):
+        scale, zero_point = 0.1, 5
+        for dtype in (torch.quint4x2, torch.quint2x4):
+            qt = torch.quantize_per_tensor(
+                torch.randn(16, 16), scale=scale, zero_point=zero_point, dtype=dtype
+            )
+            torch.flip(qt, dims=(0,))
+
+
+class TestShapeOpsDevice(TestCase):
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_movedim_invalid(self, device, dtype):
         shape = self._rand_shape(4, min_size=5, max_size=10)
@@ -252,23 +275,6 @@ class TestShapeOps(TestCase):
         result = torch.diagonal(x, 17)
         expected = torch.diag(x, 17)
         self.assertEqual(result, expected)
-
-    @onlyCPU
-    @dtypes(torch.float)
-    def test_diagonal_multidim(self, device, dtype):
-        x = torch.randn(10, 11, 12, 13, dtype=dtype, device=device)
-        xn = x.numpy()
-        for args in [(2, 2, 3), (2,), (-2, 1, 2), (0, -2, -1)]:
-            result = torch.diagonal(x, *args)
-            expected = xn.diagonal(*args)
-            self.assertEqual(expected.shape, result.shape)
-            self.assertEqual(expected, result)
-        # test non-contiguous
-        xp = x.permute(1, 2, 3, 0)
-        result = torch.diagonal(xp, 0, -2, -1)
-        expected = xp.numpy().diagonal(0, -2, -1)
-        self.assertEqual(expected.shape, result.shape)
-        self.assertEqual(expected, result)
 
     @dtypes(*all_types())
     @dtypesIfCUDA(*all_types_and(torch.half))
@@ -591,16 +597,6 @@ class TestShapeOps(TestCase):
         self.compare_with_numpy(torch_fn, np_fn, t_in)
         del t_in
 
-    @onlyCPU
-    @unittest.expectedFailure
-    @dtypes(torch.quint4x2, torch.quint2x4)
-    def test_flip_unsupported_dtype(self, dtype):
-        scale, zero_point = 0.1, 5
-        qt = torch.quantize_per_tensor(
-            torch.randn(16, 16), scale=scale, zero_point=zero_point, dtype=dtype
-        )
-        torch.flip(qt, dims=(0,))
-
     def _test_fliplr_flipud(self, torch_fn, np_fn, min_dim, max_dim, device, dtype):
         for dim in range(min_dim, max_dim + 1):
             shape = self._rand_shape(dim, 5, 10)
@@ -861,7 +857,7 @@ class TestShapeOps(TestCase):
             torch.ops.aten.unfold_backward(grad_in, input_sizes, 0, -1, 1)
 
 
-instantiate_device_type_tests(TestShapeOps, globals())
+instantiate_device_type_tests(TestShapeOpsDevice, globals())
 
 if __name__ == "__main__":
     run_tests()
