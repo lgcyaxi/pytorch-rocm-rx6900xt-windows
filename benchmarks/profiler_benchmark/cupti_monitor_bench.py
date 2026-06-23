@@ -53,7 +53,9 @@ from torch.profiler import profile, ProfilerActivity, schedule
 from torch.profiler._cupti import monitor as cupti_monitor
 
 
-def build_mixed_graph(groups: int, tensor_size: int, sleep_cycles: int):
+def build_mixed_graph(
+    groups: int, tensor_size: int, sleep_cycles: int, layers: int
+):
     x = torch.randn(tensor_size, device="cuda")
     y = torch.randn(tensor_size, device="cuda")
     for _ in range(20):
@@ -64,14 +66,18 @@ def build_mixed_graph(groups: int, tensor_size: int, sleep_cycles: int):
         torch.cuda._sleep(sleep_cycles)
     torch.cuda.synchronize()
 
+    # ``layers`` stacks the whole group-pattern, deepening the captured graph so the
+    # step runs proportionally longer (more records per window) without changing the
+    # per-record work -- lets the distortion be read as a function of step length.
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for _ in range(groups):
-            for _ in range(8):
-                x.add_(y)
-                x.relu_()
-            torch.cuda._sleep(sleep_cycles)
-            torch.cuda._sleep(sleep_cycles)
+        for _ in range(layers):
+            for _ in range(groups):
+                for _ in range(8):
+                    x.add_(y)
+                    x.relu_()
+                torch.cuda._sleep(sleep_cycles)
+                torch.cuda._sleep(sleep_cycles)
     torch.cuda.synchronize()
     return g
 
@@ -81,6 +87,7 @@ def build_multistream_mixed_graph(
     tensor_size: int,
     sleep_cycles_main: int,
     sleep_cycles_side: int,
+    layers: int,
 ):
     x_main = torch.randn(tensor_size, device="cuda")
     y_main = torch.randn(tensor_size, device="cuda")
@@ -106,24 +113,28 @@ def build_multistream_mixed_graph(
         x_main.mul_(1.0001)
     torch.cuda.synchronize()
 
+    # ``layers`` stacks the whole group-pattern, deepening the captured graph so the
+    # step runs proportionally longer (more records per window) without changing the
+    # per-record work -- lets the distortion be read as a function of step length.
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         capture_stream = torch.cuda.current_stream()
-        for _ in range(groups):
-            x_main.add_(y_main)
-            x_main.relu_()
-            with torch.cuda.stream(side_stream):
-                side_stream.wait_stream(capture_stream)
-                for _ in range(4):
-                    x_side.add_(y_side)
-                    x_side.relu_()
-                torch.cuda._sleep(sleep_cycles_side)
-            for _ in range(4):
+        for _ in range(layers):
+            for _ in range(groups):
                 x_main.add_(y_main)
                 x_main.relu_()
-            torch.cuda._sleep(sleep_cycles_main)
-            capture_stream.wait_stream(side_stream)
-            x_main.mul_(1.0001)
+                with torch.cuda.stream(side_stream):
+                    side_stream.wait_stream(capture_stream)
+                    for _ in range(4):
+                        x_side.add_(y_side)
+                        x_side.relu_()
+                    torch.cuda._sleep(sleep_cycles_side)
+                for _ in range(4):
+                    x_main.add_(y_main)
+                    x_main.relu_()
+                torch.cuda._sleep(sleep_cycles_main)
+                capture_stream.wait_stream(side_stream)
+                x_main.mul_(1.0001)
     torch.cuda.synchronize()
     return g
 
@@ -131,7 +142,7 @@ def build_multistream_mixed_graph(
 def make_workload(args):
     if args.workload == "mixed":
         graph = build_mixed_graph(
-            args.mixed_groups, args.tensor_size, args.sleep_cycles
+            args.mixed_groups, args.tensor_size, args.sleep_cycles, args.layers
         )
     else:
         graph = build_multistream_mixed_graph(
@@ -139,6 +150,7 @@ def make_workload(args):
             args.tensor_size,
             args.sleep_cycles_main,
             args.sleep_cycles_side,
+            args.layers,
         )
 
     def run_step():
@@ -387,6 +399,12 @@ def main():
         default="multistream_mixed",
     )
     parser.add_argument("--mixed-groups", type=int, default=256)
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=1,
+        help="stack the group-pattern N times -> deeper graph / longer step",
+    )
     parser.add_argument("--tensor-size", type=int, default=2048)
     parser.add_argument("--sleep-cycles", type=int, default=180000)
     parser.add_argument("--sleep-cycles-main", type=int, default=180000)

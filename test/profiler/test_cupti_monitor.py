@@ -179,6 +179,7 @@ class TestCuptiRecords(TestCase):
         from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
         from torch.profiler._cupti.monitor import CuptiMonitorBuffer
+        from torch.profiler._cupti.records import Kernel, Memcpy
 
         kernel = int(ActivityKind.CONCURRENT_KERNEL)
         memcpy = int(ActivityKind.MEMCPY)
@@ -191,16 +192,18 @@ class TestCuptiRecords(TestCase):
             return buf.decode()
 
         def build(records, layouts):
-            # records: [(kind, {field_id: int | bytes})]; a bytes value is written as
-            # a real C string whose pointer is packed. layouts: {kind: (rsz, [(fid,
-            # off, sz), ...])}. Returns (keepalive, addr, n).
+            # records: [(kind, {Field: int | bytes})]; a bytes value is written as
+            # a real C string whose pointer is packed. layouts: {kind: (rsz, [(Field,
+            # off, sz), ...])}. Fields are coerced to their int id at the byte-packing
+            # boundary. Returns (keepalive, addr, n).
             keep: list = []
             blob = bytearray()
             for kind, vals in records:
                 rsz, fields = layouts[kind]
                 rec = bytearray(rsz)
-                values = {0: kind, **vals}
+                values = {0: kind, **{int(f): v for f, v in vals.items()}}
                 for fid, off, sz in fields:
+                    fid = int(fid)
                     if fid not in values:
                         continue
                     v = values[fid]
@@ -215,62 +218,78 @@ class TestCuptiRecords(TestCase):
             return keep, ctypes.addressof(buf), len(blob)
 
         def as_list(layouts):
-            return [(k, rsz, fields) for k, (rsz, fields) in layouts.items()]
+            # decode() matches field ids against STRING_FIELDS (int-keyed), so coerce
+            # the named Fields to their int id for the layout list it consumes.
+            return [
+                (k, rsz, [(int(fid), off, sz) for fid, off, sz in fields])
+                for k, (rsz, fields) in layouts.items()
+            ]
 
         # --- single kind: homogeneous stride ---
-        ker = {kernel: (24, [(0, 0, 4), (7, 8, 8), (8, 16, 8)])}
+        kf = [(Kernel.KIND, 0, 4), (Kernel.START, 8, 8), (Kernel.END, 16, 8)]
+        ker = {kernel: (24, kf)}
         keep, addr, n = build(
-            [(kernel, {7: 100, 8: 150}), (kernel, {7: 200, 8: 275})], ker
+            [
+                (kernel, {Kernel.START: 100, Kernel.END: 150}),
+                (kernel, {Kernel.START: 200, Kernel.END: 275}),
+            ],
+            ker,
         )
         out = decode(addr, n, as_list(ker))
-        np.testing.assert_array_equal(out[kernel][7], [100, 200])
-        np.testing.assert_array_equal(out[kernel][8], [150, 275])
+        np.testing.assert_array_equal(out[kernel][int(Kernel.START)], [100, 200])
+        np.testing.assert_array_equal(out[kernel][int(Kernel.END)], [150, 275])
         # Columns are independent copies of the buffer: scribbling over the source
         # bytes must not change already-decoded columns. This is what lets the worker
         # return the buffer to the pool immediately after decode().
         ctypes.memset(addr, 0, n)
-        np.testing.assert_array_equal(out[kernel][7], [100, 200])
-        np.testing.assert_array_equal(out[kernel][8], [150, 275])
+        np.testing.assert_array_equal(out[kernel][int(Kernel.START)], [100, 200])
+        np.testing.assert_array_equal(out[kernel][int(Kernel.END)], [150, 275])
 
         # --- uniform size: stride + dispatch by KIND (both kinds 24B) ---
-        uni = {
-            kernel: (24, [(0, 0, 4), (7, 8, 8), (8, 16, 8)]),
-            memcpy: (24, [(0, 0, 4), (5, 8, 8), (6, 16, 8)]),
-        }
+        mf = [(Memcpy.KIND, 0, 4), (Memcpy.BYTES, 8, 8), (Memcpy.START, 16, 8)]
+        uni = {kernel: (24, kf), memcpy: (24, mf)}
         keepu, addru, nu = build(
             [
-                (kernel, {7: 10, 8: 11}),
-                (memcpy, {6: 20, 5: 999}),
-                (kernel, {7: 30, 8: 33}),
+                (kernel, {Kernel.START: 10, Kernel.END: 11}),
+                (memcpy, {Memcpy.START: 20, Memcpy.BYTES: 999}),
+                (kernel, {Kernel.START: 30, Kernel.END: 33}),
             ],
             uni,
         )
         outu = decode(addru, nu, as_list(uni))
-        np.testing.assert_array_equal(outu[kernel][7], [10, 30])
-        np.testing.assert_array_equal(outu[memcpy][6], [20])
-        np.testing.assert_array_equal(outu[memcpy][5], [999])
+        np.testing.assert_array_equal(outu[kernel][int(Kernel.START)], [10, 30])
+        np.testing.assert_array_equal(outu[memcpy][int(Memcpy.START)], [20])
+        np.testing.assert_array_equal(outu[memcpy][int(Memcpy.BYTES)], [999])
 
         # --- variable size + bounds guard: per-record walk ---
         # kernel (24B) and memcpy (16B) differ -> walk. A third kernel record's KIND
         # header fits in valid_size but its body runs past it -> dropped.
         var = {
-            kernel: (24, [(0, 0, 4), (7, 8, 8)]),
-            memcpy: (16, [(0, 0, 4), (6, 8, 8)]),
+            kernel: (24, [(Kernel.KIND, 0, 4), (Kernel.START, 8, 8)]),
+            memcpy: (16, [(Memcpy.KIND, 0, 4), (Memcpy.START, 8, 8)]),
         }
         keepv, addrv, _ = build(
-            [(kernel, {7: 1}), (memcpy, {6: 3}), (kernel, {7: 4})], var
+            [
+                (kernel, {Kernel.START: 1}),
+                (memcpy, {Memcpy.START: 3}),
+                (kernel, {Kernel.START: 4}),
+            ],
+            var,
         )
         valid = 24 + 16 + 4  # third kernel: KIND header only, body cut off
         outv = decode(addrv, valid, as_list(var))
-        np.testing.assert_array_equal(outv[kernel][7], [1])  # truncated 3rd dropped
-        np.testing.assert_array_equal(outv[memcpy][6], [3])
+        # truncated 3rd dropped
+        np.testing.assert_array_equal(outv[kernel][int(Kernel.START)], [1])
+        np.testing.assert_array_equal(outv[memcpy][int(Memcpy.START)], [3])
 
-        # --- const char* string field dereferenced in place (NAME id 24) ---
-        ks = {kernel: (40, [(0, 0, 4), (7, 8, 8), (24, 32, 8)])}
-        keeps, addrs, ns = build([(kernel, {7: 7, 24: b"my_kernel"})], ks)
+        # --- const char* string field dereferenced in place (NAME) ---
+        kf_name = [(Kernel.KIND, 0, 4), (Kernel.START, 8, 8), (Kernel.NAME, 32, 8)]
+        ks = {kernel: (40, kf_name)}
+        recs = [(kernel, {Kernel.START: 7, Kernel.NAME: b"my_kernel"})]
+        keeps, addrs, ns = build(recs, ks)
         outs = decode(addrs, ns, as_list(ks))
-        self.assertEqual(list(outs[kernel][24]), ["my_kernel"])
-        np.testing.assert_array_equal(outs[kernel][7], [7])
+        self.assertEqual(list(outs[kernel][int(Kernel.NAME)]), ["my_kernel"])
+        np.testing.assert_array_equal(outs[kernel][int(Kernel.START)], [7])
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_normalize_activities(self):
