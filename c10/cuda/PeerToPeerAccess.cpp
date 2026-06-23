@@ -11,6 +11,7 @@
 #include <c10/util/irange.h>
 
 #include <array>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 #include <vector>
@@ -261,7 +262,6 @@ std::string get_nvml_fabric_info([[maybe_unused]] c10::DeviceIndex dev) {
   }
 
   const char* state_str = "unknown";
-  // NOLINTNEXTLINE(bugprone-switch-missing-default-case)
   switch (info.state) {
     case NVML_GPU_FABRIC_STATE_NOT_SUPPORTED:
       state_str = "not_supported";
@@ -274,6 +274,8 @@ std::string get_nvml_fabric_info([[maybe_unused]] c10::DeviceIndex dev) {
       break;
     case NVML_GPU_FABRIC_STATE_COMPLETED:
       state_str = "completed";
+      break;
+    default:
       break;
   }
 
@@ -288,7 +290,7 @@ std::string get_nvml_fabric_info([[maybe_unused]] c10::DeviceIndex dev) {
         << static_cast<int>(info.healthSummary);
   }
 #endif
-  return std::move(oss).str();
+  return oss.str();
 #else
   return "fabric info unsupported (requires CUDA >= 12.4)";
 #endif
