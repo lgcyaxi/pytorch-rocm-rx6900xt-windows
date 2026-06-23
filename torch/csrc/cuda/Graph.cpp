@@ -57,8 +57,18 @@ void THCPGraph_init(PyObject* module) {
           "capture_end",
           torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::capture_end))
       .def(
+          "capture_end_pre",
+          torch::wrap_pybind_function_no_gil(
+              &at::cuda::CUDAGraph::capture_end_pre))
+      .def(
+          "capture_end_post",
+          torch::wrap_pybind_function_no_gil(
+              &at::cuda::CUDAGraph::capture_end_post))
+      .def(
           "instantiate",
           torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::instantiate))
+      .def_property_readonly(
+          "_has_graph_exec", &at::cuda::CUDAGraph::has_graph_exec)
       .def(
           "register_generator_state",
           [](::at::cuda::CUDAGraph& self, py::handle raw_generator) {
