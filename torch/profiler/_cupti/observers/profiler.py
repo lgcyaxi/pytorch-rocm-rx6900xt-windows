@@ -20,6 +20,7 @@ from torch.profiler._cupti.cupti_python import OVERHEAD_KIND_NAMES
 from torch.profiler._cupti.monitor_trace import merge_trace_window_into_chrome_trace
 from torch.profiler._cupti.observers.base import (
     CuptiMonitorObserver,
+    default_graph_annotation_resolver,
     ObserverAnnotationSettings,
 )
 from torch.profiler._cupti.observers.observation_window import WindowFinalizerMixin
@@ -38,8 +39,6 @@ from torch.profiler._cupti.records import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from torch.profiler._cupti.observers.base import AnnotationResolver
 
 
 def _current_thread_resource_tuple() -> tuple[int, int, int]:
@@ -179,7 +178,6 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
 
     def __init__(
         self,
-        annotation_resolver: AnnotationResolver | None = None,
         metadata_resolver: Callable[[int], str | None] | None = None,
         enable_cuda_sync: bool = False,
         defer_export: bool = True,
@@ -207,10 +205,15 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         selection = {k: set(v) for k, v in PROFILER_FIELDS.items()}
         if enable_cuda_sync:
             selection.update({k: set(v) for k, v in SYNC_FIELDS.items()})
+        # Graph naming on via the default registry resolver (the profiler always wants graph
+        # captures named -- it's free when there are none and a no-op for eager-only runs).
+        # Eager naming stays off (the default): the full profiler already selects
+        # EXTERNAL_CORRELATION + RUNTIME and does the correlation -> external_id -> annotation
+        # join in the trace build itself, so the base eager machinery would be redundant.
         super().__init__(
             selection,
             annotations=ObserverAnnotationSettings(
-                graph=True, custom_graph_annotation_resolver=annotation_resolver
+                graph_annotation_resolver=default_graph_annotation_resolver,
             ),
         )
         if self.available:
@@ -536,22 +539,19 @@ def _demangle_column(names: Any) -> Any:
     return out
 
 
-def _resolve_annotation_column(resolver, gnid: Any, kind: int, corr: Any) -> Any:
-    """Per-row graph annotation as an object column, memoized over distinct
-    (graph_node_id, correlation_id) keys. None resolver -> all-None column, no calls."""
+def _resolve_annotation_column(resolver, gnid: Any) -> Any:
+    """Per-row graph annotation as an object column, memoized over distinct graph_node_ids.
+    None resolver -> all-None column, no calls."""
     n = len(gnid)
     out = np.empty(n, dtype=object)
     if resolver is None:
         out[:] = None
         return out
-    cache: dict[tuple[int, int], Any] = {}
-    gl = gnid.tolist()
-    cl = corr.tolist()
-    for i in range(n):
-        key = (gl[i], cl[i])
-        val = cache.get(key, _ANNOTATION_MISS)
+    cache: dict[int, Any] = {}
+    for i, g in enumerate(gnid.tolist()):
+        val = cache.get(g, _ANNOTATION_MISS)
         if val is _ANNOTATION_MISS:
-            val = cache[key] = resolver(gl[i], kind, cl[i])
+            val = cache[g] = resolver(g)
         out[i] = val
     return out
 
@@ -569,9 +569,7 @@ def _kernel_columns(cols, convert, resolver):
         "graph_node_id": gnid,
         "graph_id": cols[Kernel.GRAPH_ID.id].astype(np.int64),
         "name": _demangle_column(cols[Kernel.NAME.id]),
-        "annotation": _resolve_annotation_column(
-            resolver, gnid, int(ActivityKind.CONCURRENT_KERNEL), corr
-        ),
+        "annotation": _resolve_annotation_column(resolver, gnid),
         "grid_x": cols[Kernel.GRID_X.id].astype(np.int64),
         "grid_y": cols[Kernel.GRID_Y.id].astype(np.int64),
         "grid_z": cols[Kernel.GRID_Z.id].astype(np.int64),
@@ -600,9 +598,7 @@ def _memcpy_columns(cols, convert, resolver):
         "correlation_id": corr,
         "graph_node_id": gnid,
         "graph_id": cols[Memcpy.GRAPH_ID.id].astype(np.int64),
-        "annotation": _resolve_annotation_column(
-            resolver, gnid, int(ActivityKind.MEMCPY), corr
-        ),
+        "annotation": _resolve_annotation_column(resolver, gnid),
         "bytes": cols[Memcpy.BYTES.id].astype(np.int64),
         "copy_kind": cols[Memcpy.COPY_KIND.id].astype(np.int64),
         "src_kind": cols[Memcpy.SRC_KIND.id].astype(np.int64),
@@ -623,9 +619,7 @@ def _memset_columns(cols, convert, resolver):
         "correlation_id": corr,
         "graph_node_id": gnid,
         "graph_id": cols[Memset.GRAPH_ID.id].astype(np.int64),
-        "annotation": _resolve_annotation_column(
-            resolver, gnid, int(ActivityKind.MEMSET), corr
-        ),
+        "annotation": _resolve_annotation_column(resolver, gnid),
         "bytes": cols[Memset.BYTES.id].astype(np.int64),
         "value": cols[Memset.VALUE.id].astype(np.int64),
         "memory_kind": cols[Memset.MEMORY_KIND.id].astype(np.int64),

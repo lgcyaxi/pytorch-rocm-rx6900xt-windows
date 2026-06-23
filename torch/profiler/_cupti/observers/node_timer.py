@@ -23,19 +23,18 @@ is a single op, so its kind is unambiguous. Eager (non-graph) activities report
 base); :meth:`drain_annotated` then returns ``{name: [(start_ns, end_ns), ...]}``,
 resolving each span graph-first then eager-fallback:
 
-  * **Graph** (``graph=True``) -- ``graph_node_id -> name`` via the resolver
-    (``custom_graph_annotation_resolver`` or the default registry). Needs no extra
-    record kinds, so it stays on the monitor's **vectorized** decode path.
-  * **Eager** (``eager=True``) -- ``record_function``-style regions bracketed with
-    :meth:`push_annotation`/:meth:`annotate` (inherited from the base) become
+  * **Graph** (``graph_annotation_resolver``) -- ``graph_node_id -> name`` via the resolver
+    (a custom one or the default registry). Needs no extra record kinds, so it stays on the
+    monitor's **vectorized** decode path. On by default; ``None`` disables it.
+  * **Eager** (``support_eager_annotations``) -- ``record_function``-style regions bracketed
+    with :meth:`push_annotation`/:meth:`annotate` (inherited from the base) become
     external-correlation ids, joined ``correlation_id -> external_id -> name``. This
     folds in the EXTERNAL_CORRELATION + RUNTIME record kinds (CUPTI only emits the
     former when the latter is enabled), whose differing record sizes drop the decode
-    onto the slower per-record walk. External ids don't survive CUDA-graph capture, so
-    eager covers only eager activity.
+    onto the slower per-record walk -- off by default for that cost. External ids don't
+    survive CUDA-graph capture, so eager covers only eager activity.
 
-Set ``graph=True`` for graph naming (fast path), ``eager=True`` for eager regions, or
-both for mixed graph/eager workloads.
+With no ``annotations`` at all, nothing is named (everything in ``""``).
 """
 
 from __future__ import annotations
@@ -235,7 +234,7 @@ class NodeTimerObserver(CuptiMonitorObserver):
         if resolver is not None:
             uniq_g, inv_g = np.unique(gnode, return_inverse=True)
             g_names = np.array(
-                [(resolver(int(g), 0, 0) or "") if g else "" for g in uniq_g.tolist()],
+                [(resolver(int(g)) or "") if g else "" for g in uniq_g.tolist()],
                 dtype=object,
             )
             span_names = g_names[inv_g]
