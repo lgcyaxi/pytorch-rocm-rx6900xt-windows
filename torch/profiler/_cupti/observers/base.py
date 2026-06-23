@@ -43,19 +43,15 @@ def default_graph_annotation_resolver(graph_node_id: int) -> Any | None:
 @dataclass(frozen=True)
 class ObserverAnnotationSettings:
     """How an observer attributes activity to named regions. Each source enforces its own
-    fields when enabled (the observer folds them into its selection) and contributes nothing
-    when disabled.
+    fields when enabled (folded into the selection) and contributes nothing when disabled.
 
-    - ``graph_annotation_resolver`` -- graph-node naming (``graph_node_id -> name``),
-      resolved from the recorded CUDA-graph registry (survives replay); collection-free
-      beyond the graph_node_id field. Pluggable; defaults to ``None`` (no graph naming, and
-      the graph_node_id field is not enforced). Pass ``default_graph_annotation_resolver``
-      (or a custom resolver) to enable it.
-    - ``support_eager_annotations`` -- enable eager ``record_function`` naming via the
-      observer's built-in external-correlation join (``correlation_id -> external_id ->
-      name``, from ``push_annotation``). Folds EXTERNAL_CORRELATION + RUNTIME into the
-      selection (CUPTI only emits the former when the latter is enabled), which drops decode
-      onto the slower per-record walk -- off by default for that cost.
+    - ``graph_annotation_resolver`` -- graph-node naming (``graph_node_id -> name``) from the
+      recorded CUDA-graph registry (survives replay); collection-free beyond graph_node_id.
+      Pluggable; defaults to ``None`` (disabled). Pass ``default_graph_annotation_resolver``
+      (or a custom resolver) to enable.
+    - ``support_eager_annotations`` -- eager ``record_function`` naming via the built-in
+      external-correlation join (``correlation_id -> external_id -> name``). Folds in
+      EXTERNAL_CORRELATION + RUNTIME (-> slower per-record decode), so off by default.
     """
 
     graph_annotation_resolver: GraphAnnotationResolver | None = None
@@ -83,10 +79,8 @@ class CuptiMonitorObserver:
         *,
         annotations: ObserverAnnotationSettings | None = None,
     ) -> None:
-        # Region naming (see ObserverAnnotationSettings): one resolver per source, each
-        # None to disable. A non-None resolver enforces its fields -- graph naming just
-        # needs the graph_node_id (collection-free), eager folds extra record kinds in
-        # (-> per-record walk).
+        # Region naming (see ObserverAnnotationSettings): an enabled source folds its
+        # required fields into the selection (graph: just graph_node_id; eager: extra kinds).
         if annotations is None:
             self._resolver: GraphAnnotationResolver | None = None
             self._eager = False

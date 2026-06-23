@@ -1,24 +1,15 @@
 # mypy: allow-untyped-defs
 """Shared window-finalization machinery for CUPTI monitor observers.
 
-An observer that publishes per *window* (a span ended by a boundary -- a training step, a
+An observer that publishes per *window* (a span ended by a boundary -- a training step or
 profiling window) stamps each boundary in CUPTI's native record clock and finalizes the
-window only once its records are *naturally* delivered. No device sync touches the measured
-timeline: CUPTI delivers buffers in fill order, so once a delivered record starts at/after
-a boundary, every earlier record is in hand ("covered").
-
-This mixin owns the boundary queue, the poll thread, the cover-detection loop, and
-teardown. The subclass supplies what differs between consumers:
-
-  * ``_collect_delivered(sync)`` -- pull delivered records into its buffer (``sync`` only
-    at teardown, where a synchronous flush is harmless).
-  * ``_window_watermark_ns()`` -- max delivered record start (native clock); a boundary
-    at/below this is covered.
-  * ``_finalize_window(window_id, boundary_ns)`` -- select, publish, and drop that
-    window's records.
-
-Boundaries use ``now_native_ns()`` from :class:`CuptiMonitorObserver`, the same timebase
-as records' START/END.
+window only once its records are *naturally* delivered -- no device sync on the measured
+timeline (CUPTI delivers buffers in fill order, so a delivered record starting at/after a
+boundary means every earlier one is in hand). This mixin owns the boundary queue, poll
+thread, cover-detection, and teardown; the subclass supplies ``_collect_delivered(sync)``,
+``_window_watermark_ns()`` (max delivered record start, native clock), and
+``_finalize_window(window_id, boundary_ns)``. Boundaries use ``now_native_ns()`` from
+:class:`CuptiMonitorObserver`, the same timebase as record START/END.
 """
 
 from __future__ import annotations
