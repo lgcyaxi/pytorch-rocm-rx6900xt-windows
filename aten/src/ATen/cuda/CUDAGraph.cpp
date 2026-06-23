@@ -174,7 +174,12 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
   }
 }
 
-void CUDAGraph::capture_end() {
+// capture_end is split so callers can run work on the captured cudaGraph_t
+// (e.g. read its id, dump it, transform it) in the window between the end of
+// capture and finalization, when graph_ is live for both keep_graph modes.
+// capture_end_post finalizes (instantiate + destroy for keep_graph=false);
+// capture_end runs the two back to back for callers that don't need the window.
+void CUDAGraph::capture_end_pre() {
   auto stream = at::cuda::getCurrentCUDAStream();
 
   TORCH_CHECK(stream.stream() == capture_stream_.stream(),
@@ -213,6 +218,9 @@ void CUDAGraph::capture_end() {
 
   capture_ended_ = true;
   has_graph_ = true;
+}
+
+void CUDAGraph::capture_end_post() {
   if (!keep_graph_) {
     instantiate();
     if (!_cuda_graphs_debug) {
@@ -220,6 +228,11 @@ void CUDAGraph::capture_end() {
     }
     has_graph_ = false;
   }
+}
+
+void CUDAGraph::capture_end() {
+  capture_end_pre();
+  capture_end_post();
 }
 
 void CUDAGraph::instantiate() {
@@ -255,11 +268,11 @@ void CUDAGraph::instantiate() {
 void CUDAGraph::replay() {
   TORCH_CHECK(capture_ended_,
               "Called CUDAGraph::replay without a preceding successful capture.");
-
-  if (!has_graph_exec_) {
-    TORCH_INTERNAL_ASSERT(keep_graph_);
-    instantiate();
-  }
+  // Instantiating on demand is handled by the Python replay() wrapper (which
+  // can do so for keep_graph=true). At this level the exec graph must exist.
+  TORCH_CHECK(has_graph_exec_,
+              "Called CUDAGraph::replay before the graph was instantiated; "
+              "call instantiate() first.");
 
   c10::OptionalDeviceGuard device_guard{capture_stream_.device()};
 
@@ -292,8 +305,10 @@ void CUDAGraph::debug_dump(const std::string& debug_path) {
 }
 
 cudaGraph_t CUDAGraph::raw_cuda_graph() {
-  TORCH_CHECK(keep_graph_, "You cannot access the raw cudaGraph_t instance unless CUDAGraph was initialized with keep_graph=true");
-  TORCH_CHECK(has_graph_, "You cannot access the raw cudaGraph_t instance until capture_end() has been called");
+  TORCH_CHECK(has_graph_,
+      "No cudaGraph_t is available: either capture_end() has not been called, "
+      "or the underlying cudaGraph_t was destroyed (keep_graph=false, and "
+      "capture has been finalized).");
   return graph_;
 }
 
