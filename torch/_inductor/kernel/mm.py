@@ -628,6 +628,9 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
 
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
     m, n, k, layout, mat1, mat2, inp_expanded = mm_args(mat1, mat2, inp, layout=layout)
+    # Keep the pre-realized TensorBox bias; lowerings (e.g. select) require a
+    # TensorBox, while realize_inputs returns a realized buffer.
+    inp_tensorbox = inp
     inp = realize_inputs(inp)
     static_shape, is_nonzero = _is_static_problem(layout)
     name = "addmm"
@@ -676,9 +679,26 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
             inp.get_stride()[0] == 0
             and len(inp.get_size()) == 2
             and inductor_config.triton.autotune_cublasLt
-            and not V.graph.cpp_wrapper  # bias_addmm only has a Python implementation
         ):
-            aten_templates.append(aten_bias_addmm)
+            if V.graph.cpp_wrapper:
+                # bias_addmm has only a Python implementation, so cpp_wrapper
+                # cannot emit it. Reproduce the same cublasLt fast path (addmm
+                # with a 1D bias) via aten_addmm on a 1D view of the broadcast
+                # bias; aten_addmm has a C-shim and works under cpp_wrapper.
+                counters["inductor"]["cpp_wrapper_bias_addmm"] += 1
+                bias_1d = realize_inputs(lowerings[aten.select](inp_tensorbox, 0, 0))
+                choices.extend(
+                    V.choices.get_template_configs(
+                        MMKernelInputs(
+                            [bias_1d, mat1, mat2],
+                            scalars=dict(alpha=alpha, beta=beta),
+                        ),
+                        [aten_addmm],
+                        name,
+                    )
+                )
+            else:
+                aten_templates.append(aten_bias_addmm)
 
         # On ROCm, ATen choices use original bias input; non-ROCm keeps unified inputs.
         choices.extend(

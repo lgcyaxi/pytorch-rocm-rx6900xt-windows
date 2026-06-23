@@ -98,6 +98,40 @@ def _register_fbcode_cpp_wrapper_arg_helper_op(m, device):
 class TestGpuWrapper(InductorTestCase):
     device = GPU_TYPE
 
+    def test_cpp_wrapper_bias_addmm_cublaslt(self):
+        if not RUN_GPU:
+            self.skipTest("GPU not available")
+
+        from torch._dynamo.utils import counters
+        from torch._inductor.utils import fresh_cache
+
+        M, K, N = 64, 64, 128
+
+        def fn(bias, x, w):
+            return torch.addmm(bias, x, w)
+
+        x = torch.randn(M, K, device=self.device)
+        w = torch.randn(K, N, device=self.device)
+        # 2D bias broadcast along dim 0 (stride(0) == 0): the case bias_addmm
+        # targets for the faster cublasLt path.
+        bias = torch.randn(N, device=self.device).expand(M, N)
+
+        counters.clear()
+        with (
+            fresh_cache(),
+            config.patch(
+                {
+                    "cpp_wrapper": True,
+                    "max_autotune_gemm": True,
+                    "max_autotune_gemm_backends": "ATEN",
+                    "triton.autotune_cublasLt": True,
+                }
+            ),
+        ):
+            result = torch.compile(fn)(bias, x, w)
+        self.assertEqual(result, fn(bias, x, w))
+        self.assertGreaterEqual(counters["inductor"]["cpp_wrapper_bias_addmm"], 1)
+
     def test_aoti_debug_printer_works_on_constants(self):
         batch_size = 32
         seq_length = 50
