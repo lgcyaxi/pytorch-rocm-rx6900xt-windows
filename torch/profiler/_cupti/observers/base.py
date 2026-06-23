@@ -21,17 +21,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-# (graph_node_id, activity_kind, correlation_id) -> annotation, or None. The graph
-# naming mechanism shared by observers: map a CUDA-graph node id to its registered
-# region name (survives graph replay, needs no extra record kinds).
-AnnotationResolver = Callable[[int, int, int], "Any | None"]
+# graph_node_id -> annotation name (or None). The graph naming mechanism shared by
+# observers: map a CUDA-graph node id to its registered region name (survives graph
+# replay, needs no extra record kinds).
+GraphAnnotationResolver = Callable[[int], "Any | None"]
 
 
-def default_graph_annotation_resolver(
-    graph_node_id: int, activity_kind: int, correlation_id: int
-) -> Any | None:
+def default_graph_annotation_resolver(graph_node_id: int) -> Any | None:
     """Default resolver: map a CUDA-graph node id to its registered annotation."""
-    del activity_kind, correlation_id
     if graph_node_id == 0:
         return None
     try:
@@ -45,25 +42,24 @@ def default_graph_annotation_resolver(
 
 @dataclass(frozen=True)
 class ObserverAnnotationSettings:
-    """How an observer attributes activity to named regions. With neither ``graph``
-    nor ``eager`` set (the default), no naming is applied and every span falls into
-    the ``""`` bucket in :meth:`NodeTimerObserver.drain_annotated`.
+    """How an observer attributes activity to named regions. Each source enforces its own
+    fields when enabled (the observer folds them into its selection) and contributes nothing
+    when disabled.
 
-    - ``graph`` -- enable graph-node naming (``graph_node_id -> name``, vectorized,
-      no extra record kinds, survives graph replay). Uses
-      ``custom_graph_annotation_resolver`` if given, else the CUDA-graph annotation
-      registry.
-    - ``eager`` -- enable eager ``record_function`` naming via the
-      ``correlation_id -> external_id -> name`` external-correlation join. Folds
-      EXTERNAL_CORRELATION + RUNTIME into the selection (CUPTI only emits the former
-      when the latter is enabled), which drops decode onto the slower per-record walk.
-    - ``custom_graph_annotation_resolver`` -- override the graph resolver (only used
-      when ``graph`` is set; falls back to the default registry resolver if omitted).
+    - ``graph_annotation_resolver`` -- graph-node naming (``graph_node_id -> name``),
+      resolved from the recorded CUDA-graph registry (survives replay); collection-free
+      beyond the graph_node_id field. Pluggable; defaults to ``None`` (no graph naming, and
+      the graph_node_id field is not enforced). Pass ``default_graph_annotation_resolver``
+      (or a custom resolver) to enable it.
+    - ``support_eager_annotations`` -- enable eager ``record_function`` naming via the
+      observer's built-in external-correlation join (``correlation_id -> external_id ->
+      name``, from ``push_annotation``). Folds EXTERNAL_CORRELATION + RUNTIME into the
+      selection (CUPTI only emits the former when the latter is enabled), which drops decode
+      onto the slower per-record walk -- off by default for that cost.
     """
 
-    eager: bool = False
-    graph: bool = False
-    custom_graph_annotation_resolver: AnnotationResolver | None = None
+    graph_annotation_resolver: GraphAnnotationResolver | None = None
+    support_eager_annotations: bool = False
 
 
 class CuptiMonitorObserver:
@@ -87,20 +83,18 @@ class CuptiMonitorObserver:
         *,
         annotations: ObserverAnnotationSettings | None = None,
     ) -> None:
-        # Region naming (see ObserverAnnotationSettings): a graph-node resolver and/or the
-        # eager external-correlation join. Eager folds extra record kinds in -> per-record
-        # walk; graph naming is just a resolver, staying on the vectorized path.
+        # Region naming (see ObserverAnnotationSettings): one resolver per source, each
+        # None to disable. A non-None resolver enforces its fields -- graph naming just
+        # needs the graph_node_id (collection-free), eager folds extra record kinds in
+        # (-> per-record walk).
         if annotations is None:
-            self._resolver: AnnotationResolver | None = None
+            self._resolver: GraphAnnotationResolver | None = None
             self._eager = False
         else:
-            self._eager = annotations.eager
-            self._resolver = (
-                annotations.custom_graph_annotation_resolver
-                or default_graph_annotation_resolver
-                if annotations.graph
-                else None
-            )
+            self._resolver = annotations.graph_annotation_resolver
+            self._eager = annotations.support_eager_annotations
+        if self._resolver is not None:
+            activities = self._with_graph_fields(activities)
         if self._eager:
             activities = self._with_eager_fields(activities)
         # frozenset of requested kinds (a field map collapses to keys) for the observer's
@@ -153,6 +147,22 @@ class CuptiMonitorObserver:
             int(ExternalCorrelation.CORRELATION_ID),
         }
         aug[int(ActivityKind.RUNTIME)] = {CORRELATION_FIELD[int(ActivityKind.RUNTIME)]}
+        return aug
+
+    @staticmethod
+    def _with_graph_fields(activities: Any) -> dict[int, set[int]]:
+        """Augment a field map so the graph resolver can name nodes: add each GPU-op kind's
+        GRAPH_NODE_ID. Collection-free (it's a normal record field, no extra kinds, stays on
+        the vectorized path). Expects a ``{kind: fields}`` map."""
+        from torch.profiler._cupti.records import GRAPH_NODE_FIELD
+
+        aug: dict[int, set[int]] = {}
+        for kind, sel in dict(activities).items():
+            k = int(kind)
+            fields = {int(f) for f in sel}
+            if k in GRAPH_NODE_FIELD:
+                fields.add(GRAPH_NODE_FIELD[k])
+            aug[k] = fields
         return aug
 
     def push_annotation(self, name: str) -> int | None:

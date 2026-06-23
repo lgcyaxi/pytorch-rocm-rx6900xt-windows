@@ -433,9 +433,9 @@ class _KinetoProfile:
                 raise AssertionError(
                     "CUPTI monitor trace window must be closed before exporting"
                 )
-            # Capture the Kineto CPU trace (cheap, no device sync) and hand it + the output
-            # path to the observer. Async: the poller merges + writes `path` once the GPU
-            # records arrive; wait_for_exports() blocks for it.
+            # Capture the profiler's CPU-side trace (cheap, no device sync) and hand it + the
+            # output path to the observer. Async: the poller merges + writes `path` once the
+            # GPU records arrive; wait_for_exports() blocks for it.
             fp = tempfile.NamedTemporaryFile(  # noqa: SIM115
                 "w+t", suffix=".json", delete=False
             )
