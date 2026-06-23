@@ -4103,7 +4103,6 @@ exit(2)
             model_graphed({"x": real_inputs[0]}), model_control({"x": real_inputs[0]})
         )
 
-    @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/179961")
     @unittest.skipIf(
         not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
     )
@@ -4369,7 +4368,7 @@ exit(2)
 
         with self.assertRaisesRegex(
             RuntimeError,
-            r"You cannot access the raw (cuda|hip)Graph_t instance unless CUDAGraph was initialized with keep_graph=true",
+            r"No (cuda|hip)Graph_t is available",
         ):
             raw_pointer = graph.raw_cuda_graph()
 
