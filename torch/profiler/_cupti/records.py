@@ -213,6 +213,15 @@ CORRELATION_FIELD: dict[int, int] = {
 }
 
 
+# Per-kind graph-node-id field, for the graph annotation resolver: only the GPU-op kinds
+# carry a graph_node_id (the field the resolver maps to a region name).
+GRAPH_NODE_FIELD: dict[int, int] = {
+    ActivityKind.CONCURRENT_KERNEL: int(Kernel.GRAPH_NODE_ID),
+    ActivityKind.MEMCPY: int(Memcpy.GRAPH_NODE_ID),
+    ActivityKind.MEMSET: int(Memset.GRAPH_NODE_ID),
+}
+
+
 # A record layout as captured by CUPTI (pBufferCompleteInfo->ppRecordLayouts) and
 # attached to a completed buffer by the native layer: a list of
 # (kind, record_size, [(field_id, offset, size), ...]). This is what the monitor

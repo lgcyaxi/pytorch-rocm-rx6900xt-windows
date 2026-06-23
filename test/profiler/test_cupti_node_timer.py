@@ -74,13 +74,15 @@ class TestCuptiNodeTimerCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_node_timer_drain_annotated_eager(self):
-        # With eager=True, eager kernels bracketed by annotate(name) resolve to that
-        # region via the correlation_id -> external_id -> name join, and
+        # With eager naming on (default), eager kernels bracketed by annotate(name) resolve
+        # to that region via the correlation_id -> external_id -> name join, and
         # drain_annotated() returns {name: [(start, end), ...]}.
         from torch.profiler._cupti.observers.base import ObserverAnnotationSettings
         from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
-        obs = NodeTimerObserver(annotations=ObserverAnnotationSettings(eager=True))
+        obs = NodeTimerObserver(
+            annotations=ObserverAnnotationSettings(support_eager_annotations=True)
+        )
         if not obs.available:
             self.skipTest("CUPTI monitor unavailable (v2 subscribe failed)")
         try:
@@ -111,7 +113,9 @@ class TestCuptiNodeTimerCUDA(TestCase):
         from torch.profiler._cupti.observers.base import ObserverAnnotationSettings
         from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
-        obs = NodeTimerObserver(annotations=ObserverAnnotationSettings(eager=True))
+        obs = NodeTimerObserver(
+            annotations=ObserverAnnotationSettings(support_eager_annotations=True)
+        )
         if not obs.available:
             self.skipTest("CUPTI monitor unavailable (v2 subscribe failed)")
         mon = obs._monitor
