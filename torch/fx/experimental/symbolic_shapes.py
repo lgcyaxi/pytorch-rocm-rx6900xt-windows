@@ -1113,9 +1113,8 @@ def is_symbol_binding_fx_node(node: torch.fx.Node) -> sympy.Symbol | None:
     """
     Check if a given FX node is a symbol binding node.
 
-    A symbol binding node is one that has a SymInt value in its meta whose
-    placeholder expression is a sympy Symbol, and is either a placeholder node or
-    records that it binds the unbacked symbol in node.meta["unbacked_bindings"].
+    A symbol binding node is one that has a SymInt value in its meta that contains
+    a sympy Symbol expression, and is either a placeholder node or contains unbacked symbols.
 
     Args:
         node (torch.fx.Node): The FX node to check
@@ -1123,21 +1122,16 @@ def is_symbol_binding_fx_node(node: torch.fx.Node) -> sympy.Symbol | None:
     Returns:
         Optional[sympy.Symbol]: The sympy Symbol if the node is a symbol binding node, None otherwise
     """
-    if "val" not in node.meta or not isinstance(node.meta["val"], torch.SymInt):
-        return None
-
-    expr = _get_placeholder_expr(node.meta["val"].node)
-    if not isinstance(expr, sympy.Symbol):
-        return None
-
-    if node.op == "placeholder":
-        return expr
-
-    if unbacked_bindings := resolve_unbacked_bindings(
-        node.meta["val"].node.shape_env, node.meta.get("unbacked_bindings")
+    if (
+        "val" in node.meta
+        and isinstance(node.meta["val"], torch.SymInt)
+        and isinstance(node.meta["val"].node.expr, sympy.Symbol)
+        and (
+            node.op == "placeholder"
+            or free_unbacked_symbols(node.meta["val"].node.expr)
+        )
     ):
-        if expr in unbacked_bindings:
-            return expr
+        return node.meta["val"].node.expr
     return None
 
 
@@ -7291,7 +7285,12 @@ class ShapeEnv:
         # axioms with compute hint NYE
         if compute_hint and axioms:
             raise AssertionError("compute_hint and axioms cannot both be set")
-        expr = self.simplify(expr, size_oblivious)
+        expr = self.simplify(
+            expr,
+            size_oblivious,
+            axioms=axioms,
+            var_to_range=var_to_range,
+        )
 
         if compute_hint:
             expr = expr.xreplace(self.backed_var_to_val).xreplace(
@@ -7394,7 +7393,14 @@ class ShapeEnv:
         self._update_version_counter()
 
     @_lru_cache
-    def simplify(self, expr: _SympyT, size_oblivious: bool = False) -> _SympyT:
+    def simplify(
+        self,
+        expr: _SympyT,
+        size_oblivious: bool = False,
+        *,
+        axioms: tuple[SympyBoolean] | None = None,
+        var_to_range: tuple[tuple[sympy.Symbol, ValueRanges[sympy.Expr]]] | None = None,
+    ) -> _SympyT:
         """Use known constraints and replacements to simplify the given expr"""
         expr = safe_expand(expr)
         expr = self.replace(expr)
@@ -7410,9 +7416,17 @@ class ShapeEnv:
                 if b == 1 or b == 0:
                     a, b = b, a
 
-                if a == 1 and self._maybe_evaluate_static(sympy.Ge(b, 1)):
+                if a == 1 and self._maybe_evaluate_static(
+                    sympy.Ge(b, 1),
+                    axioms=axioms,
+                    var_to_range=var_to_range,
+                ):
                     min_max_replacements[atom] = b
-                if a == 0 and self._maybe_evaluate_static(sympy.Ge(b, 0)):
+                if a == 0 and self._maybe_evaluate_static(
+                    sympy.Ge(b, 0),
+                    axioms=axioms,
+                    var_to_range=var_to_range,
+                ):
                     min_max_replacements[atom] = b
             if min_max_replacements:
                 expr = expr.xreplace(min_max_replacements)
