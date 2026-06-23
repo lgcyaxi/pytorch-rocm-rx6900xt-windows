@@ -938,6 +938,10 @@ ProcessGroupNCCL::ProcessGroupNCCL(
       ValueError,
       at::cuda::getNumGPUs() != 0,
       "ProcessGroupNCCL is only supported with GPUs, no GPUs found!");
+  TORCH_CHECK(
+      !options_->enable_reconfigure,
+      "ProcessGroupNCCL does not support enable_reconfigure "
+      "(reconfigure-based fault tolerance).");
 
   // getNcclVersion needs to get called before launching threads which can
   // potentially call getenv. getNcclVersion internally calls setenv to set some
@@ -1874,10 +1878,11 @@ void ProcessGroupNCCL::HeartbeatMonitor::runLoop() {
         lastTimePollStore = currentTime;
         auto handleError = [&](const std::string& errorMessage) {
           LOG(WARNING)
-              << pg_->logPrefix()
-              << "Failed to check the \"should dump\" flag on TCPStore, "
-              << "(maybe TCPStore server has shut down too early), with error: "
-              << errorMessage;
+              << pg_->logPrefix() << "TCPStore check for dump key \""
+              << kStoreDumpKey
+              << "\" failed (store unavailable, not absent key). Cannot detect "
+              << "remote dump signals. A rank exiting outside NCCL without "
+              << "broadcasting is a separate case. Error: " << errorMessage;
           // We give up for now assuming TCPStore has been torn down.
           return;
         };
@@ -2081,7 +2086,7 @@ void ProcessGroupNCCL::HeartbeatMonitor::runLoop() {
   // check the return value here.  We mainly use a future so we can exit early
   // if done.
   if (!terminateHeartbeatMonitorThread_.load()) {
-    // Create a error message reported from MonitorThread, so
+    // Create an error message reported from MonitorThread, so
     // we throw exception and make the whole process to be killed.
     // TODO(fduwjj): After having a hang debug wiki, we need to update the wiki
     // url here.
@@ -4961,7 +4966,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather_coalesced(
       "ProcessGroupNCCL does not support allgather_coalesced");
 }
 
-c10::intrusive_ptr<Work> ProcessGroupNCCL::allgather_into_tensor_coalesced(
+c10::intrusive_ptr<Work> ProcessGroupNCCL::all_gather_single_coalesced(
     std::vector<at::Tensor>& outputs,
     std::vector<at::Tensor>& inputs,
     const AllgatherOptions& opts) {
@@ -5111,7 +5116,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter(
   }
 }
 
-c10::intrusive_ptr<Work> ProcessGroupNCCL::_reduce_scatter_base(
+c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter_single(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
     const ReduceScatterOptions& opts) {
@@ -5191,7 +5196,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_reduce_scatter_base(
       "nccl:_reduce_scatter_base");
 }
 
-c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter_tensor_coalesced(
+c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter_single_coalesced(
     std::vector<at::Tensor>& outputs,
     std::vector<at::Tensor>& inputs,
     const ReduceScatterOptions& opts) {
@@ -5348,7 +5353,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::barrier(const BarrierOptions& opts) {
   return nullptr;
 }
 
-c10::intrusive_ptr<Work> ProcessGroupNCCL::alltoall_base(
+c10::intrusive_ptr<Work> ProcessGroupNCCL::all_to_all_single(
     at::Tensor& outputTensor,
     at::Tensor& inputTensor,
     std::vector<int64_t>& outputSplitSizes,
@@ -5660,7 +5665,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::gather(
     // if not in the root rank, initialize outputs as empty list
     assertEmptyOutputTensorList(invalidArgument, outputTensors);
     outputs = {};
-    // append a empty tensor to the list, we don't use it but the
+    // append an empty tensor to the list, we don't use it but the
     // `collective` template function requires it to invoke its function
     outputs.emplace_back();
   }
@@ -5736,7 +5741,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::scatter(
     // with an empty list
     assertEmptyInputTensorList(invalidArgument, inputTensors);
     inputs = {};
-    // append a empty tensor to the list, we don't use it but the
+    // append an empty tensor to the list, we don't use it but the
     // `collective` template function requires it to invoke its function
     inputs.emplace_back();
   }
@@ -5794,7 +5799,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::recvAnysource(
       NotImplementedError, "ProcessGroupNCCL does not support recvAnysource");
 }
 
-c10::intrusive_ptr<Work> ProcessGroupNCCL::_allgather_base(
+c10::intrusive_ptr<Work> ProcessGroupNCCL::all_gather_single(
     at::Tensor& output_tensor,
     at::Tensor& input_tensor,
     const AllgatherOptions& opts) {

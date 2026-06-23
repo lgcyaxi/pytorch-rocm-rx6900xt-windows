@@ -643,10 +643,15 @@ class UserFunctionVariable(BaseUserFunctionVariable):
         return self.fn.__globals__
 
     def should_allow_nested_graph_breaks(self) -> bool:
-        from torch._dynamo.trace_rules import BUILTIN_INLINE_WHEN_CALLED
+        from torch._dynamo.trace_rules import (
+            BUILTIN_INLINE_WHEN_CALLED,
+            is_ngb_suppressed_inline,
+        )
 
         filename = self.get_filename()
         if any(filename.startswith(d) for d in BUILTIN_INLINE_WHEN_CALLED):
+            return False
+        if is_ngb_suppressed_inline(filename):
             return False
         return True
 
@@ -1048,9 +1053,6 @@ class UserFunctionVariable(BaseUserFunctionVariable):
             return collected
         return None
 
-    def is_python_equal(self, other: object) -> bool:
-        return isinstance(other, variables.UserFunctionVariable) and self.fn is other.fn
-
 
 class InspectSignatureVariable(UserFunctionVariable):
     """
@@ -1194,6 +1196,15 @@ class LocalGeneratorObjectVariable(VariableTracker):
 
     def python_type(self) -> type:
         return types.GeneratorType
+
+    def richcompare_impl(
+        self, tx: "InstructionTranslatorBase", other: VariableTracker, op: str
+    ) -> VariableTracker:
+        # Generators have no tp_richcompare: identity for ==/!=, TypeError for
+        # ordering.
+        from .object_protocol import object_richcompare
+
+        return object_richcompare(self, tx, other, op)
 
     def gen_send_ex2(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
@@ -1529,6 +1540,14 @@ class LocalGeneratorFunctionVariable(BaseUserFunctionVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        if isinstance(self.vt, SkipFunctionVariable):
+            unimplemented(
+                gb_type="generator function over a skipped function",
+                context=str(self.vt),
+                explanation="Cannot trace a generator whose underlying function is skipped by Dynamo "
+                "(e.g. defined in a skip-listed module), since its body cannot be symbolically traced.",
+                hints=[*graph_break_hints.FUNDAMENTAL],
+            )
         if not is_generator(self.vt.get_code()):
             unimplemented(
                 gb_type="non-generator contextlib.contextmanager",
@@ -1910,7 +1929,12 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
     def python_type(self) -> type[types.FunctionType]:
         return types.FunctionType
 
-    def get_function(self, _converting: set[int] | None = None) -> types.FunctionType:
+    def get_function(
+        self,
+        _converting: set[int] | None = None,
+        *,
+        allow_sourced_cells: bool = False,
+    ) -> types.FunctionType:
         # _converting is used a way to break cycles when
         # two nested_functions refer to each other.
         from .base import AsPythonConstantNotImplementedError
@@ -1924,7 +1948,7 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
             )
         _converting.add(self_id)
         try:
-            return self._get_function_impl(_converting)
+            return self._get_function_impl(_converting, allow_sourced_cells)
         except AsPythonConstantNotImplementedError as e:
             raise ClosureConversionError(
                 "failed to convert closure cell to Python constant"
@@ -1939,7 +1963,9 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
         except (NotImplementedError, Unsupported):
             return False
 
-    def _get_function_impl(self, _converting: set[int]) -> types.FunctionType:
+    def _get_function_impl(
+        self, _converting: set[int], allow_sourced_cells: bool
+    ) -> types.FunctionType:
         closure_cells = None
         if self.closure:
             from torch._dynamo.symbolic_convert import InstructionTranslator
@@ -1966,10 +1992,46 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                 # If the cell contents is a NestedUserFunctionVariable, call get_function
                 # directly to properly propagate the _converting set for cycle detection
                 if isinstance(cell_contents, NestedUserFunctionVariable):
-                    value = cell_contents.get_function(_converting)
-                else:
+                    value = cell_contents.get_function(
+                        _converting,
+                        allow_sourced_cells=allow_sourced_cells,
+                    )
+                    cells.append(make_cell(value))
+                    continue
+
+                try:
                     value = cell_contents.as_python_constant()
-                cells.append(make_cell(value))
+                    cells.append(make_cell(value))
+                    continue
+                except (NotImplementedError, Unsupported):
+                    if not allow_sourced_cells:
+                        raise ClosureConversionError(
+                            "failed to convert closure cell to Python constant"
+                        ) from None
+
+                # Non-constant closure cell (e.g. a class defined in a compiled
+                # region closing over a real object such as a TestCase
+                # instance). Only allow source-backed objects that have not
+                # been mutated during the trace, and pin their identity with
+                # an ID_MATCH guard. Materialize a real cell from the backing
+                # object and register it in side_effects mapping back to the
+                # traced VT, so that when methods of the built class are
+                # later inlined, bind_args reuses the original VT (preserving
+                # its source, guards, and identity) via load_cell. Only the
+                # __build_class__ path opts in; as_python_constant
+                # conversions must stay strict.
+                if not (
+                    isinstance(cell_contents, UserDefinedObjectVariable)
+                    and cell_contents.source is not None
+                    and not tx.output.side_effects.is_modified(cell_contents)
+                ):
+                    raise ClosureConversionError(
+                        "failed to convert closure cell to Python constant"
+                    )
+                value = cell_contents.guard_as_python_constant()
+                cell = make_cell(value)
+                tx.output.side_effects.track_cell_existing(None, cell, cell_contents)
+                cells.append(cell)
             closure_cells = tuple(cells)
 
         func = types.FunctionType(
@@ -2473,12 +2535,6 @@ class SkipFunctionVariable(VariableTracker):
             )
 
         return fn_var_getattr(tx, self.value, self.source, name)
-
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, VariableTracker)
-            and self.as_python_constant() == other.as_python_constant()
-        )
 
 
 class WrappedSkipFunctionVariable(SkipFunctionVariable):
@@ -3002,22 +3058,6 @@ class FunctoolsPartialVariable(VariableTracker):
         if self.original_cache_hash is not None:
             result.cache_hash = self.original_cache_hash  # type: ignore[missing-attribute]
         return result
-
-    def is_python_equal(self, other: object) -> bool:
-        return (
-            isinstance(other, FunctoolsPartialVariable)
-            and self.func.is_python_equal(other.func)
-            and all(
-                arg_a.is_python_equal(arg_b)
-                for (arg_a, arg_b) in zip(self.args, other.args)
-            )
-            and all(
-                value_a.is_python_equal(value_b)
-                for (value_a, value_b) in zip(
-                    self.keywords.values(), other.keywords.values()
-                )
-            )
-        )
 
 
 class PolyfilledFunctionVariable(VariableTracker):
@@ -3983,24 +4023,26 @@ class MethodWrapperVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        try:
-            method_wrapper = self.as_python_constant()
-        except NotImplementedError:
-            method_wrapper = None
-        if (
-            method_wrapper is not None
-            and is_tensor_base_attr_getter(method_wrapper)
-            and args
-            and isinstance(args[0], variables.TensorVariable)
-        ):
-            if not (len(args) == 1 and len(kwargs) == 0):
-                raise_type_error(
-                    tx, "tensor attribute getter takes exactly one argument"
-                )
-            # Avoid the generic descriptor path's implicit owner lookup, which
-            # would read __class__ on tensor subclasses during __torch_function__.
-            descriptor = cast(Any, method_wrapper.__self__)
-            return args[0].var_getattr(tx, descriptor.__name__)
+        # Only materialize the wrapper (which forces self.obj's python constant)
+        # for the tensor-getter special case; the generic path below dispatches
+        # via call_method and must not require a constant self.obj (e.g. a set /
+        # frozenset whose as_python_constant() re-hashes its keys).
+        if args and isinstance(args[0], variables.TensorVariable):
+            try:
+                method_wrapper = self.as_python_constant()
+            except NotImplementedError:
+                method_wrapper = None
+            if method_wrapper is not None and is_tensor_base_attr_getter(
+                method_wrapper
+            ):
+                if not (len(args) == 1 and len(kwargs) == 0):
+                    raise_type_error(
+                        tx, "tensor attribute getter takes exactly one argument"
+                    )
+                # Avoid the generic descriptor path's implicit owner lookup, which
+                # would read __class__ on tensor subclasses during __torch_function__.
+                descriptor = cast(Any, method_wrapper.__self__)
+                return args[0].var_getattr(tx, descriptor.__name__)
 
         return self.obj.call_method(tx, self.descriptor.__name__, list(args), kwargs)
 
@@ -4022,14 +4064,6 @@ class MethodWrapperVariable(VariableTracker):
         from .object_protocol import python_constant_richcompare_impl
 
         return python_constant_richcompare_impl(self, tx, other, op)
-
-    def is_python_equal(self, other: object) -> bool:
-        if not isinstance(other, VariableTracker):
-            return False
-        try:
-            return self.as_python_constant() == other.as_python_constant()
-        except NotImplementedError:
-            return False
 
 
 class MethodDescriptorVariable(VariableTracker):
@@ -4418,7 +4452,7 @@ class MemberDescriptorVariable(VariableTracker):
                 return obj.var_getattr(tx, attr_name)
         try:
             resolved = self.descriptor.__get__(obj_value)
-        except AttributeError:
+        except (AttributeError, TypeError):
             raise_observed_exception(
                 AttributeError,
                 tx,
@@ -4505,7 +4539,7 @@ class GetSetDescriptorVariable(VariableTracker):
                 return obj.var_getattr(tx, attr_name)
         try:
             resolved = self.descriptor.__get__(obj_value)
-        except AttributeError:
+        except (AttributeError, TypeError):
             raise_observed_exception(
                 AttributeError,
                 tx,
