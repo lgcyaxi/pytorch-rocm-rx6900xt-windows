@@ -8,6 +8,7 @@ import torch
 from torch.cuda._graph_annotations import (
     _get_stream_id,
     _is_tools_id_unavailable,
+    _rekey_annotations,
     clear_kernel_annotations,
     enable_annotations,
     get_kernel_annotations,
@@ -16,7 +17,13 @@ from torch.cuda._graph_annotations import (
     remap_to_exec_graph,
     resolve_pending_annotations,
 )
-from torch.testing._internal.common_utils import run_tests, skipIfRocm, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    skipIfRocm,
+    TestCase,
+)
 
 
 TEST_CUDA = torch.cuda.is_available()
@@ -30,6 +37,7 @@ except ImportError:
 
 
 # cuda.bindings is NVIDIA-only; graph annotation APIs have no ROCm equivalent.
+@instantiate_parametrized_tests
 @skipIfRocm
 @unittest.skipUnless(TEST_CUDA, "CUDA not available")
 @unittest.skipUnless(TEST_CUDA_BINDINGS, "cuda.bindings not available")
@@ -464,6 +472,124 @@ class TestMarkKernels(TestCase):
             self.assertEqual(ann["name"], "aux_branch")
             self.assertEqual(ann["stream"], expected_stream_id)
 
+    def _exec_graph_id(self, graph):
+        from cuda.bindings import runtime as cuda_runtime
+
+        handle = cuda_runtime.cudaGraphExec_t(init_value=graph.raw_cuda_graph_exec())
+        _, exec_graph_id = cuda_runtime.cudaGraphExecGetId(handle)
+        return exec_graph_id
+
+    @parametrize("keep_graph", [True, False])
+    def test_multiple_graphs_in_sequence_each_remapped(self, keep_graph):
+        """Several graphs captured in sequence, then resolved once and
+        remapped each, must all be annotated -- not just the last one.
+
+        Covers both keep_graph modes: with keep_graph=True the template
+        survives capture, with keep_graph=False it is destroyed -- the capture
+        id is recovered from the graph object either way.
+        """
+        graph_a = torch.cuda.CUDAGraph(keep_graph=keep_graph)
+        graph_b = torch.cuda.CUDAGraph(keep_graph=keep_graph)
+        x = torch.randn(8, device="cuda")
+
+        with torch.cuda.graph(graph_a):
+            with mark_kernels("graph_a"):
+                _ = x + 1
+
+        # Break in between, then capture a second graph with its own marks.
+        with torch.cuda.graph(graph_b):
+            with mark_kernels("graph_b"):
+                _ = x * 2
+
+        if keep_graph:
+            # keep_graph=False auto-instantiates at capture_end.
+            graph_a.instantiate()
+            graph_b.instantiate()
+
+        # Resolve the whole sequence once, then remap each graph.
+        resolve_pending_annotations()
+        remap_to_exec_graph(graph_a)
+        remap_to_exec_graph(graph_b)
+
+        exec_a = self._exec_graph_id(graph_a)
+        exec_b = self._exec_graph_id(graph_b)
+        self.assertNotEqual(exec_a, exec_b)
+
+        graph_ids_by_name: dict[str, set] = {}
+        for tools_id, anns in get_kernel_annotations().items():
+            self.assertEqual(len(anns), 1)
+            graph_ids_by_name.setdefault(anns[0]["str"], set()).add(tools_id >> 32)
+
+        self.assertIn("graph_a", graph_ids_by_name)
+        self.assertIn("graph_b", graph_ids_by_name)
+        # Each graph's annotations land under that graph's exec id, proving
+        # both -- not just the last -- were remapped correctly.
+        self.assertEqual(graph_ids_by_name["graph_a"], {exec_a})
+        self.assertEqual(graph_ids_by_name["graph_b"], {exec_b})
+
+    def _assert_keyed_to(self, exec_graph_id):
+        annotations = get_kernel_annotations()
+        self.assertGreater(len(annotations), 0)
+        for tools_id in annotations:
+            self.assertEqual(tools_id >> 32, exec_graph_id)
+
+    @parametrize("trigger", ["instantiate", "replay"])
+    def test_keep_graph_true_remaps_on_first_instantiation(self, trigger):
+        """With keep_graph=True the exec graph is not instantiated at
+        capture_end, so the context exit must not error and the remap must be
+        deferred until the graph is instantiated -- whether that happens via an
+        explicit instantiate() or implicitly on the first replay().
+        """
+        clear_kernel_annotations()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        x = torch.randn(8, device="cuda")
+
+        # Must not raise: previously __exit__ called raw_cuda_graph_exec() before
+        # instantiation, which errors when keep_graph=True.
+        with torch.cuda.graph(graph, enable_annotations=True):
+            with mark_kernels("kg"):
+                _ = x + 1
+
+        # Annotations are recorded but still keyed by the capture id until the
+        # exec graph exists.
+        self.assertGreater(len(get_kernel_annotations()), 0)
+
+        if trigger == "instantiate":
+            graph.instantiate()
+        else:
+            graph.replay()
+
+        self._assert_keyed_to(self._exec_graph_id(graph))
+
+    def test_keep_graph_true_reinstantiate_rekeys_annotations(self):
+        """keep_graph=True is meant for modifying the template and instantiating
+        again. Each instantiate() produces a fresh exec id, so annotations must
+        be rekeyed from the previous exec id to the new one on re-instantiation,
+        while a plain replay() (no new exec graph) leaves them unchanged.
+        """
+        clear_kernel_annotations()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        x = torch.randn(8, device="cuda")
+
+        with torch.cuda.graph(graph, enable_annotations=True):
+            with mark_kernels("kg"):
+                _ = x + 1
+
+        graph.instantiate()
+        exec1 = self._exec_graph_id(graph)
+        self._assert_keyed_to(exec1)
+
+        # Replay does not create a new exec graph: keys must stay on exec1.
+        graph.replay()
+        self.assertEqual(self._exec_graph_id(graph), exec1)
+        self._assert_keyed_to(exec1)
+
+        # Re-instantiate: a new exec id, annotations must follow it.
+        graph.instantiate()
+        exec2 = self._exec_graph_id(graph)
+        self.assertNotEqual(exec1, exec2)
+        self._assert_keyed_to(exec2)
+
     def test_mark_kernels_skips_preexisting_dependents_on_entry_frontier(self):
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
@@ -572,6 +698,43 @@ class TestGetGraphData(TestCase):
 
         with self.assertRaises(RuntimeError):
             g.get_graph_data()
+
+
+# Pure keying logic, exercised without a live capture so it runs on all of CI
+# (TestMarkKernels skips unless cuda-bindings/driver >= 13.1). A toolsId packs
+# the graph id in the upper 32 bits and the node id in the lower 32.
+class TestRekeyAnnotations(TestCase):
+    @staticmethod
+    def _tools_id(graph_id, node_id):
+        return (graph_id << 32) | node_id
+
+    def test_rekeys_matching_graph(self):
+        annotations = {self._tools_id(1, 10): ["a"], self._tools_id(1, 20): ["b"]}
+        remapped = _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
+        self.assertEqual(
+            remapped,
+            {self._tools_id(2, 10): ["a"], self._tools_id(2, 20): ["b"]},
+        )
+
+    def test_leaves_other_graphs_untouched(self):
+        other = self._tools_id(9, 10)
+        annotations = {self._tools_id(1, 10): ["a"], other: ["x"]}
+        remapped = _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
+        self.assertEqual(
+            remapped,
+            {self._tools_id(2, 10): ["a"], other: ["x"]},
+        )
+
+    def test_empty(self):
+        self.assertEqual(
+            _rekey_annotations({}, capture_graph_id=1, exec_graph_id=2), {}
+        )
+
+    def test_does_not_mutate_input_lists(self):
+        original = ["a"]
+        annotations = {self._tools_id(1, 10): original}
+        _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
+        self.assertEqual(original, ["a"])
 
 
 if __name__ == "__main__":

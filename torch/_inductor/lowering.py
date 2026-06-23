@@ -289,8 +289,8 @@ def decode_dtype(dtype: int | torch.dtype) -> torch.dtype:
     return dtype
 
 
-def is_integer_type(x: Any) -> TypeGuard[TensorBox | sympy.Expr | int]:
-    if isinstance(x, TensorBox):
+def is_integer_type(x: Any) -> TypeGuard[TensorBox | IRNode | sympy.Expr | int]:
+    if isinstance(x, (TensorBox, IRNode)):
         return is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     elif isinstance(x, sympy.Expr):
         return x.is_integer is True  # type: ignore[attr-defined]
@@ -298,8 +298,8 @@ def is_integer_type(x: Any) -> TypeGuard[TensorBox | sympy.Expr | int]:
         return isinstance(x, int)
 
 
-def is_boolean_type(x: Any) -> TypeGuard[TensorBox | bool]:
-    if isinstance(x, TensorBox):
+def is_boolean_type(x: Any) -> TypeGuard[TensorBox | IRNode | bool]:
+    if isinstance(x, (TensorBox, IRNode)):
         return is_boolean_dtype(x.get_dtype())
     else:
         return isinstance(x, bool)
@@ -583,6 +583,7 @@ def promote_constants(
     inputs: Sequence[_T],
     override_return_dtype: torch.dtype | None = None,
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None = None,
+    round_scalar_constants: bool = False,
 ) -> Sequence[_T | BaseView | BaseConstant]:
     if not (override_return_dtype is None or type_promotion_kind is None):
         raise AssertionError(
@@ -613,8 +614,10 @@ def promote_constants(
     ex = next(x for x in inputs if isinstance(x, (TensorBox, ExpandView, ir.Constant)))
     tensor_dtype = ex.get_dtype()
 
-    # Round scalar to tensor's dtype for comparison ops to match eager
-    if override_return_dtype == torch.bool and tensor_dtype in (
+    # Round scalar to tensor's dtype to match eager
+    if (
+        override_return_dtype == torch.bool or round_scalar_constants
+    ) and tensor_dtype in (
         torch.bfloat16,
         torch.float16,
     ):
@@ -2278,7 +2281,7 @@ def cat(inputs, dim=0):
     fusable_reduction = any(can_fuse_reduction(t, exclude) for t in inputs)
 
     def should_lower_cat_input(x) -> bool:
-        # Unrealized inputs will not be storage and layouts, and we dont want to realize
+        # Unrealized inputs will not be storage and layouts, and we don't want to realize
         # them in case we want to fuse
         if ir.is_storage_and_layout(x):
             storage, _ = ir.as_storage_and_layout(x, freeze=False)
@@ -7129,13 +7132,11 @@ def make_reduction(
 ) -> Callable[..., TensorBox]:
     def inner(x, axis=None, keepdims=False, *, dtype=None) -> TensorBox:
         # For argmax/argmin on boolean tensors, cast to int32 first to ensure
-        # correct comparison in Triton. See https://github.com/pytorch/pytorch/issues/174069
-        # Only apply on Triton backend; MPS handles bool comparisons natively.
-        if (
-            reduction_type in ("argmax", "argmin")
-            and x.get_dtype() == torch.bool
-            and is_triton(x)
-        ):
+        # correct comparison. Boolean comparisons can produce incorrect indices
+        # on multiple backends (Triton, CPU, etc.).
+        # See https://github.com/pytorch/pytorch/issues/174069
+        # and https://github.com/pytorch/pytorch/issues/184893
+        if reduction_type in ("argmax", "argmin") and x.get_dtype() == torch.bool:
             x = to_dtype(x, torch.int32)
         kwargs = _make_reduction_inner(
             x,
@@ -8356,7 +8357,21 @@ register_lowering(aten.clamp_max)(minimum)
 neg = register_pointwise(aten.neg)
 abs = register_pointwise(aten.abs)
 reciprocal = register_pointwise_numeric(aten.reciprocal)
-register_pointwise(aten.remainder)
+
+register_op_dtype_propagation_rules(
+    "remainder",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    override_return_dtype=None,
+)
+
+
+@register_lowering(aten.remainder, broadcast=True)
+def remainder(a, b):
+    a, b = promote_constants((a, b), round_scalar_constants=True)
+    fn = ops_wrapper("remainder")
+    return make_pointwise(fn)(a, b)
+
+
 sign = register_pointwise(aten.sign, override_fn_when_input_bool="identity")
 register_pointwise(aten.ceil)
 
