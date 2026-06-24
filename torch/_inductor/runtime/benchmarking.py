@@ -684,6 +684,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         if (
             device_type == "cuda"
             and inductor_config.autotune_cudagraph_benchmarking
+            and inductor_config.max_autotune
             and not self._in_cudagraph_benchmark
         ):
             try:
