@@ -608,8 +608,12 @@ __host__ __device__
 
 #if defined(C10_MOBILE) && C10_MOBILE
 #define C10_ALWAYS_INLINE_UNLESS_MOBILE inline
+// Mobile builds skip storage size overflow checks, so the relevant routines
+// cannot throw and may be marked noexcept.
+#define C10_NOEXCEPT_ON_MOBILE noexcept
 #else
 #define C10_ALWAYS_INLINE_UNLESS_MOBILE C10_ALWAYS_INLINE
+#define C10_NOEXCEPT_ON_MOBILE
 #endif
 
 #if !defined(FBCODE_CAFFE2) && !defined(C10_NODEPRECATED)

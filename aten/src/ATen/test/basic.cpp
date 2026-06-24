@@ -12,6 +12,7 @@ struct THFloatTensor;
 
 #include <iostream>
 #include <chrono>
+#include <limits>
 // NOLINTNEXTLINE(modernize-deprecated-headers)
 #include <string.h>
 #include <sstream>
@@ -535,3 +536,14 @@ TEST(BasicTest, TestForBlobStridesResizeCPU) {
   auto te = *at::expand_size(t, {3, 3});
   ASSERT_EQ(te[1][1].item<int32_t>(), 5);
 }
+
+#ifndef C10_MOBILE
+TEST(BasicTest, TestForBlobStridesOverflowCPU) {
+  // Strides large enough to overflow the storage size computation must throw.
+  // Overflow checks are compiled out on mobile, hence the guard above.
+  std::array<int32_t, 6> storage;
+  const auto huge = std::numeric_limits<int64_t>::max();
+  ASSERT_THROWS(
+      at::for_blob(storage.data(), {2,}).strides({huge,}).options(c10::TensorOptions(kInt)).make_tensor());
+}
+#endif
