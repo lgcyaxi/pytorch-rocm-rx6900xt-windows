@@ -171,6 +171,7 @@ dtensor_fails = {
     xfail("tensor_split"),
     # output_specs count mismatch in unsafe_split strategy
     xfail("unsafe_split"),
+    xfail("torch.ops.aten._scaled_dot_product_flash_attention_for_cpu"),
     # /TODO(whc) debug/triage
     # ops inside this might even fail without dtensor
     # tests, as we rescale op db common test size factor (i.e. L, M, S)
@@ -867,6 +868,7 @@ ops_unbacked_dtensor_dde = {
     xfail("view"),
     xfail("view_as"),
     xfail("view_as_complex"),
+    xfail("torch.ops.aten._scaled_dot_product_flash_attention_for_cpu"),
 }
 
 
