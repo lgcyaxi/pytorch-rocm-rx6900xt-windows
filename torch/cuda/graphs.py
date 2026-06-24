@@ -103,15 +103,38 @@ class CUDAGraph(_CUDAGraph):
     """
 
     _tracker: _CUDAGraphInputLivenessTracker | None
-    # Stays None unless mark_kernels stamps it during capture (requires
-    # annotations enabled and cudaGraphNodeGetToolsId available).
+    # Read-only property exposed from the C++ _CUDAGraph base via pybind;
+    # annotated (not assigned) so the type checker sees it without shadowing it.
+    _has_graph_exec: bool
+    # Stays None unless maybe_stamp_capture_graph_id stamps it during capture_end
+    # (requires annotations enabled and cudaGraphNodeGetToolsId available).
     _capture_graph_id: int | None
+    # Exec graph id the recorded annotations are currently keyed to, or None
+    # before the first remap. Lets a re-instantiate (which produces a fresh exec
+    # id) rekey annotations from the previous exec id to the new one.
+    _remapped_exec_id: int | None
+    _keep_graph: bool
 
     def __new__(cls, keep_graph: bool = False) -> Self:
         instance = super().__new__(cls, keep_graph)
         instance._tracker = None
         instance._capture_graph_id = None
+        instance._remapped_exec_id = None
+        instance._keep_graph = keep_graph
         return instance
+
+    def _maybe_remap_annotations(self) -> None:
+        # Remap recorded kernel annotations to the current exec graph id. No-op
+        # unless a capture id was stamped (annotations enabled). Called from
+        # instantiate() -- which replay() routes through for keep_graph=True --
+        # so every fresh exec graph (each instantiate() produces a new exec id)
+        # rekeys the annotations; remap_to_exec_graph self-skips when the exec id
+        # is unchanged.
+        if self._capture_graph_id is None:
+            return
+        from torch.cuda._graph_annotations import remap_to_exec_graph
+
+        remap_to_exec_graph(self)
 
     def __del__(self) -> None:
         try:
@@ -161,6 +184,19 @@ class CUDAGraph(_CUDAGraph):
             self._tracker = _CUDAGraphInputLivenessTracker()
             self._tracker.start()
 
+    def capture_end_pre(self) -> None:
+        r"""End capture but do not finalize: leaves the captured ``cudaGraph_t``
+        live (for both ``keep_graph`` modes) so it can be inspected before
+        :meth:`capture_end_post` instantiates and/or destroys it."""
+        super().capture_end_pre()
+
+    def capture_end_post(self) -> None:
+        r"""Finalize a capture started by :meth:`capture_end_pre`: instantiate
+        and destroy the template when ``keep_graph=False``."""
+        super().capture_end_post()
+        if self._tracker is not None:
+            self._tracker.stop()
+
     def capture_end(self) -> None:
         r"""End CUDA graph capture on the current stream.
 
@@ -170,9 +206,16 @@ class CUDAGraph(_CUDAGraph):
         Use :class:`~torch.cuda.graph` or :func:`~torch.cuda.make_graphed_callables`,
         which call ``capture_end`` internally.
         """
-        super().capture_end()
-        if self._tracker is not None:
-            self._tracker.stop()
+        self.capture_end_pre()
+        # Stamp the capture graph id while the template is live (both keep_graph
+        # modes); self-gates on annotations being enabled. An error here is
+        # unexpected and propagates -- we deliberately don't wrap this in a
+        # finally that calls capture_end_post(), since a failing finalize would
+        # mask the real (stamp) error.
+        from torch.cuda._graph_annotations import maybe_stamp_capture_graph_id
+
+        maybe_stamp_capture_graph_id(self)
+        self.capture_end_post()
 
     def instantiate(self) -> None:
         r"""Instantiate the CUDA graph. Will be called by
@@ -182,11 +225,17 @@ class CUDAGraph(_CUDAGraph):
         by ``raw_cuda_graph``.
         """
         super().instantiate()
+        self._maybe_remap_annotations()
 
     def replay(self) -> None:
         r"""Replay the CUDA work captured by this graph."""
         if self._tracker is not None:
             self._tracker.check_alive(self.pool())
+        # With keep_graph=True the exec graph is instantiated on demand here on
+        # the first replay; the C++ replay() requires it to already exist. The
+        # annotation remap rides on instantiate(), so it is handled by that call.
+        if not self._has_graph_exec:
+            self.instantiate()
         super().replay()
 
     def reset(self) -> None:
@@ -195,6 +244,7 @@ class CUDAGraph(_CUDAGraph):
             self._tracker.stop()
             self._tracker = None
         self._capture_graph_id = None
+        self._remapped_exec_id = None
         super().reset()
 
     def pool(self) -> _POOL_HANDLE:
@@ -482,7 +532,10 @@ class graph:
         self.cuda_graph.capture_end()
         self.stream_ctx.__exit__(*args)
 
-        if self._enable_annotations:
+        # With keep_graph=True the exec graph is not instantiated by
+        # capture_end(), so there is no exec graph id to remap against yet. The
+        # remap is deferred to the graph's instantiate()/replay() in that case.
+        if self._enable_annotations and not self.cuda_graph._keep_graph:
             from torch.cuda._graph_annotations import remap_to_exec_graph
 
             remap_to_exec_graph(self.cuda_graph)
