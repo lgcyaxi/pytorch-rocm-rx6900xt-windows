@@ -1041,7 +1041,7 @@ def _snapshot(device: "Device" = None, augment_with_fx_traces=False):
             # The size of reserved memory is the sum of all Segments.
             # Segments are cached and reused for future allocations.
             # If the reuse is smaller than the segment, the segment
-            # is split into more then one Block.
+            # is split into more than one Block.
             # empty_cache() frees Segments that are entirely inactive.
             address: int
             total_size: int  #  cudaMalloc'd size of segment
@@ -1099,7 +1099,7 @@ def _snapshot(device: "Device" = None, augment_with_fx_traces=False):
                 "oom",  # the allocator threw an OOM exception. 'size' is
                 # the requested number of bytes that did not succeed
                 "snapshot",  # the allocator generated a memory snapshot
-                # useful to coorelate a previously taken
+                # useful to correlate a previously taken
                 # snapshot with this trace
             ]
             addr: int  # not present for OOM
@@ -1436,12 +1436,33 @@ def _use_uvm(device: "Device" = None):
                 _advise_uses_struct = False
         return _runtime.cudaMemAdvise(ptr, size, advice, device_id)
 
+    _uvm_advise_supported_cache: dict[tuple[int, int], bool] = {}
+
+    def _device_supports_uvm_advise(device_id, _runtime=_rt):
+        cache_key = (device_id, id(_runtime))
+        if cache_key in _uvm_advise_supported_cache:
+            return _uvm_advise_supported_cache[cache_key]
+        attr = getattr(
+            _runtime.cudaDeviceAttr, "cudaDevAttrConcurrentManagedAccess", None
+        )
+        if attr is None:
+            supported = False
+        else:
+            result = _runtime.cudaDeviceGetAttribute(attr, device_id)
+            err = result if not isinstance(result, tuple) else result[0]
+            if err != _runtime.cudaError_t.cudaSuccess:
+                supported = False
+            else:
+                supported = bool(result[1])
+        _uvm_advise_supported_cache[cache_key] = supported
+        return supported
+
     def _uvm_alloc(size, device, stream, _runtime=_rt):
         try:
             err, ptr = _runtime.cudaMallocManaged(size, _runtime.cudaMemAttachGlobal)
             _check(err, f"cudaMallocManaged({size})")
             ptr = int(ptr)
-            if device >= 0:
+            if device >= 0 and _device_supports_uvm_advise(device, _runtime):
                 _check(
                     _mem_advise(
                         ptr,
