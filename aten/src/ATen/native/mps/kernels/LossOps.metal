@@ -42,6 +42,7 @@ static inline T logsumexp(T first, Ts... rest) {
 }
 
 template <typename T, typename T_target, typename T_index>
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void ctc_loss(
     device T* loss [[buffer(0)]],
     device T* log_alpha [[buffer(1)]],
