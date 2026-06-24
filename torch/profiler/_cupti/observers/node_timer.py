@@ -3,17 +3,17 @@
 
 The smallest real consumer of the monitor: registers for one or more activity
 kinds with just the compact fields needed for timing (START, END,
-GRAPH_NODE_ID) and buffers the raw per-kernel spans the monitor's worker thread
-delivers. :meth:`NodeTimerObserver.drain` returns them as flat numpy columns
-``(graph_node_id, start_ns, end_ns)`` -- consumers aggregate or bucket as they
-need (e.g. total duration per node, or kernels bucketed into training steps by
-start time), staying vectorized.
+GRAPH_NODE_ID, STREAM_ID) and buffers the raw per-kernel spans the monitor's
+worker thread delivers. :meth:`NodeTimerObserver.drain` returns them as flat numpy
+columns ``(graph_node_id, start_ns, end_ns, stream_id)`` -- consumers aggregate or
+bucket as they need (e.g. total duration per node, or kernels bucketed into training
+steps by start time, or split per stream), staying vectorized.
 
 By default only CONCURRENT_KERNEL is timed -- the common case. Opt into MEMCPY /
-MEMSET via ``kinds`` to time those nodes too. Every kind here times the same 3
-fields (START, END, GRAPH_NODE_ID), so all records are one size and the monitor
-decodes them via its vectorized stride + kind-dispatch path; this observer just
-buffers the raw columns (the cost is in the monitor's decode, not here).
+MEMSET via ``kinds`` to time those nodes too. Every kind here times the same 4
+fields (START, END, GRAPH_NODE_ID, STREAM_ID), so all records are one size and the
+monitor decodes them via its vectorized stride + kind-dispatch path; this observer
+just buffers the raw columns (the cost is in the monitor's decode, not here).
 
 Durations are keyed by graph_node_id alone, kind-agnostic: each CUDA-graph node
 is a single op, so its kind is unambiguous. Eager (non-graph) activities report
@@ -61,22 +61,26 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
-# kind -> (start_field_id, end_field_id, graph_node_field_id) for duration timing.
-_TIMED_FIELDS: dict[int, tuple[int, int, int]] = {
+# kind -> (start_field_id, end_field_id, graph_node_field_id, stream_field_id) for
+# duration timing. stream lets consumers attribute spans to their CUDA stream.
+_TIMED_FIELDS: dict[int, tuple[int, int, int, int]] = {
     int(ActivityKind.CONCURRENT_KERNEL): (
         int(Kernel.START),
         int(Kernel.END),
         int(Kernel.GRAPH_NODE_ID),
+        int(Kernel.STREAM_ID),
     ),
     int(ActivityKind.MEMCPY): (
         int(Memcpy.START),
         int(Memcpy.END),
         int(Memcpy.GRAPH_NODE_ID),
+        int(Memcpy.STREAM_ID),
     ),
     int(ActivityKind.MEMSET): (
         int(Memset.START),
         int(Memset.END),
         int(Memset.GRAPH_NODE_ID),
+        int(Memset.STREAM_ID),
     ),
 }
 
@@ -84,7 +88,7 @@ _EXTERNAL = int(ActivityKind.EXTERNAL_CORRELATION)
 
 
 class NodeTimerObserver(CuptiMonitorObserver):
-    """Buffers raw per-activity ``(graph_node_id, start_ns, end_ns)`` spans the
+    """Buffers raw per-activity ``(graph_node_id, start_ns, end_ns, stream_id)`` spans the
     monitor delivers; :meth:`drain` returns them as flat numpy columns. Construct with
     ``annotations=ObserverAnnotationSettings(...)`` and :meth:`drain_annotated` returns
     ``{name: [(start_ns, end_ns), ...]}``. See the module docstring."""
@@ -106,9 +110,9 @@ class NodeTimerObserver(CuptiMonitorObserver):
             )
         self._lock = threading.Lock()
         # Raw span column chunks as the worker thread delivers them: each is
-        # (graph_node_id, start, end, correlation_id|None -- the id only when eager).
-        # Kept raw (not pre-aggregated) so consumers can build per-kernel timing on top.
-        self._chunks: list[tuple[Any, Any, Any, Any]] = []
+        # (graph_node_id, start, end, stream, correlation_id|None -- the id only when
+        # eager). Kept raw (not pre-aggregated) so consumers build per-kernel timing on top.
+        self._chunks: list[tuple[Any, Any, Any, Any, Any]] = []
         # EXTERNAL_CORRELATION chunks (external_id, correlation_id) for the eager name
         # join; only populated when eager naming is on.
         self._ext_chunks: list[tuple[Any, Any]] = []
@@ -121,7 +125,7 @@ class NodeTimerObserver(CuptiMonitorObserver):
     def _on_activities(self, columns: dict[Any, dict[int, Any]]) -> None:
         # Worker thread: just stash the columns (cheap append); grouping/joining
         # happens after drain, off this hot path.
-        spans: list[tuple[Any, Any, Any, Any]] = []
+        spans: list[tuple[Any, Any, Any, Any, Any]] = []
         exts: list[tuple[Any, Any]] = []
         for kind, cols in columns.items():
             k = int(kind)
@@ -136,12 +140,17 @@ class NodeTimerObserver(CuptiMonitorObserver):
             spec = _TIMED_FIELDS.get(k)
             if spec is None:
                 continue
-            sf, ef, gf = spec
-            start, end, gnode = cols.get(sf), cols.get(ef), cols.get(gf)
-            if start is None or end is None or gnode is None:
+            sf, ef, gf, stf = spec
+            start, end, gnode, stream = (
+                cols.get(sf),
+                cols.get(ef),
+                cols.get(gf),
+                cols.get(stf),
+            )
+            if start is None or end is None or gnode is None or stream is None:
                 continue
             corr = cols.get(CORRELATION_FIELD[k]) if self._eager else None
-            spans.append((gnode, start, end, corr))
+            spans.append((gnode, start, end, stream, corr))
         if spans or exts:
             with self._lock:
                 self._chunks.extend(spans)
@@ -174,10 +183,10 @@ class NodeTimerObserver(CuptiMonitorObserver):
             ext_chunks, self._ext_chunks = self._ext_chunks, []
         return chunks, ext_chunks
 
-    def drain(self, flush: bool = False) -> tuple[Any, Any, Any]:
-        """Return the raw per-activity spans delivered since the last call as three
-        parallel numpy columns ``(graph_node_id, start_ns, end_ns)`` (dtypes
-        ``<u8, <i8, <i8``), and reset. Empty -> three length-0 arrays.
+    def drain(self, flush: bool = False) -> tuple[Any, Any, Any, Any]:
+        """Return the raw per-activity spans delivered since the last call as four
+        parallel numpy columns ``(graph_node_id, start_ns, end_ns, stream_id)`` (dtypes
+        ``<u8, <i8, <i8, <u8``), and reset. Empty -> four length-0 arrays.
 
         Flat and vectorized on purpose: consumers bucket/aggregate with numpy
         (e.g. ``bincount``/``searchsorted``) without a Python loop over the (~50k)
@@ -200,11 +209,13 @@ class NodeTimerObserver(CuptiMonitorObserver):
                 np.empty(0, dtype="<u8"),
                 np.empty(0, dtype="<i8"),
                 np.empty(0, dtype="<i8"),
+                np.empty(0, dtype="<u8"),
             )
         gnode = np.concatenate([c[0] for c in chunks]).astype("<u8", copy=False)
         start = np.concatenate([c[1] for c in chunks]).astype("<i8", copy=False)
         end = np.concatenate([c[2] for c in chunks]).astype("<i8", copy=False)
-        return gnode, start, end
+        stream = np.concatenate([c[3] for c in chunks]).astype("<u8", copy=False)
+        return gnode, start, end, stream
 
     def drain_annotated(self, flush: bool = False) -> dict[str, list[tuple[int, int]]]:
         """Resolve the spans delivered since the last call to region names and
@@ -246,7 +257,7 @@ class NodeTimerObserver(CuptiMonitorObserver):
         # here we just keep those that name a region (in `names`) and map their
         # correlation ids.
         if self._eager and names:
-            corr = np.concatenate([c[3] for c in chunks]).astype("<u8", copy=False)
+            corr = np.concatenate([c[4] for c in chunks]).astype("<u8", copy=False)
             corr_to_ext: dict[int, int] = {}
             for eid_col, corr_col in ext_chunks:
                 for eid, c in zip(eid_col.tolist(), corr_col.tolist()):

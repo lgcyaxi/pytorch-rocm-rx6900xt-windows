@@ -57,20 +57,22 @@ class TestCuptiNodeTimerCUDA(TestCase):
             # drain()'s own flush is plain/best-effort, so deterministically deliver
             # everything via the monitor's sync flush, then drain.
             obs._monitor.flush(sync=True)
-            gnode, start, end = obs.drain()
+            gnode, start, end, stream = obs.drain()
             # drain() resets; with no new work the next drain is empty.
-            _, start2, _ = obs.drain()
+            _, start2, _, _ = obs.drain()
         finally:
             obs.close()
 
         self.assertGreater(len(start), 0)
         self.assertEqual(len(start), len(end))
         self.assertEqual(len(gnode), len(start))
+        self.assertEqual(len(stream), len(start))
         self.assertEqual(len(start2), 0)
         # durations are non-negative, and the columns have the documented dtypes.
         self.assertTrue(bool((end >= start).all()))
         self.assertEqual(gnode.dtype, np.dtype("<u8"))
         self.assertEqual(start.dtype, np.dtype("<i8"))
+        self.assertEqual(stream.dtype, np.dtype("<u8"))
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_node_timer_drain_annotated_eager(self):
