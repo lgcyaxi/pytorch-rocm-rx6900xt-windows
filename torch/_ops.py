@@ -5,7 +5,6 @@ import ctypes
 import importlib
 import inspect
 import sys
-import threading
 import types
 from collections.abc import Callable, Iterator
 from functools import cached_property
@@ -32,30 +31,6 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T", default=Any)
 _P = ParamSpec("_P", default=...)
-
-
-# TLS holding the active redispatch chain entry: [op, chain, idx]
-# where op is the target OpOverload, chain is a tuple of callables
-# (autograd_impl, [adinplaceorview_impl,] backend_dispatch), and idx
-# is the next position to dispatch.
-_redispatch_chain_tls = threading.local()
-_fast_redispatch_count: int = 0
-
-
-def _set_fast_redispatch(op: "OpOverload", chain: tuple):
-    """Set up fast redispatch chain. Returns previous entry for restore.
-
-    Split into set/unset instead of a context manager to avoid __enter__/__exit__
-    overhead on the custom_op fast path.
-    """
-    prev = getattr(_redispatch_chain_tls, "entry", None)
-    _redispatch_chain_tls.entry = [op, chain, 0]
-    return prev
-
-
-def _unset_fast_redispatch(prev):
-    """Restore previous redispatch chain entry."""
-    _redispatch_chain_tls.entry = prev
 
 
 # Query `hasattr` only once.
@@ -563,6 +538,7 @@ class HigherOrderOperator(OperatorBase, abc.ABC):
             return torch.overrides.handle_torch_function(
                 self, flat_args, *args, **kwargs
             )
+        del flat_args
 
         dispatch_key_set = _compute_keyset(args, kwargs, self.non_fallthrough_keys)
         return self.dispatch(dispatch_key_set.highestPriorityTypeId(), *args, **kwargs)
@@ -904,14 +880,6 @@ class OpOverload(OperatorBase, Generic[_P, _T]):
     def redispatch(
         self, /, keyset: torch._C.DispatchKeySet, *args: _P.args, **kwargs: _P.kwargs
     ) -> _T:
-        global _fast_redispatch_count
-        entry = getattr(_redispatch_chain_tls, "entry", None)
-        if entry is not None:
-            target_op, chain, idx = entry
-            if target_op is self and idx < len(chain):
-                entry[2] += 1
-                _fast_redispatch_count += 1
-                return chain[idx](keyset, *args, **kwargs)
         return self._handle.redispatch_boxed(keyset, *args, **kwargs)  # type: ignore[return-value]
 
     def __hash__(self):
@@ -1315,6 +1283,9 @@ class OpOverloadPacket(Generic[_P, _T]):
     def overloads(self):
         return [n if n else "default" for n in self._overload_names]
 
+    def op_overloads(self):
+        return [getattr(self, n) for n in self.overloads()]
+
 
 # Note - this mirrors the logic of the cpp_function defined in jit/python/init.cpp
 # _jit_get_operations, which calls _get_operation_for_overload_or_packet.
@@ -1330,7 +1301,7 @@ def _call_overload_packet_from_python(
         return ret
 
     # The following mirrors getOpWithStack.
-    # In cpp, we do a schema matching for the arguments, and call ToIValue to
+    # In cpp, we do a schema matching for the arguments, and call ToIValue
     # to check whether the arguments are valid. But need to do similar things here
     # and check the schema whether the FakeScriptObject is the corresponding fake class
     # of the actual class used in schema.

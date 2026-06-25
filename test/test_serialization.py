@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import torch._dynamo.config
 from torch.utils.serialization import config as serialization_config
 from torch._subclasses.fake_tensor import FakeTensorMode, FakeTensorConverter
 from torch._utils import _rebuild_tensor
@@ -1033,6 +1034,7 @@ class ClassThatUsesBuildInstructionSomeSlots(ClassThatUsesBuildInstructionAllSlo
 
 class TestBothSerialization(TestCase):
     @parametrize("weights_only", (True, False))
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_serialization_new_format_old_format_compat(self, device, weights_only):
         x = [torch.ones(200, 200, device=device) for i in range(30)]
 
@@ -5022,6 +5024,51 @@ class TestSerialization(TestCase, SerializationMixin):
                  torch.zeros(99, dtype=torch.long), 0),
                 False, None,
             )
+
+    def test_weights_only_validate_sparse(self):
+        # weights_only=True always validates sparse tensor invariants (with a
+        # warning that it may be slow) so a malformed checkpoint cannot slip an
+        # out-of-bounds index past the loader. weights_only=False keeps the
+        # historical behaviour of deferring to the global
+        # check_sparse_tensor_invariants setting.
+        good = torch.sparse_coo_tensor(
+            torch.tensor([[0, 1]]), torch.tensor([1.0, 2.0]), (2,),
+        )
+        bad = torch.sparse_coo_tensor(
+            torch.tensor([[0, 999]]), torch.tensor([1.0, 2.0]), (2,),
+            check_invariants=False,
+        )
+        good_buf = io.BytesIO()
+        torch.save({"s": good}, good_buf)
+        bad_buf = io.BytesIO()
+        torch.save({"s": bad}, bad_buf)
+
+        # weights_only=True catches the OOB index
+        bad_buf.seek(0)
+        with self.assertRaisesRegex(RuntimeError, "size is inconsistent with indices"):
+            torch.load(bad_buf, weights_only=True)
+
+        # weights_only=True on a well-formed checkpoint round-trips
+        good_buf.seek(0)
+        with self.assertWarnsRegex(UserWarning, "weights_only=True"):
+            out = torch.load(good_buf, weights_only=True)
+        self.assertEqual(out["s"].to_dense(), good.to_dense())
+
+        # weights_only=False keeps today's behaviour: falls back to the global
+        # check_sparse_tensor_invariants setting. The test framework
+        # force-enables that global, so explicitly disable it to exercise the
+        # "global off" path.
+        bad_buf.seek(0)
+        with torch.sparse.check_sparse_tensor_invariants(False):
+            out = torch.load(bad_buf, weights_only=False)
+        self.assertEqual(out["s"]._nnz(), 2)
+
+        # And with the global on, weights_only=False does validate by
+        # default (today's behaviour, preserved).
+        bad_buf.seek(0)
+        with torch.sparse.check_sparse_tensor_invariants(True):
+            with self.assertRaisesRegex(RuntimeError, "size is inconsistent with indices"):
+                torch.load(bad_buf, weights_only=False)
 
     def run(self, *args, **kwargs):
         with serialization_method(use_zip=True):

@@ -29,6 +29,7 @@ from operator import mul
 from typing import TYPE_CHECKING
 
 import torch
+import torch._dynamo.config
 import torch.autograd._functions
 import torch.autograd.forward_ad as fwAD
 from torch import inf, nan, nn
@@ -791,6 +792,7 @@ class TestAutograd(TestCase):
             unpack_hook_ref = scope()
             self.assertIsNone(unpack_hook_ref())
 
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_will_engine_execute_node(self):
         counter = [0]
 
@@ -5263,6 +5265,7 @@ SinBackward0, MulBackward0, torch::autograd::AccumulateGrad
         for h in all_hooks:
             h.remove()
 
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     @skipIfWindows(msg="node name demangling inconsistent on windows")
     def test_backward_hook_relative_ordering(self):
         order = []
@@ -10202,22 +10205,10 @@ for shape in [(1,), ()]:
         ):
             Func.apply(b)
 
-    def test_named_tensor_for_complex_views(self):
-        names = ["batch", "height", "width", "complex"]
-        z = torch.ones((2, 1, 2, 2), requires_grad=True)
-        z_named = z.refine_names(*names)
-        z_complex = torch.view_as_complex(z_named.rename(None)).refine_names(
-            *names[:-1]
-        )
-        z_complex.sum().abs().backward()
-        expected = torch.ones_like(z_complex).rename(None)
-        abs_1_1j = abs(1 + 1j)
-        expected.fill_(complex(abs_1_1j / 2, abs_1_1j / 2))
-        self.assertEqual(z.grad, torch.view_as_real(expected))
-
     @unittest.skipIf(
         TEST_WITH_TORCHDYNAMO and sys.version_info >= (3, 14), "Fails in python 3.14.2"
     )
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_custom_function_saving_mutated_view_no_leak(self):
         class Test(torch.autograd.Function):
             @staticmethod
@@ -15615,6 +15606,18 @@ class TestMultithreadAutograd(TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "blah"):
             out.backward()
+
+    def test_remove_obj_from_tls(self):
+        # Regression test for deadlock introduced by
+        # https://github.com/pytorch/pytorch/pull/173568.
+        # _remove_obj_from_tls must erase the key from the C++ thread_local
+        # map so that no SafePyObject survives to thread exit (where its
+        # destructor would try to acquire the GIL via __call_tls_dtors,
+        # risking deadlock when another thread holds the GIL).
+        torch._C._stash_obj_in_tls("test_obj", {"dummy": True})
+        self.assertTrue(torch._C._is_key_in_tls("test_obj"))
+        torch._C._remove_obj_from_tls("test_obj")
+        self.assertFalse(torch._C._is_key_in_tls("test_obj"))
 
 
 class TestNestedCheckpoint(TestCase):

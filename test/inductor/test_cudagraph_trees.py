@@ -1719,7 +1719,7 @@ if HAS_CUDA_AND_TRITON:
             self.assertEqual(len(list(node.path_live_weakrefs())), 0)
             self.assertFalse(self.get_manager().new_graph_id().id == 0)
 
-        def test_aliasing_static_ref(self):
+        def _test_aliasing_static_ref(self):
             class Mod(torch.nn.Linear):
                 def forward(self, x):
                     return self.weight.T @ x, self.weight.T, self.weight[0:4]
@@ -1756,6 +1756,13 @@ if HAS_CUDA_AND_TRITON:
             else:
                 self.assertFalse(first_node.unaliased_in_all_paths[0])
                 self.assertTrue(first_node.cached_tensor_outputs[0] is None)
+
+        def test_aliasing_static_ref(self):
+            self._test_aliasing_static_ref()
+
+        @torch._inductor.config.patch("graph_partition", False)
+        def test_aliasing_static_ref_no_graph_partition(self):
+            self._test_aliasing_static_ref()
 
         @torch._inductor.config.patch("implicit_fallbacks", True)
         def test_multinomial(self):
@@ -2093,7 +2100,7 @@ if HAS_CUDA_AND_TRITON:
         @blas_library_context("cublas")
         @unittest.mock.patch.dict(os.environ, {"TORCH_DISABLE_ADDR2LINE": "0"})
         def test_workspace_allocation_error(self):
-            torch._C._cuda_clearCublasWorkspaces()
+            torch.cuda._clear_cublas_workspaces()
 
             prev = torch._inductor.cudagraph_trees.clear_cublas_manager
 
@@ -2133,7 +2140,7 @@ if HAS_CUDA_AND_TRITON:
                 self.assertTrue(thrown)
 
             finally:
-                torch._C._cuda_clearCublasWorkspaces()
+                torch.cuda._clear_cublas_workspaces()
                 torch._inductor.cudagraph_trees.clear_cublas_manager = prev
                 torch._inductor.cudagraph_trees.get_container(
                     self.device_idx
@@ -3897,6 +3904,53 @@ if HAS_CUDA_AND_TRITON:
                 _out = f_compiled(x, y)
             self.assertEqual(self.get_manager() is None, True)
 
+        @torch._inductor.config.patch("graph_partition", False)
+        def test_view_only_cuda_graph_suppresses_empty_warning(self):
+            counters.clear()
+
+            def fn(x):
+                return x.reshape(1, -1, 4)
+
+            x = torch.randn(6, 4, device="cuda")
+            compiled_fn = torch.compile(fn, fullgraph=True)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                for _ in range(3):
+                    actual = compiled_fn(x)
+                    torch.cuda.synchronize()
+
+            self.assertEqual(actual, fn(x))
+            self.assertFalse(
+                any("CUDA Graph is empty" in str(w.message) for w in caught)
+            )
+            self.assertEqual(
+                counters["inductor"]["cudagraph_recorded_non_static_inputs"], 1
+            )
+            self.assertIsNotNone(self.get_manager())
+
+        @torch._inductor.config.patch("triton.slow_path_cudagraph_asserts", True)
+        def test_kernel_free_allocation_uses_cudagraph_pool(self):
+            def fn(x):
+                return torch.empty_like(x)
+
+            for graph_partition in (False, True):
+                torch._dynamo.reset()
+                x = torch.randn(6, 4, device="cuda")
+                with (
+                    torch._inductor.config.patch("graph_partition", graph_partition),
+                    warnings.catch_warnings(record=True) as caught,
+                ):
+                    warnings.simplefilter("always")
+                    compiled_fn = torch.compile(fn, fullgraph=True)
+                    for _ in range(3):
+                        actual = compiled_fn(x)
+                        torch.cuda.synchronize()
+
+                self.assertEqual(actual.shape, x.shape)
+                self.assertFalse(
+                    any("CUDA Graph is empty" in str(w.message) for w in caught)
+                )
+
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_forward_backward(self):
             class Mod(torch.nn.Module):
@@ -4605,11 +4659,11 @@ if HAS_CUDA_AND_TRITON:
 
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_reorder_cpu_and_gpu_interleave(self):
-            def f(x_cuda, y_cpu, z_cuda, bias_cuda, weight_cuda, weight_cpu):
+            def f(x_cuda, y_cpu, z_cuda, weight_cuda, weight_cpu):
                 # partition 1 on cuda, no dependency
                 x_cuda0 = x_cuda + 1
                 x_cuda1 = x_cuda0 @ weight_cuda
-                x_cuda2 = 2 * (x_cuda1 + bias_cuda)
+                x_cuda2 = 2 * (x_cuda1 + x_cuda)
 
                 # partition 2 on cpu w/ dependency on partition 1
                 y_cpu0 = y_cpu + 1
@@ -4619,7 +4673,7 @@ if HAS_CUDA_AND_TRITON:
                 # partition 3 on cuda w/o dependency
                 z_cuda0 = z_cuda + 1
                 z_cuda1 = z_cuda0 @ weight_cuda
-                z_cuda2 = 2 * (z_cuda1 + bias_cuda)
+                z_cuda2 = 2 * (z_cuda1 + z_cuda)
 
                 # partition 4 on cpu w/o dependency
                 y_cpu2 = y_cpu + 5
@@ -4628,25 +4682,22 @@ if HAS_CUDA_AND_TRITON:
                 # partition 5 on cuda w/o dependency
                 u_cuda0 = z_cuda + 3
                 u_cuda1 = u_cuda0 @ weight_cuda
-                u_cuda2 = 2 * (u_cuda1 + bias_cuda)
+                u_cuda2 = 2 * (u_cuda0 + u_cuda1)
 
                 return x_cuda2, y_cpu1, z_cuda2, y_cpu3, u_cuda2
 
             x_cuda = torch.randn(3, 3, device="cuda")
             y_cpu = torch.randn(3, 3, device="cpu")
             z_cuda = torch.randn(3, 3, device="cuda")
-            # Keep the CUDA adds pointwise so this test continues to exercise
-            # graph partition reordering instead of addmm fusion.
-            bias_cuda = torch.randn(1, 3, device="cuda")
             weight_cuda = torch.randn(3, 3, device="cuda")
             weight_cpu = torch.randn(3, 3, device="cpu")
 
-            eager_out = f(x_cuda, y_cpu, z_cuda, bias_cuda, weight_cuda, weight_cpu)
+            eager_out = f(x_cuda, y_cpu, z_cuda, weight_cuda, weight_cpu)
 
             compiled_f = torch.compile(f, mode="reduce-overhead")
             for _ in range(3):
                 compiled_out = compiled_f(
-                    x_cuda, y_cpu, z_cuda, bias_cuda, weight_cuda, weight_cpu
+                    x_cuda, y_cpu, z_cuda, weight_cuda, weight_cpu
                 )
                 self.assertEqual(eager_out, compiled_out)
 
@@ -5675,9 +5726,6 @@ if HAS_CUDA_AND_TRITON:
                 new_state = old_state.clone_state()
 
                 if capture_cuda_graph:
-                    # state should be register to the graph
-                    graph.register_generator_state(new_state)
-
                     # only capturing the backward
                     with torch.cuda.graph(graph):
                         repro_perm = graphsafe_backward(generator, new_state)

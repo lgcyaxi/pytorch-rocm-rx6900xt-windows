@@ -539,9 +539,9 @@ class TestTensorCreation(TestCase):
         # Regression test for https://github.com/pytorch/pytorch/issues/155306
         msg = "expected a non-empty list of Tensors"
         with self.assertRaisesRegex(ValueError, msg):
-            torch.concat([], dim='N')
+            torch.concat([], dim=0)
         with self.assertRaisesRegex(ValueError, msg):
-            torch.concatenate([], dim='N')
+            torch.concatenate([], dim=0)
 
     def test_cat_out(self, device):
         x = torch.zeros((0), device=device)
@@ -2850,9 +2850,9 @@ class TestTensorCreation(TestCase):
         cpu_device = torch.device('cpu')
         tensor = torch.tensor((1, 2, 3), device=device)
 
-        # need more than one device_type to test this
-        if self.device_type != 'cuda':
-            raise AssertionError(f"device_type should be 'cuda', got {self.device_type!r}")
+        # need a non-CPU device (with its own device memory) to test this
+        if self.device_type == 'cpu':
+            raise AssertionError(f"expected a non-CPU device, got {self.device_type!r}")
         for left, right in product([tensor, tensor.cpu()], [tensor, tensor.cpu()]):
             for device_arg in [torch_device, cpu_device, None]:
                 if device_arg is None:

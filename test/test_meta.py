@@ -3,6 +3,7 @@
 
 import itertools
 import torch
+import torch._dynamo.config
 import os
 import numpy as np
 from enum import Enum
@@ -1014,8 +1015,7 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
             return (None, None, None)
 
         candidate_ols = []
-        for candidate_ol_name in olp.overloads():
-            candidate_ol = getattr(olp, candidate_ol_name)
+        for candidate_ol in olp.op_overloads():
             if any(arg.is_out for arg in candidate_ol._schema.arguments):
                 candidate_ols.append(candidate_ol)
 
@@ -1412,6 +1412,7 @@ class TestMeta(TestCase):
         assertEqualShapes(out_kwargs["out1"], expected_shapes[1])
         assertEqualShapes(out_kwargs["out2"], expected_shapes[2])
 
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
     def test_layer_norm_backward(self, output_mask):
@@ -1447,6 +1448,7 @@ class TestMeta(TestCase):
 
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_group_norm_backward(self, output_mask):
         from torch.testing._internal.common_methods_invocations import sample_inputs_group_norm
 
@@ -1478,6 +1480,7 @@ class TestMeta(TestCase):
 
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True], [True, False], [True, False])))
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
     def test_batch_norm_backward(self, output_mask):
         from torch.testing._internal.common_methods_invocations import sample_inputs_batch_norm
 
@@ -1972,6 +1975,17 @@ class TestMetaKernelConv(TestCase):
 
 class TestMetaKernelRegistrations(TestCase):
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_aminmax_out_dtype_mismatch(self):
+        inp = torch.rand(10, 10, device="meta")
+        out_min = torch.empty(10, dtype=torch.float64, device="meta")
+        out_max = torch.empty(10, dtype=torch.float64, device="meta")
+
+        with self.assertRaisesRegex(RuntimeError, "Expected out tensor to have dtype"):
+            torch.ops.aten.aminmax.out(
+                inp, dim=-1, keepdim=False, min=out_min, max=out_max
+            )
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_make_dep_token(self):
         cpu_result = torch.ops.aten._make_dep_token(device=torch.device("cpu"))
         meta_result = torch.ops.aten._make_dep_token(device=torch.device("meta"))
@@ -2006,6 +2020,24 @@ class TestMetaKernelRegistrations(TestCase):
         self.assertEqual(eigvecs.stride(), eigvecs_fake.stride())
         self.assertEqual(eigvecs.shape, eigvecs_fake.shape)
         self.assertEqual(eigvecs.dtype, eigvecs_fake.dtype)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    def test_zero_preserves_input_strides(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        x = torch.randn(5, 4).t()
+        cpu_result = torch.ops.aten.zero.default(x)
+
+        meta_x = torch.empty_strided(x.shape, x.stride(), device="meta")
+        meta_result = torch.ops.aten.zero.default(meta_x)
+        self.assertEqual(cpu_result.shape, meta_result.shape)
+        self.assertEqual(cpu_result.stride(), meta_result.stride())
+
+        with FakeTensorMode() as mode:
+            fake_x = mode.from_tensor(x)
+            fake_result = torch.ops.aten.zero.default(fake_x)
+        self.assertEqual(cpu_result.shape, fake_result.shape)
+        self.assertEqual(cpu_result.stride(), fake_result.stride())
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_randint_like_tensor_dtype_kwarg(self):

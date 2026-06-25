@@ -847,7 +847,7 @@ class SymPyValueRangeAnalysis:
         # If you want to implement it, compute the partial derivatives of a ** b
         # and check the ranges where the function is increasing / decreasing
         # Another non-tight way of doing this is defaulting to doing noting that for a > 0,  a ** b == exp(b * log(a))
-        # If this second option is implemented, by carefult about the types and possible infinities here and there.
+        # If this second option is implemented, be careful about the types and possible infinities here and there.
         if not b.is_singleton():
             return ValueRanges.unknown()
 
@@ -1098,6 +1098,37 @@ class SymPyValueRangeAnalysis:
         return ValueRanges.increasing_map(x, TruncToFloat)
 
 
+def _default_symbol_range(s: sympy.Symbol) -> ValueRanges:
+    if s.is_integer:
+        if s.is_positive:
+            return ValueRanges(1, int_oo)
+        if s.is_nonnegative:
+            return ValueRanges(0, int_oo)
+        return ValueRanges.unknown_int()
+    return ValueRanges.unknown()
+
+
+def _bound_sympy_for_rewrite_guard(
+    expr: sympy.Expr, ranges: dict[sympy.Symbol, ValueRanges]
+) -> ValueRanges | None:
+    try:
+        return sympy_interp(
+            SymPyValueRangeAnalysis,
+            ranges,
+            expr,
+            missing_handler=_default_symbol_range,
+        )
+    except (AttributeError, KeyError, NotImplementedError):
+        return None
+
+
+def _definitely_ge_value(value: sympy.Expr, lower: int) -> bool:
+    try:
+        return bool(value >= lower)
+    except TypeError:
+        return False
+
+
 def _definitely_ge(
     expr: sympy.Expr, lower: int, ranges: dict[sympy.Symbol, ValueRanges]
 ) -> bool:
@@ -1111,7 +1142,8 @@ def _definitely_ge(
         if isinstance(vr, ValueRanges):
             return bool(vr.lower >= lower)
 
-    return False
+    vr = _bound_sympy_for_rewrite_guard(expr, ranges)
+    return vr is not None and _definitely_ge_value(vr.lower, lower)
 
 
 def _mod_rewrite_is_valid(
@@ -1246,21 +1278,9 @@ def bound_sympy(
         else:
             ranges = context.fake_mode.shape_env.var_to_range
 
-    expr = _rewrite_for_value_range_analysis(expr, ranges)
-
-    def missing_handler(s):
-        if s.is_integer:  # type: ignore[attr-defined]
-            if s.is_positive:  # type: ignore[attr-defined]
-                vr = ValueRanges(1, int_oo)
-            elif s.is_nonnegative:  # type: ignore[attr-defined]
-                vr = ValueRanges(0, int_oo)
-            else:
-                vr = ValueRanges.unknown_int()
-        else:
-            # Don't bother trying very hard here
-            vr = ValueRanges.unknown()
-        return vr
+    if expr.has(PythonMod, Mod, sympy.Mod):
+        expr = _rewrite_for_value_range_analysis(expr, ranges)
 
     return sympy_interp(
-        SymPyValueRangeAnalysis, ranges, expr, missing_handler=missing_handler
+        SymPyValueRangeAnalysis, ranges, expr, missing_handler=_default_symbol_range
     )
