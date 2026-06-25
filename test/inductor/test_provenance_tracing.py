@@ -656,7 +656,7 @@ class TestProvenanceTracingStackTraces(TestCase):
                 "x = self.fc1(x)",
                 "x = self.relu(x)",
             ],
-            "triton_poi_fused_mul_0:1": [
+            "triton_poi_fused_mul_0:2": [
                 "d = a * 3.14",
             ],
             "triton_poi_fused_addmm_gelu_1:4": [
@@ -664,10 +664,10 @@ class TestProvenanceTracingStackTraces(TestCase):
                 "y = torch.addmm(c, d, b)",
             ],
             "extern_kernels.mm:3": [
-                "x = self.fc1(x)",
-            ],
-            "extern_kernels.mm:2": [
                 "y = torch.addmm(c, d, b)",
+            ],
+            "extern_kernels.mm:1": [
+                "x = self.fc1(x)",
             ],
         }
 
