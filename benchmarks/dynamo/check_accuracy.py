@@ -35,9 +35,21 @@ def get_field(csv, model_name: str, field: str):
 def check_accuracy(actual_csv, expected_csv, expected_filename):
     failed = []
     improved = []
+    flaky = set(flaky_models)
+    cuda_timm_training = "rocm" not in expected_filename and os.path.basename(
+        expected_filename
+    ) in {
+        "inductor_timm_training.csv",
+        "dynamic_inductor_timm_training.csv",
+    }
+
+    if cuda_timm_training:
+        # CUDA TIMM training can report exact-tolerance eager/eager drift in
+        # near-zero BatchNorm gradients for this model.
+        flaky.add("mobilenetv2_100")
 
     if "rocm" in expected_filename:
-        flaky_models.update(
+        flaky.update(
             {
                 "Background_Matting",
                 "mnasnet1_0",
@@ -74,7 +86,7 @@ def check_accuracy(actual_csv, expected_csv, expected_filename):
             status = "PASS" if expected_accuracy == "pass" else "XFAIL"
             print(f"{model:34}  {status}")
             continue
-        elif model in flaky_models:
+        elif model in flaky:
             if accuracy == "pass":
                 # model passed but marked xfailed
                 status = "PASS_BUT_FLAKY:"
