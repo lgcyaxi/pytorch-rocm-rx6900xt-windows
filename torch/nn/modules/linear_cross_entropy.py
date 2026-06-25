@@ -676,7 +676,7 @@ class _ChunkContext:
         else:
             torch.mm(mat1, mat2, out_dtype=out.dtype, out=out)
 
-    def shifted_logits(self, chunk: "_ChunkViews") -> torch.Tensor:
+    def shifted_logits(self, chunk: _ChunkViews) -> torch.Tensor:
         # Per-chunk forward prelude shared by all three chunk loops (none /
         # prob / index): logits = input @ weight.T (+ bias), shifted by the
         # per-row max for softmax stability. Writes into ``chunk.logits``.
@@ -696,12 +696,12 @@ class _ChunkContext:
         return weight.dot(x.gather(1, indices.unsqueeze(1)).squeeze(1).to(weight.dtype))
 
     def sumexp_(self, x: torch.Tensor, dim: int) -> torch.Tensor:
-        # Accumulate the normalizer in fp32 for fp16 input, like softmax /
-        # cross_entropy (which always reduce in acc_type): the denom sums
-        # num_classes terms in (0, 1] and overflows fp16 (>65504) for a large
-        # vocabulary. bf16 shares fp32's exponent range so it cannot overflow,
-        # and fp32/fp64 already suffice -- so the widening is fp16-only,
-        # keeping the fp32 radius minimal.
+        # The denom sums num_classes terms in (0, 1] (shifted logits <= 0).
+        # fp16: accumulate in fp32 -- the sum overflows fp16's 65504 for a large
+        # vocabulary (-> inf). bf16 stays in acc_dtype: it shares fp32's exponent
+        # range so it cannot overflow, and computing the denom in fp32 vs bf16
+        # was measured to move the bf16-stored log(denom) / (1/denom) by <=1 ULP,
+        # so there is no gain to justify it (and it would re-calibrate bf16 caps).
         reduce_dtype = torch.float32 if self.dtype == torch.float16 else self.acc_dtype
         return x.exp_().sum(dim, dtype=reduce_dtype)
 
