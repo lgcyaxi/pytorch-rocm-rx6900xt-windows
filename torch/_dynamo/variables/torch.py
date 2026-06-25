@@ -2536,10 +2536,6 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
 
             message_eager = None
             message_graph_arg = None
-            message_explanation = (
-                "The message argument of torch._check*() must be a string, None, "
-                "or a function defined within the torch.compile region."
-            )
             match message_vt:
                 case None:
                     pass
@@ -2549,7 +2545,10 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                         unimplemented(
                             gb_type="Can't extract message from torch._check*()",
                             context=str(message_vt),
-                            explanation=message_explanation,
+                            explanation=(
+                                "The message argument of torch._check*() must be a string, None, "
+                                "or a function defined within the torch.compile region."
+                            ),
                             hints=[
                                 *graph_break_hints.SUPPORTABLE,
                             ],
@@ -2580,7 +2579,10 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
                     unimplemented(
                         gb_type="Can't extract message from torch._check*()",
                         context=str(message_vt),
-                        explanation=message_explanation,
+                        explanation=(
+                            "The message argument of torch._check*() must be a string, None, "
+                            "or a function defined within the torch.compile region."
+                        ),
                         hints=[
                             *graph_break_hints.SUPPORTABLE,
                         ],
