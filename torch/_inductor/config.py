@@ -1069,7 +1069,7 @@ combo_kernel_per_subkernel_blocks: bool = Config(
 # When True, each combo sub-kernel autotunes its block sizes standalone at compile time;
 # the winners are stitched and baked into the combo kernel. Requires
 # combo_kernel_per_subkernel_blocks.
-combo_kernel_compile_time_autotune = False
+combo_kernel_compile_time_autotune = True
 # When True, combo-kernel autotuning groups sub-kernels that share the same
 # candidate config set and kernel-analysis signature. Disabled by default.
 combo_kernel_autotune_grouping = True
