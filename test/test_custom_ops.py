@@ -54,6 +54,7 @@ from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
     scoped_load_inline,
+    skipIfCrossRef,
     skipIfTorchDynamo,
     skipIfXpu,
     subtest,
@@ -740,6 +741,7 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertTrue(seen_keysets[0].has(torch._C.DispatchKey.CPU))
 
     @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    @skipIfCrossRef
     def test_pyobject_redispatch_requires_keyset(self):
         @torch.library.custom_op(
             f"{self.test_ns}::pyobject_dispatch_redispatch_requires_keyset",
