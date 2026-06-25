@@ -77,7 +77,6 @@ from ..utils import (
     base_exception_methods,
     check_constant_args,
     cmp_name_to_op_mapping,
-    deque_methods,
     dict_methods,
     exception_methods,
     frozenset_methods,
@@ -391,7 +390,6 @@ class UserDefinedClassVariable(UserDefinedVariable):
             int.__new__,
             float.__new__,
             str.__new__,
-            collections.deque.__new__,
         }
         return c_new_fns.union(exceptions)
 
@@ -1052,7 +1050,7 @@ class UserDefinedClassVariable(UserDefinedVariable):
             # unreconstructable args (e.g. generators).  Other tp_new functions
             # (tuple.__new__, BaseException.__new__) use the extra args.
             new_fn = self.value.__new__
-            if new_fn in (dict.__new__, set.__new__, collections.deque.__new__):
+            if new_fn in (dict.__new__, set.__new__):
                 init_args: list[VariableTracker] = []
             else:
                 init_args = list(args[1:])
@@ -2839,6 +2837,15 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                         traceable_fn, self
                     ).call_function(tx, args, kwargs)
 
+        if name == "__call__":
+            unimplemented(
+                gb_type="call to a callable object with no traceable __call__",
+                context=f"object={self.value}",
+                explanation="Dynamo could not trace a Python `__call__` method on "
+                "this object.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+
         return super().call_method(tx, name, args, kwargs)
 
     def sq_concat_impl(
@@ -3746,6 +3753,23 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                     functools.partial(GuardBuilder.HASATTR, attr=name)
                 )
             )
+
+        if not self._object_has_getattribute:
+            type_attr = self.lookup_class_mro_attr(name)
+            if (
+                (type_attr is NO_SUCH_SUBOBJ or not is_data_descriptor(type_attr))
+                and hasattr(self.value, "__dict__")
+                and not tx.output.side_effects.has_pending_mutation_of_attr(
+                    self,
+                    name,
+                    (AttrMutationKind.INSTANCE_DICT, AttrMutationKind.GENERIC_SETATTR),
+                )
+                and not tx.output.side_effects.has_pending_mutation_of_attr(
+                    self, "__dict__", AttrMutationKind.GENERIC_SETATTR
+                )
+                and self.has_key_in_generic_dict(tx, name)
+            ):
+                return variables.ConstantVariable.create(True)
 
         try:
             var_vt = self.var_getattr(tx, name)
@@ -5145,37 +5169,6 @@ class UserDefinedListVariable(UserDefinedObjectVariable):
         else:
             self._base_vt = list_vt
         self._base_methods = list_methods
-        if self._base_vt is None:
-            raise AssertionError("_base_vt must not be None after initialization")
-
-
-class UserDefinedDequeVariable(UserDefinedObjectVariable):
-    """
-    Represents user defined objects that are subclasses of collections.deque.
-
-    Internally, it uses a DequeVariable to represent the deque part of the
-    variable tracker. For everything else, it falls back to
-    UserDefinedObjectVariable.
-    """
-
-    def __init__(
-        self,
-        value: object,
-        deque_vt: Union["variables.lists.DequeVariable", None] = None,
-        **kwargs: Any,
-    ) -> None:
-        from .lists import DequeVariable
-
-        super().__init__(value, **kwargs)
-        if deque_vt is None:
-            if self.source is not None:
-                raise AssertionError(
-                    "deque_vt must be constructed by builder.py when source is present"
-                )
-            self._base_vt = DequeVariable([], mutation_type=ValueMutationNew())
-        else:
-            self._base_vt = deque_vt
-        self._base_methods = deque_methods
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None after initialization")
 

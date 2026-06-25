@@ -456,17 +456,6 @@ class SideEffects:
     def store_instance_dict_attr(
         self, item: VariableTracker, name: str, value: VariableTracker
     ) -> None:
-        # `obj.__dict__` ordering is observable (e.g. list(obj.__dict__)). When a
-        # key is re-added after being deleted, CPython appends it at the end
-        # rather than reusing its old slot. store_attr_mutations is an
-        # insertion-ordered dict, so a plain re-store of an existing key would
-        # keep the stale position; drop the deleted entry first so the new value
-        # re-inserts at the end.
-        if not isinstance(value, variables.DeletedVariable):
-            existing = self.store_attr_mutations.get(item, {}).get(name)
-            if isinstance(existing, variables.DeletedVariable):
-                del self.store_attr_mutations[item][name]
-                self.attr_mutation_kinds[item].pop(name, None)
         self.store_attr(item, name, value, AttrMutationKind.INSTANCE_DICT)
 
     def get_attr_mutation_kind(
@@ -575,7 +564,6 @@ class SideEffects:
             str.__getattribute__,
             list.__getattribute__,
             tuple.__getattribute__,
-            collections.deque.__getattribute__,
             BaseException.__getattribute__,
         )
 
@@ -711,8 +699,6 @@ class SideEffects:
                 variable_cls = variables.UserDefinedTupleVariable
         elif issubclass(user_cls, list):
             variable_cls = variables.UserDefinedListVariable
-        elif issubclass(user_cls, collections.deque):
-            variable_cls = variables.UserDefinedDequeVariable
         elif issubclass(user_cls, MutableMapping):
             variable_cls = variables.MutableMappingVariable
         elif is_frozen_dataclass(user_cls):
