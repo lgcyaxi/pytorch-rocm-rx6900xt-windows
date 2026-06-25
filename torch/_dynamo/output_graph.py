@@ -135,6 +135,7 @@ from .source import (
     GlobalStateSource,
     is_constant_source,
     is_from_local_source,
+    ListGetItemSource,
     LocalSource,
     NumpyTensorSource,
     ParamBufferSource,
@@ -159,6 +160,8 @@ from .utils import (
     get_unique_name_wrt,
     graph_break_reasons,
     increment_op_count,
+    is_numpy_ndarray,
+    istensor,
     istype,
     lazy_format_graph_code,
     LazyString,
@@ -2008,9 +2011,12 @@ class OutputGraph(OutputGraphCommon):
                         "variable should never be NULL in Python < 3.12"
                     )
             meta.locals_names[k] = len(meta.locals_names)
-            if isinstance(v, ContextWrappingVariable):
+            # Avoid realizing lazy locals here; resume metadata only needs to
+            # handle context variables that Dynamo already materialized.
+            if type.__instancecheck__(ContextWrappingVariable, v):
+                ctx_v = cast(ContextWrappingVariable, v)
                 target_values = (
-                    () if v.target_values is None else tuple(v.target_values)
+                    () if ctx_v.target_values is None else tuple(ctx_v.target_values)
                 )
                 meta.locals_ctx_args.append((k, target_values))
             stack_values.append(v)
@@ -2181,23 +2187,36 @@ class OutputGraph(OutputGraphCommon):
         stored_graph_output_var = False
         graph_output_var = None
 
+        def can_use_tensor_stack_fast_path(v: VariableTracker) -> bool:
+            if isinstance(v, variables.LazyVariableTracker):
+                if v.is_realized():
+                    v = v.unwrap()
+                elif is_numpy_ndarray(v.original_value()):
+                    return False
+                elif v.is_tensor():
+                    v = v.unwrap()
+                else:
+                    return False
+
+            if not v.is_tensor():
+                return False
+
+            return not any(
+                type.__instancecheck__(cls, v)
+                for cls in (
+                    UnspecializedPythonVariable,
+                    NumpyNdarrayVariable,
+                    TensorWithTFOverrideVariable,
+                )
+            ) and not (
+                type.__instancecheck__(SymNodeVariable, v) and v.python_type() is float
+            )
+
         # call compiled fx graph and codegen all values - stack and locals
         if (
             self.root_tx is tx  # single frame
             and stack_values_flat
-            and all(
-                not isinstance(
-                    v,
-                    (
-                        UnspecializedPythonVariable,
-                        NumpyNdarrayVariable,
-                        TensorWithTFOverrideVariable,
-                    ),
-                )
-                and not (isinstance(v, SymNodeVariable) and v.python_type() is float)
-                for v in stack_values_flat
-            )
-            and all(x.is_tensor() for x in stack_values_flat)
+            and all(can_use_tensor_stack_fast_path(v) for v in stack_values_flat)
             and len(set(stack_values_flat)) == len(stack_values_flat)
             and self.side_effects.is_empty()
             and not tx.debug_locals
@@ -2326,9 +2345,55 @@ class OutputGraph(OutputGraphCommon):
             output = []
             subgraph_pycode = None
             if count_calls(self.graph) != 0 or len(pass2.graph_outputs) != 0:
-                instructions, subgraph_pycode = self.compile_and_call_fx_graph(
-                    tx, pass2.graph_output_vars(), root
+                live_local_names = (
+                    self._live_local_names(pass2) | self._resume_live_local_names()
                 )
+                graph_input_names_to_delete = self._dead_tensor_graph_input_names(
+                    live_local_names
+                )
+                resume_args_varname = tx._boxed_resume_arg_name()
+                resume_arg_indexes_to_clear: set[int] = set()
+                if (
+                    resume_args_varname is not None
+                    and resume_args_varname in tx.cleared_fast_locals
+                ):
+                    resume_args = tx.f_locals.get(resume_args_varname)
+                    if isinstance(resume_args, list):
+                        live_resume_arg_indexes = self._live_resume_arg_indexes(
+                            pass2, resume_args_varname, len(resume_args)
+                        )
+                        resume_arg_indexes_to_clear = {
+                            idx
+                            for idx, value in enumerate(resume_args)
+                            if idx not in live_resume_arg_indexes and istensor(value)
+                        }
+                if (
+                    resume_args_varname is not None
+                    and resume_args_varname in live_local_names
+                ):
+                    graph_input_names_to_delete.discard(resume_args_varname)
+                graph_input_names_to_clear = tx.cleared_fast_locals - live_local_names
+                use_boxed_graph_call = resume_args_varname is not None and bool(
+                    graph_input_names_to_delete
+                    or graph_input_names_to_clear
+                    or resume_arg_indexes_to_clear
+                )
+                instructions, subgraph_pycode = self.compile_and_call_fx_graph(
+                    tx,
+                    pass2.graph_output_vars(),
+                    root,
+                    graph_input_names_to_delete,
+                    graph_input_names_to_clear,
+                    resume_arg_indexes_to_clear,
+                    use_boxed_graph_call,
+                )
+                if (
+                    resume_args_varname is not None
+                    and resume_args_varname in graph_input_names_to_delete
+                ):
+                    tx._mark_resume_args_cleanup_emitted()
+                    if self.root_tx is not tx:
+                        self.root_tx._mark_resume_args_cleanup_emitted()
                 output.extend(instructions)
 
                 if len(pass2.graph_outputs) != 0:
@@ -2539,6 +2604,74 @@ class OutputGraph(OutputGraphCommon):
 
         cg.restore_stack(stack_values, value_from_source=not tx.export)
         self.side_effects.codegen_update_mutated(cg, log_side_effects)
+
+    @staticmethod
+    def _base_local_name(source: Source | None) -> str | None:
+        while source is not None:
+            if isinstance(source, LocalSource):
+                return source.local_name
+            source = getattr(source, "base", None)
+        return None
+
+    def _live_local_names(self, cg: PyCodegen) -> set[str]:
+        live_local_names: set[str] = set(self.code_options["co_cellvars"])
+        live_local_names.update(self.code_options["co_freevars"])
+        for value in cg.uses:
+            source = (
+                value if isinstance(value, Source) else getattr(value, "source", None)
+            )
+            local_name = self._base_local_name(source)
+            if local_name is not None:
+                live_local_names.add(local_name)
+        return live_local_names
+
+    def _live_resume_arg_indexes(
+        self, cg: PyCodegen, resume_args_varname: str, resume_args_len: int
+    ) -> set[int]:
+        live_indexes: set[int] = set()
+        for value in cg.uses:
+            source = (
+                value if isinstance(value, Source) else getattr(value, "source", None)
+            )
+            while source is not None:
+                if (
+                    isinstance(source, (GetItemSource, ListGetItemSource))
+                    and isinstance(source.base, LocalSource)
+                    and source.base.local_name == resume_args_varname
+                    and isinstance(source.index, int)
+                ):
+                    live_indexes.add(source.index)
+                    break
+                if (
+                    isinstance(source, LocalSource)
+                    and source.local_name == resume_args_varname
+                ):
+                    return set(range(resume_args_len))
+                source = getattr(source, "base", None)
+        return live_indexes
+
+    def _resume_live_local_names(self) -> set[str]:
+        if not self.compile_subgraph_reason.graph_break:
+            return set()
+
+        return {
+            name
+            for name, value in self.root_tx.symbolic_locals.items()
+            if isinstance(value.source, LocalSource) and value.source.local_name == name
+        }
+
+    def _dead_tensor_graph_input_names(self, live_local_names: set[str]) -> set[str]:
+        names: set[str] = set()
+        for arg in self.graphargs:
+            if (
+                arg.is_tensor
+                and not arg.pass_arg_as_tensor
+                and isinstance(arg.source, LocalSource)
+                and arg.source.local_name not in live_local_names
+                and arg.source.local_name in self.code_options["co_varnames"]
+            ):
+                names.add(arg.source.local_name)
+        return names
 
     def cleanup_graph(self) -> None:
         """
@@ -2801,6 +2934,10 @@ class OutputGraph(OutputGraphCommon):
         tx: "InstructionTranslatorBase",
         rv: list[VariableTracker],
         root: FakeRootModule,
+        graph_input_names_to_delete: set[str] | None = None,
+        graph_input_names_to_clear: set[str] | None = None,
+        resume_arg_indexes_to_clear: set[int] | None = None,
+        use_boxed_graph_call: bool = False,
     ) -> tuple[list[Instruction], list[str] | None]:
         """
         Generate code from self.graph and return the Instruction()s to
@@ -3032,6 +3169,29 @@ class OutputGraph(OutputGraphCommon):
 
                 compiled_fn = _tf_disabled_wrapper
 
+            is_gm_forward = (
+                getattr(compiled_fn, "__self__", None) is gm
+                and getattr(compiled_fn, "__name__", None) == "forward"
+            )
+            compiled_fn_code = getattr(compiled_fn, "__code__", None)
+            # Some AOTAutograd wrappers inherit _boxed_call from an inner
+            # function even though they still accept *args.
+            boxed_call = (
+                getattr(gm, "_boxed_call", False)
+                if is_gm_forward
+                else (
+                    getattr(compiled_fn, "_boxed_call", False)
+                    and compiled_fn_code is not None
+                    and compiled_fn_code.co_argcount == 1
+                    and not (compiled_fn_code.co_flags & inspect.CO_VARARGS)
+                )
+            )
+            if use_boxed_graph_call and not boxed_call and is_gm_forward:
+                gm.graph.set_codegen(torch.fx.graph._BoxedCodeGen())
+                gm.recompile()
+                compiled_fn = gm.forward
+                boxed_call = True
+
             compiled_fn = disable(
                 compiled_fn, reason="do not trace Dynamo-compiled graph"
             )
@@ -3137,7 +3297,13 @@ class OutputGraph(OutputGraphCommon):
             for idx, arg in enumerate(self.graphargs):
                 self.export_metadata.graph_input_idx_to_local_source[idx] = arg.source
 
-            cg.make_call_generated_code(name)
+            cg.make_call_generated_code(
+                name,
+                graph_input_names_to_delete,
+                graph_input_names_to_clear,
+                resume_arg_indexes_to_clear,
+                boxed_call,
+            )
 
             return cg.get_instructions(), cg.get_pycode()
 

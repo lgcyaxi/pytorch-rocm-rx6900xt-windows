@@ -673,11 +673,31 @@ class PyCodegen:
         if source not in self.tempvars:
             self.tempvars[source] = None
 
-    def make_call_generated_code(self, fn_name: str) -> None:
+    def make_call_generated_code(
+        self,
+        fn_name: str,
+        graph_input_names_to_delete: set[str] | None = None,
+        graph_input_names_to_clear: set[str] | None = None,
+        resume_arg_indexes_to_clear: set[int] | None = None,
+        boxed_call: bool = False,
+    ) -> None:
         """Call the generated code function stored in fn_name"""
         self.extend_output(self.load_function_name(fn_name, True))
 
         graphargs = self.tx.output.graphargs
+        graph_input_names_to_delete = {
+            name
+            for name in graph_input_names_to_delete or set()
+            if name in self.code_options["co_varnames"]
+        }
+        graph_input_names_to_clear = {
+            name
+            for name in graph_input_names_to_clear or set()
+            if name in self.code_options["co_varnames"]
+        }
+        resume_args_varname = self.tx._boxed_resume_arg_name()
+        if resume_args_varname is not None:
+            graph_input_names_to_clear.discard(resume_args_varname)
 
         def extract_nested_sources(source: Source) -> list[Source]:
             nested_sources: list[Source] = []
@@ -740,7 +760,6 @@ class PyCodegen:
             else:
                 self.call_reconstruct(arg)
                 self.add_pycode(f"{arg_varname} = {{}}", arg)
-
         if config.record_runtime_overhead:
             # Record the pregraph bytecode end
             self.add_push_null(
@@ -754,10 +773,45 @@ class PyCodegen:
             self.extend_output(create_call_function(1, False))
             self.pop_top()
 
-        self.extend_output(create_call_function(len(graphargs), False))
         self.clear_tempvars()
+
+        for name in sorted(graph_input_names_to_clear):
+            self.append_output(self.create_load(name))
+            self.load_method("clear")
+            self.call_method(0)
+            self.pop_top()
+        if resume_args_varname is not None and resume_arg_indexes_to_clear:
+            resume_args = self.tx.f_locals.get(resume_args_varname)
+            if isinstance(resume_args, list):
+                for idx in sorted(resume_arg_indexes_to_clear, reverse=True):
+                    self.add_push_null(
+                        lambda: self.load_import_from(
+                            "torch._dynamo.resume_execution",
+                            "_maybe_clear_tensor_resume_arg",
+                        )
+                    )
+                    self.append_output(self.create_load(resume_args_varname))
+                    self.append_output(self.create_load_const(idx))
+                    self.extend_output(create_call_function(2, False))
+                    self.pop_top()
+        graph_input_names_to_delete |= graph_input_names_to_clear
+        for name in sorted(graph_input_names_to_delete):
+            self.append_output(self.create_delete(name))
+        if graph_input_names_to_delete:
+            self.add_pycode("del " + ", ".join(sorted(graph_input_names_to_delete)))
+
+        if boxed_call:
+            self.append_output(create_instruction("BUILD_LIST", arg=len(graphargs)))
+            nargs = 1
+        else:
+            nargs = len(graphargs)
+
+        self.extend_output(create_call_function(nargs, False))
+        graph_call_args = (
+            f"[{', '.join(arg_varnames)}]" if boxed_call else ", ".join(arg_varnames)
+        )
         self.add_pycode(
-            f"__graph_out = {fn_name}({', '.join(arg_varnames)})",
+            f"__graph_out = {fn_name}({graph_call_args})",
         )
 
     def create_import_name(self, module_name: str) -> Instruction:

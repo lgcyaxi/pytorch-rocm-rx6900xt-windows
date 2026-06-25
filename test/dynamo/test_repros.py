@@ -8193,6 +8193,130 @@ SavedForBackwardsAOTOutput(idx=5)""",
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         self.assertEqual(fn(x), opt_fn(x))
 
+    def test_graph_break_resume_args_cleanup_not_duplicated(self):
+        def graph(a):
+            return a + 1, a + 2
+
+        @torch._dynamo.disable()
+        def graph_break(a):
+            return a + 1
+
+        @torch._dynamo.disable()
+        def probe(a):
+            return a + 1
+
+        def fn(a):
+            a, b = graph(a)
+            a = graph_break(a)
+            c = a + b
+            return probe(c)
+
+        x = torch.randn(2)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_graph_break_resume_args_preserves_non_tensor_lifetime(self):
+        deleted = [False]
+
+        class Token:
+            def __del__(self):
+                deleted[0] = True
+
+        @torch._dynamo.disable()
+        def make_token():
+            return Token()
+
+        @torch._dynamo.disable()
+        def graph_break(token):
+            return lambda fn: fn
+
+        @torch._dynamo.disable()
+        def check_alive():
+            gc.collect()
+            self.assertFalse(deleted[0])
+
+        def fn(x):
+            token = make_token()
+            decorator = graph_break(token)
+
+            @decorator
+            def inner():
+                return None
+
+            check_alive()
+            inner()
+            return x + 1
+
+        x = torch.randn(2)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(fn(x), x + 1)
+        deleted[0] = False
+        self.assertEqual(opt_fn(x), x + 1)
+
+    def test_graph_break_resume_args_clears_dead_tensor_slots_per_index(self):
+        @torch._dynamo.disable()
+        def make_ref(x):
+            return weakref.ref(x)
+
+        @torch._dynamo.disable()
+        def check_dead(ref):
+            gc.collect()
+            self.assertIsNone(ref())
+
+        def fn(x):
+            y = x + 1
+            keep = x + 2
+            ref = make_ref(y)
+            del y
+            out = keep * 2
+            check_dead(ref)
+            return out + keep
+
+        x = torch.randn(2)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertEqual(fn(x), opt_fn(x))
+
+    def test_graph_break_resume_args_cleared_when_resume_frame_skips(self):
+        def fn(x):
+            y = x + 1
+            ref = weakref.ref(y)
+            torch._dynamo.graph_break()
+            del y
+            return ref() is None
+
+        x = torch.randn(2)
+        opt_fn = torch.compile(fn, backend="eager")
+        self.assertTrue(fn(x))
+        self.assertTrue(opt_fn(x))
+
+    def test_resume_args_name_collision(self):
+        def user_arg_name(__resume_args):  # noqa: PYI063
+            return __resume_args + 1
+
+        def torch_dynamo_resume_in_user(__torch_dynamo_resume_args):  # noqa: PYI063
+            return __torch_dynamo_resume_args[0] + 1
+
+        def internal_arg_name(x):
+            __torch_dynamo_resume_args = x + 1
+            torch._dynamo.graph_break()
+            return __torch_dynamo_resume_args + 1
+
+        x = torch.randn(2)
+        self.assertEqual(
+            user_arg_name(x), torch.compile(user_arg_name, backend="eager")(x)
+        )
+        self.assertEqual(
+            internal_arg_name(x),
+            torch.compile(internal_arg_name, backend="eager")(x),
+        )
+        resume_args = [x]
+        self.assertEqual(
+            torch_dynamo_resume_in_user(resume_args),
+            torch.compile(torch_dynamo_resume_in_user, backend="eager")(resume_args),
+        )
+        self.assertEqual(len(resume_args), 1)
+        self.assertIs(resume_args[0], x)
+
 
 class ReproTestsDevice(torch._dynamo.test_case.TestCase):
     @serialTest()
@@ -9509,6 +9633,121 @@ class CUDAReproTests(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(x.grad, torch.ones_like(x))
         self.assertEqual(y.grad, -y.detach().sin())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_graph_break_resume_does_not_extend_tensor_lifetime(self):
+        def graph(a):
+            return a + 1, a + 2
+
+        @torch._dynamo.disable()
+        def graph_break(a):
+            return a + 1
+
+        def no_graph_break(a):
+            return a + 1
+
+        def resume(a, b):
+            out_0 = a + b
+            out_1 = out_0 * 2
+            out_2 = out_1 * 2
+            return out_0, out_1, out_2
+
+        def make_fn(gb):
+            def fn(a):
+                a, b = graph(a)
+                a = gb(a)
+                return resume(a, b)
+
+            return fn
+
+        def measure_peak(gb, n):
+            torch._dynamo.reset()
+            compiled = torch.compile(make_fn(gb), backend="eager")
+            a = torch.randn(n, n, device="cuda")
+            with torch.no_grad():
+                out = compiled(a)
+                torch.cuda.synchronize()
+                del out
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+
+                out = compiled(a)
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated()
+                del out
+
+            del a, compiled
+            gc.collect()
+            torch.cuda.empty_cache()
+            return peak
+
+        n = 2048
+        tensor_bytes = n * n * torch.empty((), dtype=torch.float32).element_size()
+        configs = (
+            (None, contextlib.nullcontext()),
+            ("L['a']", torch.compiler.config.patch(dynamic_sources="L['a']")),
+        )
+        for dynamic_sources, ctx in configs:
+            with self.subTest(dynamic_sources=dynamic_sources), ctx:
+                no_graph_break_peak = measure_peak(no_graph_break, n)
+                graph_break_peak = measure_peak(graph_break, n)
+                self.assertLessEqual(
+                    graph_break_peak, no_graph_break_peak + tensor_bytes
+                )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_graph_break_resume_releases_dead_tensor_before_disabled_call(self):
+        def graph(a):
+            return a + 1, a + 2
+
+        @torch._dynamo.disable()
+        def graph_break(a):
+            return None
+
+        def no_graph_break(a):
+            return None
+
+        @torch._dynamo.disable()
+        def memory_probe(a):
+            torch.cuda.synchronize()
+            return torch.cuda.memory_allocated()
+
+        def make_fn(gb):
+            def fn(a):
+                a, b = graph(a)
+                gb(a)
+                del b
+                return memory_probe(a)
+
+            return fn
+
+        def measure_allocated(gb, n):
+            torch._dynamo.reset()
+            compiled = torch.compile(make_fn(gb), backend="eager")
+            a = torch.randn(n, n, device="cuda")
+            with torch.no_grad():
+                compiled(a)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                allocated = compiled(a)
+                torch.cuda.synchronize()
+
+            del a, compiled
+            gc.collect()
+            torch.cuda.empty_cache()
+            return allocated
+
+        n = 2048
+        no_graph_break_allocated = measure_allocated(no_graph_break, n)
+        graph_break_allocated = measure_allocated(graph_break, n)
+        tensor_bytes = n * n * torch.empty((), dtype=torch.float32).element_size()
+        self.assertLessEqual(
+            graph_break_allocated,
+            no_graph_break_allocated + tensor_bytes // 2,
+        )
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cuda_sync(self):

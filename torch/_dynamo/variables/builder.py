@@ -2665,9 +2665,13 @@ class VariableBuilder:
                         f"{int_spec!r} (expected int, IntVar, or None)"
                     )
 
-            if is_dynamic_source(self.source.name):
+            dynamic_source_name = _dynamic_source_name_for_resume(
+                self.tx, self.source, self.source.name
+            )
+            if is_dynamic_source(dynamic_source_name):
                 log.debug(
-                    "%s marked dynamic via dynamic-sources list", self.source.name
+                    "%s marked dynamic via dynamic-sources list",
+                    dynamic_source_name,
                 )
                 return self.wrap_symint(value, dynamism=DimDynamic.DYNAMIC)
 
@@ -4277,6 +4281,33 @@ def is_dynamic_source(source_name: str, dim: int | None = None) -> bool:
     return False
 
 
+def _dynamic_source_name_for_resume(
+    tx: "InstructionTranslatorBase", source: Source | None, name: str
+) -> str:
+    if source is None:
+        return name
+
+    from ..resume_execution import (
+        _boxed_resume_arg_name,
+        _boxed_resume_local_argname_indexes,
+    )
+
+    resume_args_varname = _boxed_resume_arg_name(tx.f_code)
+    if (
+        resume_args_varname is None
+        or not isinstance(source, (GetItemSource, ListGetItemSource))
+        or not isinstance(source.base, LocalSource)
+        or source.base.local_name != resume_args_varname
+        or not isinstance(source.index, int)
+    ):
+        return name
+
+    local_name = _boxed_resume_local_argname_indexes(tx.f_code).get(source.index)
+    if local_name is None:
+        return name
+    return LocalSource(local_name).name
+
+
 def record_automatic_dynamic(
     tx: "InstructionTranslatorBase", name: str, e: torch.Tensor
 ) -> FrameStateSizeEntry:
@@ -4409,7 +4440,7 @@ def _automatic_dynamic(
             hints=[],
         )
 
-    name = source.name
+    name = _dynamic_source_name_for_resume(tx, source, source.name)
     prior_policy = tx.output.tracing_context.tensor_to_context.get(e, None)
     shape_env_to_source_to_symbol_cache = (
         prior_policy.shape_env_to_source_to_symbol_cache if prior_policy else {}
