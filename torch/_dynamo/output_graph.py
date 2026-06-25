@@ -2987,17 +2987,13 @@ class OutputGraph(OutputGraphCommon):
             # Restore placeholder metadata mutated by
             # in-graph shallow_copy_data_.
             if self._shallow_copy_placeholder_snapshots:
-                placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-                placeholder_to_idx = {n: i for i, n in enumerate(placeholders)}
+                placeholder_to_idx = {
+                    n: i for i, n in enumerate(gm.graph.nodes) if n.op == "placeholder"
+                }
                 for node, snapshot in self._shallow_copy_placeholder_snapshots.items():
                     node.meta["example_value"] = snapshot
-                    idx = placeholder_to_idx.get(node)
-                    if (
-                        idx is not None
-                        and idx < len(example_inputs)
-                        and hasattr(example_inputs[idx], "fake_device")
-                    ):
-                        example_inputs[idx].fake_device = snapshot.fake_device  # type: ignore[union-attr]
+                    idx = placeholder_to_idx[node]
+                    example_inputs[idx].fake_device = snapshot.fake_device  # type: ignore[union-attr]
 
             gm.graph.lint()
             with self.restore_global_state():

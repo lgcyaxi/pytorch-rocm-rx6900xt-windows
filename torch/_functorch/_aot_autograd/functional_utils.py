@@ -218,7 +218,7 @@ def was_shallow_copy_data(t: object) -> bool:
     if not isinstance(t, torch.Tensor):
         return False
     if not isinstance(t, FunctionalTensor):
-        return False
+        raise AssertionError(f"expected FunctionalTensor, got {type(t)}")
     return torch._functionalize_was_shallow_copy_data(t.elem)  # type: ignore[attr-defined]
 
 
