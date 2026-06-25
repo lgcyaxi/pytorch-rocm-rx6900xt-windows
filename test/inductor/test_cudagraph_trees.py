@@ -2483,7 +2483,9 @@ if HAS_CUDA_AND_TRITON:
                 out + out
 
             FileCheck().check("overwritten").check("x * x * x").check(
-                "cudagraph_trees_generation_cloning"
+                "cudagraph_mark_step_begin"
+            ).check("manually clone").check("cudagraph_trees_generation_cloning").check(
+                "clone all user-visible tensors that persist"
             ).run(repr(exc.exception))
 
             foo(inp)
@@ -2492,7 +2494,9 @@ if HAS_CUDA_AND_TRITON:
                 out2 + out2
 
             FileCheck().check("overwritten").check("x * x * x").check(
-                "cudagraph_trees_generation_cloning"
+                "cudagraph_mark_step_begin"
+            ).check("manually clone").check("cudagraph_trees_generation_cloning").check(
+                "clone all user-visible tensors that persist"
             ).run(repr(exc.exception))
 
         @torch._inductor.config.patch(
