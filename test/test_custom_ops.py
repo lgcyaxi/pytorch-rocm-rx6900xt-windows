@@ -664,6 +664,37 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertEqual(calls, ["custom"])
 
     @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    def test_pyobject_dispatch_custom_op_autograd(self):
+        @torch.library.custom_op(
+            f"{self.test_ns}::pyobject_dispatch_custom_op_autograd",
+            mutates_args=(),
+        )
+        def f(x: Tensor) -> Tensor:
+            return x.sin()
+
+        def setup_context(ctx, inputs, output):
+            (x,) = inputs
+            ctx.save_for_backward(x)
+
+        backward_called = False
+
+        def backward(ctx, grad):
+            nonlocal backward_called
+            backward_called = True
+            (x,) = ctx.saved_tensors
+            return grad * x.cos()
+
+        f.register_autograd(backward, setup_context=setup_context)
+
+        op = self.ns().pyobject_dispatch_custom_op_autograd.default
+        self.assertTrue(op._is_pyobj_dispatcher_enabled())
+
+        x = torch.randn(3, requires_grad=True)
+        f(x).sum().backward()
+        self.assertTrue(backward_called)
+        self.assertEqual(x.grad, x.detach().cos())
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_pyobject_dispatch_normalizes_tensor_list_input(self):
         @torch.library.custom_op(
             f"{self.test_ns}::pyobject_dispatch_tensor_list", mutates_args=()
