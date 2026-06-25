@@ -644,17 +644,9 @@ test_inductor_shard() {
     exit 1
   fi
 
-  python tools/dynamo/verify_dynamo.py
-  python test/run_test.py --inductor \
-    --include test_modules test_ops test_ops_gradients test_torch \
-    --shard "$1" "$NUM_TEST_SHARDS" \
-    --verbose
-
-  # Do not add --inductor for the following inductor unit tests, otherwise we will fail because of nested dynamo state
-  python test/run_test.py \
-    --include inductor/test_torchinductor inductor/test_torchinductor_opinfo inductor/test_aot_inductor inductor/test_cpu_select_algorithm \
-    --shard "$1" "$NUM_TEST_SHARDS" \
-    --verbose
+  # REPRO(neutered): run ONLY the AOTInductor logging tests (the class tripping the
+  # _handler_watcher assertion), not the full inductor suite. Restore before merging.
+  python test/run_test.py --include inductor/test_aot_inductor -k AOTInductorLoggingTest --verbose
 
   # ROCm origami GEMM tests: rocm.origami / max_autotune are read once at config
   # import (env-var-driven, see torch/_inductor/config.py); without these set

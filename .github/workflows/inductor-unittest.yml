@@ -6,6 +6,7 @@ name: inductor-unittest
 
 on:
   workflow_call:
+  workflow_dispatch:
   schedule:
     - cron: 29 8 * * * # about 1:29am PDT, for mem leak check and rerun disabled tests.
   pull_request:
@@ -44,13 +45,12 @@ jobs:
       ci-docker-hash: ${{ needs.get-label-type.outputs.ci-docker-hash }}
       cuda-arch-list: '8.6'
       runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
+      # REPRO(neutered): only the single OSDC shard that hits
+      # AOTInductorLoggingTest::test_shape_env_reuse_zero_consts_use_consts_asm_false.
+      # Restore the full include list before merging.
       test-matrix: |
         { include: [
-          { config: "inductor", shard: 1, num_shards: 2, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g5.4xlarge.nvidia.gpu" },
           { config: "inductor", shard: 2, num_shards: 2, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g5.4xlarge.nvidia.gpu" },
-          { config: "inductor_distributed", shard: 1, num_shards: 1, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g5.12xlarge.nvidia.gpu" },
-          { config: "inductor_cpp_wrapper", shard: 1, num_shards: 2, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g5.4xlarge.nvidia.gpu" },
-          { config: "inductor_cpp_wrapper", shard: 2, num_shards: 2, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g5.4xlarge.nvidia.gpu" },
         ]}
       use-arc: ${{ needs.get-label-type.outputs.use-arc == 'true' }}
       python-version: "3.10"
@@ -75,6 +75,7 @@ jobs:
     secrets: inherit
 
   inductor-halide-build:
+    if: false  # REPRO(neutered): disabled; restore before merging
     name: inductor-halide-build
     uses: ./.github/workflows/_linux-build.yml
     needs: get-label-type
@@ -108,6 +109,7 @@ jobs:
     secrets: inherit
 
   inductor-triton-cpu-build:
+    if: false  # REPRO(neutered): disabled; restore before merging
     name: inductor-triton-cpu-build
     uses: ./.github/workflows/_linux-build.yml
     needs: get-label-type
@@ -141,6 +143,7 @@ jobs:
     secrets: inherit
 
   inductor-cpu-build:
+    if: false  # REPRO(neutered): disabled; restore before merging
     name: inductor-cpu-build
     uses: ./.github/workflows/_linux-build.yml
     needs: get-label-type
@@ -175,6 +178,7 @@ jobs:
     secrets: inherit
 
   inductor-cpu-core-build:
+    if: false  # REPRO(neutered): disabled; restore before merging
     name: inductor-cpu-core-build
     uses: ./.github/workflows/_linux-build.yml
     needs: get-label-type
