@@ -35,6 +35,16 @@ def get_stream_name(stream_idx: int) -> str:
 
 
 @functools.lru_cache
+def _raw_stream_name_for_device(device_idx: int) -> str:
+    return f"raw_stream{device_idx}"
+
+
 def get_raw_stream_name(device_idx: int) -> str:
     """Generate variable name for a raw stream handle on the given device."""
-    return f"raw_stream{device_idx}"
+    # Under compile-on-one-rank the wrapper must be byte-identical across ranks, so the
+    # stream variable name cannot carry a rank-specific device index.
+    from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+    if _coor_enabled():
+        return "raw_stream"
+    return _raw_stream_name_for_device(device_idx)

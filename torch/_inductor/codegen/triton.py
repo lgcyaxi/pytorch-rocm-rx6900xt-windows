@@ -6566,9 +6566,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
         )
+        from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+        props_device = V.graph.get_current_device_or_throw()
+        if _coor_enabled():
+            # compile-on-one-rank: drop the rank-specific index so this kernel's triton_meta
+            # (hence its cache key and the generated code) is byte-identical across ranks;
+            # the launcher resolves the real device at load time.
+            props_device = torch.device(props_device.type)
         triton_meta: dict[str, Any] = {
             "signature": triton_meta_signature,
-            "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
+            "device": DeviceProperties.create(props_device),
             "constants": {},
             "native_matmul": (
                 torch._inductor.config.triton.native_matmul

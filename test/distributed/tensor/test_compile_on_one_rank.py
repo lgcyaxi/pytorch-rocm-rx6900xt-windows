@@ -6,8 +6,8 @@ import sys
 import unittest
 
 import torch
+import torch.compiler.config as compiler_config
 import torch.distributed as dist
-import torch.distributed.config as dist_config
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import parallelize_module, RowwiseParallel
@@ -107,7 +107,7 @@ class TestCompileOnOneRank(DTensorTestBase):
         return compiled_model, fw_graph_cell
 
     @with_comms
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_compiled_rowwise_embedding_graph_consistency(self):
         """Test that compiled graphs are identical across all ranks.
 
@@ -160,7 +160,7 @@ class TestCompileOnOneRank(DTensorTestBase):
         self._assert_graphs_identical_across_ranks(fw_graph_cell[0])
 
     @with_comms
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_all_reduce_with_explicit_pg_input(self):
         pg = dist.distributed_c10d._get_default_group()
 
@@ -175,7 +175,7 @@ class TestCompileOnOneRank(DTensorTestBase):
         self.assertEqual(out, f(x, pg))
 
     @with_comms
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_compiled_dtensor_rng_op_graph_consistency(self):
         """Compiled random ops on sharded DTensors should produce identical graphs."""
         mesh = self.build_device_mesh()
@@ -201,7 +201,7 @@ class TestCompileOnOneRank(DTensorTestBase):
         self._assert_graphs_identical_across_ranks(fw_graph_cell[0])
 
     @with_comms
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_all_reduce_with_implicit_world_group(self):
         """`dist.all_reduce(t)` with no `group=` (implicit `dist.group.WORLD`)
         should compile under compile_on_one_rank=True.
@@ -276,7 +276,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     """
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_factory_device_replaced_with_current_device(self):
         gm = make_fx(_factory_from_input_device, tracing_mode="fake")(
             torch.randn(2, 8, device="cuda:0")
@@ -294,7 +294,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         )
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_runtime_follows_current_device_not_input(self):
         # The runtime device follows the process's current device, not the input's.
         # The input is kept on cuda:0 in both runs; only the current device changes.
@@ -321,7 +321,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertTrue(_indexed_cuda_device_nodes(gm))
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_to_copy_explicit_device_replaced(self):
         # An explicit-device dtype cast (the SimpleFSDP mixed-precision pattern,
         # aten._to_copy with a device= kwarg) also gets its baked device rewired to
@@ -334,7 +334,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertEqual(_indexed_cuda_device_nodes(gm), [])
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_unindexed_accelerator_device_replaced(self):
         # A bare device="cuda" (index None) matching the current accelerator is also
         # replaced by the current_device() node.
@@ -345,7 +345,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertEqual(len(_current_device_nodes(gm)), 1)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_cpu_device_left_alone(self):
         # cpu is portable on every rank, so a cpu factory is not rewritten.
         def f(x):
@@ -364,7 +364,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertTrue(cpu_ops, "the cpu device should stay baked")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_factory_without_matching_input_succeeds(self):
         # Unlike provenance-following, matching the current accelerator needs no input
         # on that device: a cuda factory in a cpu-input graph is now rewritten, not
@@ -377,7 +377,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertEqual(_indexed_cuda_device_nodes(gm), [])
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_wrong_index_raises(self):
         # A cuda index that is not the current device's index cannot be made SPMD, so
         # the rewrite refuses it (raised during tracing before the fake op runs, so
@@ -392,7 +392,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
                 make_fx(f, tracing_mode="fake")(torch.randn(2, device="cuda:0"))
 
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
-    @dist_config.patch(compile_on_one_rank=True)
+    @compiler_config.patch(compile_on_one_rank=True)
     def test_graph_code_identical_across_devices(self):
         # The functional FX graph text (.code) must be byte-identical across ranks: the
         # device operand is the current_device() node, never a baked cuda:N. (.code
@@ -407,6 +407,122 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         code0, code1 = code_on(0), code_on(1)
         self.assertEqual(code0, code1)
         self.assertNotIn("cuda:", code0)
+
+    # ---- inductor codegen and launcher must be device-agnostic across ranks ----
+    # A device-derived factory + a reduction, so inductor emits a real kernel.
+    @staticmethod
+    def _coor_inductor_fn(x):
+        z = torch.zeros(4, x.shape[1], device=x.device, dtype=x.dtype)
+        return z + x.sum()
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @compiler_config.patch(compile_on_one_rank=True)
+    def test_inductor_compiles_under_coor(self):
+        # The current_device() node must lower through inductor, and the generated code
+        # must be device-agnostic: the device is resolved at runtime with no baked
+        # rank-specific index, so one compiled artifact is shareable across ranks.
+        from torch._C import FileCheck
+        from torch._inductor.utils import run_and_get_code
+
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            self._coor_inductor_fn, backend="inductor", fullgraph=True
+        )
+        out, codes = run_and_get_code(compiled, torch.randn(2, 8, device="cuda"))
+        self.assertEqual(out.device.type, "cuda")
+        code = "\n".join(codes)
+        FileCheck().check("torch.cuda.current_device()").run(code)
+        self.assertNotRegex(code, r"cuda:\d")
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
+    @compiler_config.patch(compile_on_one_rank=True)
+    def test_inductor_runs_on_nonzero_device(self):
+        # Problem 2 (runtime): a graph compiled under CooR must run on a rank's own
+        # (non-zero) device -- the device guard, stream, and kernel load must follow the
+        # runtime current device, not a baked index.
+        torch._dynamo.reset()
+        with torch.cuda.device(1):
+            compiled = torch.compile(
+                self._coor_inductor_fn, backend="inductor", fullgraph=True
+            )
+            out = compiled(torch.randn(2, 8, device="cuda:1"))
+        self.assertEqual(out.device, torch.device("cuda:1"))
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
+    @compiler_config.patch(compile_on_one_rank=True)
+    def test_inductor_cached_kernel_reused_across_devices(self):
+        # Problem 3 (shareable artifact): under CooR the inductor kernel cache key is
+        # device-agnostic, so a kernel compiled on cuda:0 is reloaded on cuda:1 -- the
+        # same bundle/static-launcher reload path precompile uses. If a rank-specific
+        # device is baked there, the cubin loads on device 0 and launching on cuda:1
+        # raises `invalid resource handle`. (Comparing source is necessary but does not
+        # exercise reload-on-another-device, so this runs the reloaded kernel instead.)
+        from torch._inductor.utils import clear_inductor_caches
+
+        try:
+            from torch._inductor.utils import fresh_cache
+        except ImportError:
+            from torch._inductor.utils import fresh_inductor_cache as fresh_cache
+
+        inp1 = torch.randn(2, 8, device="cuda:1")
+        ref = self._coor_inductor_fn(inp1)
+        with fresh_cache():
+            with torch.cuda.device(0):
+                compiled = torch.compile(
+                    self._coor_inductor_fn, backend="inductor", fullgraph=True
+                )
+                compiled(torch.randn(2, 8, device="cuda:0"))  # populate cache on cuda:0
+            # Drop in-memory caches (keeping the on-disk bundle) so the cuda:1 run reloads
+            # from disk -- simulating a fresh per-rank process rather than reusing the
+            # cuda:0 launcher in memory.
+            torch._dynamo.reset()
+            clear_inductor_caches()
+            with torch.cuda.device(1):
+                compiled = torch.compile(
+                    self._coor_inductor_fn, backend="inductor", fullgraph=True
+                )
+                out = compiled(inp1)  # reload the cuda:0 bundle and run on cuda:1
+        self.assertEqual(out.device, torch.device("cuda:1"))
+        self.assertEqual(out, ref)
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
+    @compiler_config.patch(compile_on_one_rank=True)
+    def test_inductor_shared_kernel_reused_in_process_across_devices(self):
+        # Under CooR the kernel cache key is device-agnostic, so a single in-process
+        # compiled artifact (the autotuner and its loaded launcher) can be invoked on
+        # more than one device -- e.g. one process driving multiple GPUs. A loaded
+        # CUfunction is device-bound, so the launcher must keep per-device handles;
+        # otherwise a kernel first loaded on cuda:0 is launched on a cuda:1 stream and
+        # raises `invalid resource handle`. Unlike
+        # test_inductor_cached_kernel_reused_across_devices, the in-memory caches are
+        # NOT dropped between the two device runs, so this exercises in-process reuse of
+        # the loaded launcher (not reload-from-disk).
+        from torch._inductor.utils import clear_inductor_caches
+
+        try:
+            from torch._inductor.utils import fresh_cache
+        except ImportError:
+            from torch._inductor.utils import fresh_inductor_cache as fresh_cache
+
+        inp0 = torch.randn(2, 8, device="cuda:0")
+        ref0 = self._coor_inductor_fn(inp0)
+        inp1 = torch.randn(2, 8, device="cuda:1")
+        ref1 = self._coor_inductor_fn(inp1)
+        torch._dynamo.reset()
+        clear_inductor_caches()
+        with fresh_cache():
+            compiled = torch.compile(
+                self._coor_inductor_fn, backend="inductor", fullgraph=True
+            )
+            with torch.cuda.device(0):
+                out0 = compiled(inp0)
+            # The same in-process autotuner (loaded on cuda:0) now launches on cuda:1.
+            with torch.cuda.device(1):
+                out1 = compiled(inp1)
+        self.assertEqual(out0.device, torch.device("cuda:0"))
+        self.assertEqual(out1.device, torch.device("cuda:1"))
+        self.assertEqual(out0, ref0)
+        self.assertEqual(out1, ref1)
 
 
 if __name__ == "__main__":

@@ -608,6 +608,28 @@ class ExitSubgraphLine(WrapperLine):
         return converter._generate_exit_subgraph
 
 
+# [device-as-parameter] Name of the call()-local variable holding the runtime current
+# device index under compile-on-one-rank, so the wrapper is byte-identical across ranks.
+_COOR_DEVICE_IDX_VAR = "_coor_device_idx"
+
+
+def _coor_device_idx_ref(device_idx: int) -> int | str:
+    """Device index to emit in the wrapper. Under compile-on-one-rank, the call()-local
+    runtime current-device variable (so the wrapper is byte-identical across ranks);
+    otherwise the literal compile-time index."""
+    from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+    return _COOR_DEVICE_IDX_VAR if _coor_enabled() else device_idx
+
+
+def _coor_device_type_str(device: torch.device) -> str:
+    """Render a device for the benchmark harness. Under compile-on-one-rank, the bare type
+    (no rank-specific index) so the harness is byte-identical across ranks."""
+    from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+    return device.type if _coor_enabled() else str(device)
+
+
 @dataclasses.dataclass
 class EnterDeviceContextManagerLine(WrapperLine):
     device_idx: int
@@ -639,9 +661,21 @@ class EnterDeviceContextManagerLine(WrapperLine):
         else:
             # Note _DeviceGuard has less overhead than device, but only accepts
             # integers
-            code.writeline(f"with {V.graph.device_ops.device_guard(self.device_idx)}:")
+            from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+            if _coor_enabled():
+                # compile-on-one-rank: resolve the device at runtime so the wrapper is
+                # byte-identical across ranks -- a shared artifact follows each rank's
+                # current device instead of the compile-time index.
+                idx: int | str = _COOR_DEVICE_IDX_VAR
+                code.writeline(
+                    f"{idx} = {V.graph.device_ops.current_device_idx_expr()}"
+                )
+            else:
+                idx = self.device_idx
+            code.writeline(f"with {V.graph.device_ops.device_guard(idx)}:")
             code.do_indent()
-            code.writeline(V.graph.device_ops.set_device(self.device_idx))
+            code.writeline(V.graph.device_ops.set_device(idx))
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_enter_device_context_manager
@@ -1884,7 +1918,7 @@ class PythonWrapperCodegen(CodeGen):
             if V.graph.cpp_wrapper:
                 # For cpp wrapper, no need to continue codegen for the main body
                 return name
-        self.writeline(f"{name} = get_raw_stream({device_idx})")
+        self.writeline(f"{name} = get_raw_stream({_coor_device_idx_ref(device_idx)})")
         return name
 
     def get_codegened_graph(self):
@@ -2813,7 +2847,7 @@ class PythonWrapperCodegen(CodeGen):
                 f"{name} = rand_strided("
                 f"{self.codegen_python_shape_tuple(shape)}, "
                 f"{self.codegen_python_shape_tuple(stride)}, "
-                f"device='{device}', dtype={dtype})"
+                f"device='{_coor_device_type_str(device)}', dtype={dtype})"
             )
 
         def add_expr_input(name, val):
@@ -2891,7 +2925,7 @@ class PythonWrapperCodegen(CodeGen):
                     continue
                 numel = group.nbytes // torch._utils._element_size(group.dtype)
                 output.writeline(
-                    f"{group.buffer_name} = rand_strided(({numel},), (1,), device='{group.device}', dtype={group.dtype})"
+                    f"{group.buffer_name} = rand_strided(({numel},), (1,), device='{_coor_device_type_str(group.device)}', dtype={group.dtype})"
                 )
                 for name, (shape, stride) in group.inputs.items():
                     aliased_input_specs[name] = (group.buffer_name, shape, stride)
@@ -4755,7 +4789,9 @@ class SubgraphPythonWrapperCodegen(PythonWrapperCodegen):
             )
         else:
             name = get_raw_stream_name(device_idx)
-            self.writeline(f"{name} = get_raw_stream({device_idx})")
+            self.writeline(
+                f"{name} = get_raw_stream({_coor_device_idx_ref(device_idx)})"
+            )
         return name
 
     def codegen_graph_nvtx_range_push(self, post_grad_graph_id: int) -> None:

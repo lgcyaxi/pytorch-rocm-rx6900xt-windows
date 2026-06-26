@@ -17,13 +17,13 @@ class CpuDeviceOpOverrides(DeviceOpOverrides):
     def cpp_kernel_type(self) -> str:
         return "void*"
 
-    def set_device(self, device_idx: int) -> str:
+    def set_device(self, device_idx: int | str) -> str:
         return "pass"
 
     def synchronize(self) -> str:
         return "pass"
 
-    def device_guard(self, device_idx: int) -> str:
+    def device_guard(self, device_idx: int | str) -> str:
         return "torch._ops.contextlib.nullcontext()"
 
 
