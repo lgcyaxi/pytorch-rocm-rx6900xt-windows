@@ -117,7 +117,6 @@ if TYPE_CHECKING:
         TritonKernelType,
     )
 
-    from .dicts import DunderDictVariable
     from .lists import BaseListVariable, ListVariable
     from .tensor import TensorVariable
 
@@ -396,12 +395,6 @@ def fn_var_getattr(
 
 
 class BaseUserFunctionVariable(VariableTracker):
-    def __init__(
-        self, dict_vt: "DunderDictVariable | None" = None, **kwargs: Any
-    ) -> None:
-        super().__init__(**kwargs)
-        self.dict_vt: DunderDictVariable | None = dict_vt
-
     def richcompare_impl(self, tx, other, op):
         from .object_protocol import object_richcompare
 
@@ -412,11 +405,6 @@ class BaseUserFunctionVariable(VariableTracker):
 
     def get_source(self) -> Source | None:
         return self.source
-
-    def get_dict_vt(self, tx: "InstructionTranslatorBase") -> "DunderDictVariable":
-        if self.dict_vt is None:
-            self.dict_vt = variables.DunderDictVariable.create(tx, self)
-        return self.dict_vt
 
     def repr_impl(self, tx: Any) -> "VariableTracker":
         # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/funcobject.c

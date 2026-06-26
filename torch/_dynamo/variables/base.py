@@ -341,7 +341,13 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         "mutation_type",
         "parents_tracker",
         "user_code_variable_name",
+        "dict_vt",
     }
+
+    # Lazily-created view of the instance __dict__, backed by the side effects
+    # table. Only meaningful for VTs whose represented type has an instance
+    # dict (see has_instance_dict); None otherwise.
+    dict_vt: variables.DunderDictVariable | None = None
 
     def clone(self, **kwargs: Any) -> VariableTracker:
         """Shallow copy with some (optional) changes"""
@@ -587,6 +593,17 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         ensure the dispatched handler remains valid.
         """
         return type(self)
+
+    def get_dict_vt(
+        self, tx: InstructionTranslatorBase
+    ) -> variables.DunderDictVariable:
+        # Callers gate this on the object actually having an instance __dict__
+        # (e.g. the per-VT `__dict__` attribute branches). If a VT without a
+        # real instance dict reaches here, DunderDictVariable's example-value
+        # lookup graph-breaks rather than fabricating a bogus dict.
+        if self.dict_vt is None:
+            self.dict_vt = variables.DunderDictVariable.create(tx, self)
+        return self.dict_vt
 
     def var_getattr(self, tx: InstructionTranslatorBase, name: str) -> VariableTracker:
         """getattr(self, name) returning a new variable"""
@@ -1790,11 +1807,14 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         source: Source | None = None,
         mutation_type: MutationType | None = None,
         source_location: SourceLocation | None = None,
+        dict_vt: variables.DunderDictVariable | None = None,
     ) -> None:
         super().__init__()
         self.source = source
         self.source_location = source_location
         self.mutation_type = mutation_type
+        # Carried so clone() round-trips the cached __dict__ view.
+        self.dict_vt = dict_vt
 
         # NOTE sometimes mutation_type is set afterwards for implementation
         # convenience, we don't validate those cases at the moment.
