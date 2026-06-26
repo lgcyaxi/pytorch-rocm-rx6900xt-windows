@@ -222,9 +222,6 @@ class TestFakePG(TestCase):
             backend="fake", rank=0, world_size=world_size, store=store
         )
 
-        device_mesh = DeviceMesh(
-            device_type, torch.arange(0, world_size).view(-1, tp_size)
-        )
         device_mesh = init_device_mesh(
             device_type, (world_size // tp_size, tp_size), mesh_dim_names=["dp", "tp"]
         )

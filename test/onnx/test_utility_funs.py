@@ -290,7 +290,6 @@ class TestUtilityFuns(_BaseTestCase):
         GLOBALS.operator_export_type = OperatorExportTypes.ONNX
         x = torch.ones(1, 3)
         model = GatherModule()
-        model(x)
         graph, _, __ = self._model_to_graph(
             GatherModule(), (x,), input_names=["x"], dynamic_axes={"x": [0, 1]}
         )
