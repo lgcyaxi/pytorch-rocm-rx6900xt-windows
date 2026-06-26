@@ -345,6 +345,16 @@ class _KinetoProfile:
                 enable_cuda_sync=bool(
                     self._custom_profiler_config.get("enable_cuda_sync_events")
                 ),
+                # PM sampling (true SM-active % + DRAM-throughput % counters) is opt-in: it
+                # locks GPU clocks while active, so it is not always-on like env counters.
+                enable_pm_sampling=bool(
+                    self._custom_profiler_config.get("enable_pm_sampling")
+                ),
+                # PM sampling interval (microseconds); finer = tighter counter-to-op
+                # alignment (less 1 ms-bucket lead) at more samples. Default 1 ms.
+                pm_sampling_interval_us=int(
+                    self._custom_profiler_config.get("pm_sampling_interval_us", 1000)
+                ),
                 # Synchronous export finalizes on the calling thread, so skip the poll thread.
                 defer_export=self._cupti_async_export,
             )

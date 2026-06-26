@@ -4,8 +4,10 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import os
+import sys
 import time as _time
-from typing import Any, cast, TYPE_CHECKING
+from typing import Any, cast
 
 import numpy as np
 
@@ -19,9 +21,6 @@ try:
 except ImportError:
     _orjson = None  # type: ignore[assignment]
 
-
-if TYPE_CHECKING:
-    import os
 
 from cupti.cupti import (  # pyrefly: ignore[missing-import]
     Driver_api_trace_cbid,
@@ -940,6 +939,31 @@ _RENDER_EXTRA = (
 _LAUNCH_DIMS = ("grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z")
 
 
+def _process_name() -> str:
+    try:
+        with open("/proc/self/comm") as f:
+            return f.read().strip() or "python"
+    except OSError:
+        return os.path.basename(sys.executable) or "python"
+
+
+def _gpu_panel_const_extra(gpu: np.ndarray) -> list[tuple[str, str]]:
+    """Trace-wide string args the GPU Compute panel reads off each kernel slice
+    (extract_arg 'arch'/'process_id'/'process_name'): the traced device's arch
+    (compute capability) plus the owning process. Constant across the trace, so
+    emitted once per event rather than per-kernel-profiled."""
+    out: list[tuple[str, str]] = []
+    try:
+        dev = int(gpu[0]) if len(gpu) else torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(dev)
+        out.append(("arch", f"sm_{major}{minor}"))
+    except Exception:
+        pass
+    out.append(("process_id", str(os.getpid())))
+    out.append(("process_name", _process_name()))
+    return out
+
+
 def _build_render_stages(columns: dict, gfx_pid: int, iid_of: dict, name_table: list):
     """Build the GpuRenderStageEvent payload (gpu_specs, gfx_contexts, stage_cols, extra,
     launch, tables) for the native GPU Render Stages hardware-queue lanes, or None if there are
@@ -1065,6 +1089,7 @@ def _build_render_stages(columns: dict, gfx_pid: int, iid_of: dict, name_table: 
         extra,
         launch,
         (compute_kernels, arg_names),
+        _gpu_panel_const_extra(gpu),
     )
 
 
@@ -1115,6 +1140,138 @@ def _build_gpu_counters(env: dict | None, active_devices: set):
         np.concatenate(ts_l).astype(np.int64),
         np.concatenate(cid_l).astype(np.int32),
         np.concatenate(val_l).astype(np.float64),
+    )
+
+
+def _build_pm_counters(pm: dict | None, active_devices: set):
+    """Build the GpuCounterEvent payload from PM-sampling columns (start_ns/device_id plus one
+    ``c<counter_id>`` value column per metric, see pm_sampling.PM_METRICS): same tuple shape as
+    :func:`_build_gpu_counters`. Restricted to devices that ran GPU work."""
+    from torch.profiler._cupti.pm_sampling import PM_METRICS
+
+    if not pm or not len(pm.get("start_ns", ())):
+        return None
+    ts = np.ascontiguousarray(pm["start_ns"], dtype=np.int64)
+    dev = np.asarray(pm["device_id"], dtype=np.int64)
+    base = (
+        np.isin(dev, list(active_devices))
+        if active_devices
+        else np.ones(len(dev), dtype=bool)
+    )
+    if not base.any():
+        return None
+    specs, gpu_l, ts_l, cid_l, val_l = [], [], [], [], []
+    for cid, name, _ in PM_METRICS:
+        col = pm.get(f"c{cid}")
+        if col is None:
+            continue
+        specs.append((cid, name))
+        gpu_l.append(dev[base])
+        ts_l.append(ts[base])
+        cid_l.append(np.full(int(base.sum()), cid, dtype=np.int32))
+        val_l.append(np.asarray(col, dtype=np.float64)[base])
+    if not specs:
+        return None
+    return (
+        specs,
+        np.concatenate(gpu_l).astype(np.int32),
+        np.concatenate(ts_l).astype(np.int64),
+        np.concatenate(cid_l).astype(np.int32),
+        np.concatenate(val_l).astype(np.float64),
+    )
+
+
+# Per-kernel derived Cycles counter for the GPU Compute panel (counter_id after env 1-5 + PM
+# 6-9). gpc__cycles_elapsed is *elapsed* cycles = duration * clock -- pure scalar math from the
+# kernel's duration + the device SM clock, no perf counters. SM Frequency is intentionally not
+# emitted: it is the same value as the always-on "SM Clock (MHz)" environment counter.
+_CYCLE_COUNTER = (10, "gpc__cycles_elapsed.max")
+
+
+def _device_clocks_hz(env: dict | None) -> dict[int, float]:
+    """Median SM clock (Hz) per device from the sampled ENVIRONMENT SPEED records
+    (environment_kind==1; smClock is the low u32 of the union, in MHz)."""
+    if not env or not len(env.get("start_ns", ())):
+        return {}
+    ek = np.asarray(env["environment_kind"])
+    m = ek == 1
+    if not m.any():
+        return {}
+    sm_mhz = (
+        np.asarray(env["data"], dtype=np.uint64)[m] & np.uint64(0xFFFFFFFF)
+    ).astype(np.float64)
+    dev = np.asarray(env["device_id"], dtype=np.int64)[m]
+    return {int(d): float(np.median(sm_mhz[dev == d])) * 1e6 for d in np.unique(dev)}
+
+
+def _build_cycle_counters(kernel: dict | None, env: dict | None, active_devices: set):
+    """Per-kernel Cycles (gpc__cycles_elapsed = duration * clock) for the GPU Compute panel,
+    derived as scalar math from each kernel's duration (activity record) and the device SM clock
+    (env counter). One sample per kernel at its start, so every kernel gets an exact value (no
+    sampling sparseness); placed in the COMPUTE group so the panel's kernel<->counter time-window
+    join finds it, and emitted as an int (a cycle count). Returns the 5-tuple plus a 6th
+    compute_group and 7th int_value_ids."""
+    if not kernel or not len(kernel.get("start_ns", ())):
+        return None
+    clocks = _device_clocks_hz(env)
+    if not clocks:
+        return None
+    cid = _CYCLE_COUNTER[0]
+    ts = np.ascontiguousarray(kernel["start_ns"], dtype=np.int64)
+    end = np.asarray(kernel["end_ns"], dtype=np.int64)
+    dev = np.asarray(kernel["device_id"], dtype=np.int64)
+    clk = np.array([clocks.get(int(d), 0.0) for d in dev], dtype=np.float64)
+    base = (clk > 0) & (
+        np.isin(dev, list(active_devices))
+        if active_devices
+        else np.ones(len(dev), dtype=bool)
+    )
+    if not base.any():
+        return None
+    devb = dev[base].astype(np.int32)
+    cycles = (np.maximum(end - ts, 0).astype(np.float64)[base] / 1e9) * clk[base]
+    return (
+        [_CYCLE_COUNTER],
+        devb,
+        ts[base].astype(np.int64),
+        np.full(len(devb), cid, np.int32),
+        cycles,
+        [cid],  # compute_group
+        [cid],  # int_value_ids
+    )
+
+
+def _merge_counters(*parts):
+    """Concatenate GpuCounterEvent payloads (the tuples from the per-source builders) into a
+    single payload for the encoder; the counter_id namespaces are disjoint across sources. A part
+    may carry a 6th element (COMPUTE-group counter_ids) and a 7th (int-valued counter_ids), each
+    unioned into the result."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    specs: list = []
+    gpu_l, ts_l, cid_l, val_l = [], [], [], []
+    compute_group: list = []
+    int_value_ids: list = []
+    for p in parts:
+        s, g, t, c, v = p[:5]
+        specs.extend(s)
+        gpu_l.append(g)
+        ts_l.append(t)
+        cid_l.append(c)
+        val_l.append(v)
+        if len(p) > 5 and p[5]:
+            compute_group.extend(p[5])
+        if len(p) > 6 and p[6]:
+            int_value_ids.extend(p[6])
+    return (
+        specs,
+        np.concatenate(gpu_l),
+        np.concatenate(ts_l),
+        np.concatenate(cid_l),
+        np.concatenate(val_l),
+        compute_group,
+        int_value_ids,
     )
 
 
@@ -1557,7 +1714,13 @@ def _window_to_pftrace(
             active_devices.update(np.unique(c["device_id"]).tolist())
     # GPU counters (power/temp/clocks) -> GpuCounterEvents: the viewer renders them under
     # "GPU / Counters / <gpu>", a sibling of the render-stage hardware queues, keyed by gpu_id.
-    counters = _build_gpu_counters(columns.get("environment"), active_devices)
+    counters = _merge_counters(
+        _build_gpu_counters(columns.get("environment"), active_devices),
+        _build_pm_counters(columns.get("pm_sampling"), active_devices),
+        _build_cycle_counters(
+            columns.get("kernel"), columns.get("environment"), active_devices
+        ),
+    )
     # encode_pftrace returns gzip-compressed bytes (compressed in C++), so write as-is.
     out = torch._C._profiler._cupti_monitor.encode_pftrace(
         tracks, name_table, group_tuples, render, counters

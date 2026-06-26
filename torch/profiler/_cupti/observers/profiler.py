@@ -24,6 +24,7 @@ from torch.profiler._cupti.observers.base import (
     ObserverAnnotationSettings,
 )
 from torch.profiler._cupti.observers.observation_window import WindowFinalizerMixin
+from torch.profiler._cupti.pm_sampling import is_available as pm_is_available, PmSampler
 from torch.profiler._cupti.records import (
     Api,
     CudaEvent,
@@ -190,6 +191,8 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         metadata_resolver: Callable[[int], str | None] | None = None,
         enable_cuda_sync: bool = False,
         defer_export: bool = True,
+        enable_pm_sampling: bool = False,
+        pm_sampling_interval_us: int = 1000,
     ) -> None:
         self._lock = threading.Lock()
         # Decoded activity kept COLUMNAR (frames of named numpy columns, not per-record
@@ -232,6 +235,16 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                 poll_interval_ms=20,
                 thread_name="cupti-profiler-export",
                 auto_start_poller=defer_export,
+            )
+        # Opt-in PM sampling (true SM-active % + DRAM-throughput %): a dedicated poller whose
+        # decoded samples land as a "pm_sampling" timed frame, bucketed into the window like any
+        # other and rendered as GPU counter tracks. Off by default -- it locks GPU clocks.
+        self._pm_sampler: PmSampler | None = None
+        if enable_pm_sampling and self.available and pm_is_available():
+            self._pm_sampler = PmSampler(
+                self._pm_sink,
+                self.convert_time_array,
+                sampling_interval_ns=pm_sampling_interval_us * 1000,
             )
 
     def _boundary_clock_ns(self) -> int:
@@ -308,6 +321,14 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
 
     # --- async window API (the cupti_monitor profiler backend drives these) ----
 
+    def _pm_sink(self, frame: dict[str, Any]) -> None:
+        # Sink for PM-sampling decode (drained at close_window): append a converted sample frame
+        # as a timed "pm_sampling" frame, but only while a window is open/pending (else no window
+        # will consume it).
+        with self._lock:
+            if self._open_start is not None or self._windows:
+                self._timed_frames.append(("pm_sampling", frame))
+
     def open_window(self) -> None:
         """Start a trace window; records before this are excluded (no prepare-phase leak)."""
         # Capture the starting thread so its RUNTIME/DRIVER records map to the OS tid
@@ -315,12 +336,18 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
         self._record_calling_thread()
         with self._lock:
             self._open_start = self._boundary_clock_ns()
+        if self._pm_sampler is not None:
+            self._pm_sampler.start()
 
     def close_window(self) -> int | None:
         """End the open window and queue it for deferred export; snapshots its annotations +
         thread map now. Pair with :meth:`set_export` for the paths. Returns the window id."""
         if not self.available:
             return None
+        # Stop the PM poller first (it does a final tail decode): _open_start is still set, so
+        # those tail frames pass _pm_sink's active check and land in this window.
+        if self._pm_sampler is not None:
+            self._pm_sampler.stop()
         with self._lock:
             start = self._open_start if self._open_start is not None else 0
             self._open_start = None
@@ -378,6 +405,8 @@ class ProfilerObserver(WindowFinalizerMixin, CuptiMonitorObserver):
                         self._boundaries
                     )  # stalled -> fall back to a forced drain
             self._stop_observation_window(sync=sync)
+        if self._pm_sampler is not None:
+            self._pm_sampler.stop()  # idempotent; covers a join without a close_window
         # Write on the foreground (here and in set_export), never the poll thread, so it
         # stays inside the caller's temp-dir lifetime.
         for window_id in list(self._windows):
