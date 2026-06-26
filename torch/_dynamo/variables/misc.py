@@ -189,7 +189,7 @@ class SuperVariable(VariableTracker):
             ],
         )
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         # Check if getattr is a constant. If not, delay the actual work by
@@ -439,7 +439,7 @@ class FrameSummaryVariable(VariableTracker):
     def python_type(self) -> type:
         return traceback.FrameSummary
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name == "lineno":
@@ -450,7 +450,7 @@ class FrameSummaryVariable(VariableTracker):
             return VariableTracker.build(tx, self.frame_summary.name)
         elif name == "line":
             return VariableTracker.build(tx, self.frame_summary.line)
-        return super().var_getattr(tx, name)
+        return super().getattro_impl(tx, name)
 
 
 class TracebackVariable(VariableTracker):
@@ -523,13 +523,13 @@ class TracebackVariable(VariableTracker):
             self.tb_next = val
         return variables.ConstantVariable.create(None)
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name == "tb_next":
             return self.tb_next
         elif name == "tb_lineno":
-            return self.frame_summary.var_getattr(tx, "lineno")
+            return self.frame_summary.getattro_impl(tx, "lineno")
         elif name == "frame_summary":
             return self.frame_summary
         elif name == "tb_lasti":
@@ -539,7 +539,7 @@ class TracebackVariable(VariableTracker):
                 explanation="Dynamo does not support accessing the tb_lasti attribute of traceback objects.",
                 hints=[*graph_break_hints.SUPPORTABLE],
             )
-        return super().var_getattr(tx, name)
+        return super().getattro_impl(tx, name)
 
     def richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
@@ -708,7 +708,7 @@ class ExceptionVariable(VariableTracker):
         else:
             return super().call_method(tx, name, args, kwargs)
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name == "__class__":
@@ -727,7 +727,7 @@ class ExceptionVariable(VariableTracker):
                 tuple(self.args),
                 source=self.source and AttrSource(self.source, "args"),
             )
-        return super().var_getattr(tx, name)
+        return super().getattro_impl(tx, name)
 
     def __str__(self) -> str:
         return f"{self.__class__.__name__}({self.exc_type})"
@@ -796,7 +796,7 @@ class ComptimeVariable(VariableTracker):
     def reconstruct(self, codegen: "PyCodegen") -> None:
         raise NotImplementedError("comptime is special form")
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         from ..comptime import comptime
@@ -1327,7 +1327,7 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
             self.saved_tensors.tensors.append(arg)
         return variables.ConstantVariable.create(None)
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if name in ["save_for_backward", "mark_dirty", "mark_non_differentiable"]:
@@ -1348,7 +1348,7 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
                 # type: ignore[attr-defined]
                 return VariableTracker.build(tx, self.value.needs_input_grad, source)
 
-        return super().var_getattr(tx, name)
+        return super().getattro_impl(tx, name)
 
 
 class AutogradEngineVariable(UserDefinedObjectVariable):
@@ -1520,7 +1520,7 @@ class GetAttrVariable(VariableTracker):
         from .object_protocol import generic_richcompare
 
         try:
-            resolved = self.obj.var_getattr(tx, self.name)
+            resolved = self.obj.getattro_impl(tx, self.name)
         except NotImplementedError:
             resolved = None
         if resolved is None or isinstance(resolved, GetAttrVariable):
@@ -1588,7 +1588,7 @@ class PythonModuleVariable(VariableTracker):
         result = hasattr(self.value, name)
         return VariableTracker.build(tx, result)
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         if tx.output.side_effects.has_pending_mutation_of_attr(self, name):
@@ -1681,7 +1681,7 @@ class TypingVariable(VariableTracker):
             return VariableTracker.build(tx, NotImplemented)
         return VariableTracker.build(tx, result)
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         from .builder import SourcelessBuilder, VariableBuilder
@@ -2318,7 +2318,7 @@ class ConstantLikeVariable(VariableTracker):
             ],
         )
 
-    def var_getattr(
+    def getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
         result = getattr(self.value, name)
