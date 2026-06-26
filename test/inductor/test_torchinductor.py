@@ -4079,7 +4079,7 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(
             result.returncode,
             0,
-            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            msg=lambda msg: f"{msg}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
     @skip_if_cpu
@@ -7606,7 +7606,7 @@ for dtype in (torch.int32, torch.int64):
             self.assertEqual(
                 mul_node in folder.node_replacements,
                 should_fold,
-                msg=f"unexpected fold decision for dtype={dtype}",
+                msg=lambda msg: f"{msg}\nunexpected fold decision for dtype={dtype}",
             )
 
     def test_mul_by_zero_extremal(self):
@@ -19161,7 +19161,7 @@ if RUN_GPU:
 
                 x = torch.randn(8, device=GPU_TYPE)
                 code = run_and_get_triton_code(fn_opt, x)
-                self.assertEqual(fn_opt(x), fn(x), msg=f"{dynamic=}")
+                self.assertEqual(fn_opt(x), fn(x), msg=lambda msg: f"{msg}\n{dynamic=}")
 
                 # Check that there's indirect indexing...
                 has_indirect(code, tl_fn="tl.load")
@@ -19191,7 +19191,7 @@ if RUN_GPU:
                 # Correctness
                 out_opt = fn_opt(a.clone(), z, b, idx0, idx1)
                 out = fn(a.clone(), z, b, idx0, idx1)
-                self.assertEqual(out_opt, out, msg=f"{dynamic=}")
+                self.assertEqual(out_opt, out, msg=lambda msg: f"{msg}\n{dynamic=}")
 
                 # We have an indirect store via atomic_add
                 has_indirect(code, tl_fn="tl.atomic_add")
@@ -20532,7 +20532,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for multinomial, got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for multinomial, got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20553,7 +20553,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for bincount, got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for bincount, got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20576,7 +20576,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for unique, got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for unique, got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20601,7 +20601,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for unique_consecutive, got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for unique_consecutive, got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20626,7 +20626,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for unique(dim=0), got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for unique(dim=0), got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20651,7 +20651,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for unique_consecutive(dim=0), got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for unique_consecutive(dim=0), got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(inp)
@@ -20685,7 +20685,7 @@ if RUN_GPU:
             self.assertEqual(
                 explanation.graph_break_count,
                 0,
-                f"Expected 0 graph breaks for _amp_update_scale_, got: {explanation.graph_break_count}",
+                lambda msg: f"{msg}\nExpected 0 graph breaks for _amp_update_scale_, got: {explanation.graph_break_count}",
             )
 
             result = torch.compile(fn)(
