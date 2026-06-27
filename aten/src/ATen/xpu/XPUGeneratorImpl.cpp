@@ -27,7 +27,8 @@ std::vector<Generator> default_gens_xpu;
 // Bridge wrappers that allow kernel DLLs (in torch-xpu-ops) to call
 // generator functions via c10_xpu.dll instead of linking torch_xpu.dll.
 // This breaks the cyclic dependency in BUILD_SEPARATE_OPS builds.
-static c10::intrusive_ptr<c10::GeneratorImpl> bridgeGetDefaultGenerator(int64_t device_index) {
+static c10::intrusive_ptr<c10::GeneratorImpl> bridgeGetDefaultGenerator(
+    int64_t device_index) {
   return c10::intrusive_ptr<c10::GeneratorImpl>(
       getDefaultXPUGenerator(device_index));
 }

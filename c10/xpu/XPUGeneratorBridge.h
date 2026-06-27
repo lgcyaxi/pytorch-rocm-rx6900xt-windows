@@ -11,7 +11,8 @@ namespace c10::xpu {
 // BUILD_SEPARATE_OPS mode) call these through c10_xpu.dll to avoid a
 // link-time dependency on torch_xpu.dll.
 
-using GetDefaultGeneratorFn = c10::intrusive_ptr<c10::GeneratorImpl> (*)(int64_t device_index);
+using GetDefaultGeneratorFn = c10::intrusive_ptr<c10::GeneratorImpl> (*)(
+    int64_t device_index);
 using PhiloxStateFn = std::pair<uint64_t, uint64_t> (*)(
     c10::GeneratorImpl* gen,
     uint64_t increment);

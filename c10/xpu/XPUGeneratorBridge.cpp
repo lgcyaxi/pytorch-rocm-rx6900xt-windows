@@ -13,7 +13,8 @@ void registerXPUGeneratorBridge(
   g_philox_fn = philox;
 }
 
-c10::intrusive_ptr<c10::GeneratorImpl> getDefaultXPUGeneratorBridge(int64_t device_index) {
+c10::intrusive_ptr<c10::GeneratorImpl> getDefaultXPUGeneratorBridge(
+    int64_t device_index) {
   TORCH_CHECK(
       g_get_gen_fn != nullptr,
       "XPU generator bridge not registered. "
