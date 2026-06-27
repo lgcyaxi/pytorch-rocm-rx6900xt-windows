@@ -1017,5 +1017,140 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
 
+class TestGlobalCompiledCache(TestCase):
+    """Tests for the global compiled artifact cache and key construction."""
+
+    def setUp(self):
+        super().setUp()
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _global_compiled_cache,
+        )
+
+        _global_compiled_cache.cache_clear()
+
+    def tearDown(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _global_compiled_cache,
+        )
+
+        _global_compiled_cache.cache_clear()
+        super().tearDown()
+
+    def test_key_distinguishes_variant_name(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key_gemm = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        key_scaled = _make_global_compiled_key(
+            "kernel_A", "SCALED_GEMM", torch.float32, tensor_key, 0
+        )
+        self.assertNotEqual(key_gemm, key_scaled)
+
+    def test_key_distinguishes_accumulator_type(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key_fp32 = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        key_fp16 = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float16, tensor_key, 0
+        )
+        self.assertNotEqual(key_fp32, key_fp16)
+
+    def test_key_distinguishes_epilogue(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key_no_epi = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        key_epi = _make_global_compiled_key(
+            "kernel_A",
+            "GEMM",
+            torch.float32,
+            tensor_key,
+            0,
+            epilogue_source="relu",
+            has_epilogue=True,
+        )
+        self.assertNotEqual(key_no_epi, key_epi)
+
+    def test_key_matches_across_autotune_and_runtime(self):
+        """Non-epilogue autotune key matches non-epilogue runtime key."""
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        autotune_key = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        runtime_key = _make_global_compiled_key(
+            "kernel_A",
+            "GEMM",
+            torch.float32,
+            tensor_key,
+            0,
+            epilogue_source="",
+            has_epilogue=False,
+        )
+        self.assertEqual(autotune_key, runtime_key)
+
+    def test_cache_insert_and_get(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _global_compiled_cache,
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        sentinel = object()
+        self.assertTrue(_global_compiled_cache.insert(key, sentinel))
+        self.assertIs(_global_compiled_cache.get(key), sentinel)
+
+    def test_cache_no_overwrite(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _global_compiled_cache,
+            _make_global_compiled_key,
+        )
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        first = object()
+        second = object()
+        self.assertTrue(_global_compiled_cache.insert(key, first))
+        self.assertFalse(_global_compiled_cache.insert(key, second))
+        self.assertIs(_global_compiled_cache.get(key), first)
+
+    def test_cache_cleared_on_fresh_cache(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _global_compiled_cache,
+            _make_global_compiled_key,
+        )
+        from torch._inductor.utils import clear_caches
+
+        tensor_key = ((128, 256), (256, 1), torch.float16)
+        key = _make_global_compiled_key(
+            "kernel_A", "GEMM", torch.float32, tensor_key, 0
+        )
+        _global_compiled_cache.insert(key, object())
+        self.assertIsNotNone(_global_compiled_cache.get(key))
+        clear_caches()
+        self.assertIsNone(_global_compiled_cache.get(key))
+
+
 if __name__ == "__main__":
     run_tests()
