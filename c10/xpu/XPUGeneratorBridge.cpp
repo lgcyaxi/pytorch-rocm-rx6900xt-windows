@@ -1,5 +1,5 @@
-#include <c10/xpu/XPUGeneratorBridge.h>
 #include <c10/util/Exception.h>
+#include <c10/xpu/XPUGeneratorBridge.h>
 
 namespace c10::xpu {
 
