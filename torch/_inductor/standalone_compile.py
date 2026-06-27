@@ -596,6 +596,168 @@ def standalone_compile(
     return CacheCompiledArtifact(compiled_fn, artifacts)
 
 
+class NoRunnableInductorModuleError(RuntimeError):
+    """Raised by ``compile_to_python`` when the graph yields no runnable Inductor
+    output module -- it has no compute to lower (returns inputs/constants unchanged),
+    so the compiled artifact carries no output-module source. Callers (e.g.
+    torch.compiler.precompile) convert this to a clear user-facing error suggesting an
+    alternative.
+    """
+
+
+def _runnable_source(artifact: CompiledArtifact) -> str:
+    """Return the final Inductor output-module source for a compiled ``artifact``.
+
+    Inductor stashes the wrapper-module source on the compiled callable as
+    ``source_code`` (a field of the underlying ``CompiledFxGraph`` propagated onto the
+    returned callable), populated identically whether the graph was freshly codegen'd
+    or restored from a warm in-process / out-of-process cache. It is the FINAL selected
+    module only: the throwaway max_autotune benchmark lowerings compile to their own
+    modules during autotuning and never become the returned artifact, so no filtering
+    is needed. A graph with no compute (returns inputs/constants unchanged) produces no
+    such source, which we surface as ``NoRunnableInductorModuleError``.
+    """
+    source = getattr(artifact._compiled_fn, "source_code", None)
+    if not isinstance(source, str) or not source:
+        raise NoRunnableInductorModuleError(
+            "the compiled graph produced no runnable Inductor output module: it has no "
+            "compute to lower (returns inputs/constants unchanged)."
+        )
+    return source
+
+
+def _binary_cache_bytes(artifact: CompiledArtifact) -> bytes | None:
+    """Serialize the artifact to opaque cache bytes, or None if it is not
+    serializable (e.g. graphs with input mutations currently do not produce a
+    saveable aot_autograd artifact). The source still runs standalone without it."""
+    # The only EXPECTED no-cache case is an artifact with no saveable aot_autograd
+    # entry (e.g. certain input-mutating graphs); detect it up front and skip the
+    # save so a genuine ``save`` regression surfaces below at warning instead of
+    # being silently downgraded to an "uncacheable" fallback (which would only show
+    # up later as a missing FxGraphCache hit on reload).
+    if not isinstance(artifact, CacheCompiledArtifact) or not artifact.is_saveable():
+        log.debug("standalone artifact has no saveable cache entry; no cache")
+        return None
+    try:
+        # Serialize fully in memory: these are exactly the bytes ``save(format=
+        # "binary")`` would write, and ``CompiledArtifact.load`` reads them back via
+        # ``load_cache_artifacts``, so the cache round-trips. Avoiding a temp file
+        # here means a SIGKILL mid-compile leaves no stray ``.bin`` in the cache dir.
+        return artifact._to_binary_bytes()
+    except Exception:
+        log.warning(
+            "standalone artifact failed to serialize unexpectedly; no cache",
+            exc_info=True,
+        )
+        return None
+
+
+def compile_to_python(
+    gm: GraphModule,
+    example_inputs: Sequence[InputType],
+    *,
+    dynamic_shapes: DynamicShapesType = "from_example_inputs",
+    options: dict[str, Any] | None = None,
+) -> tuple[str, bytes | None]:
+    """Compile ``gm`` and return ``(inner_python, cache)`` -- the INNER half of the
+    backend contract behind ``torch.compiler.precompile``.
+
+    This is an INTERNAL layered-contract entry point, not an end-user API. End users
+    should call ``torch.compiler.precompile``; this function only emits the inductor
+    piece of the artifact and assumes its caller (the AOT layer) wraps it. It lives in
+    ``torch._inductor`` (a private, leading-underscore module), so it is exposed for
+    the AOT layer to import, not as a stable public surface.
+
+    ``inner_python`` is the Inductor output module exposing ``call(args) -> outs``
+    for the post-AOTAutograd inner graph (dense, functionalized). It is the inductor
+    piece only: it carries NO prelude/epilogue (subclass flatten/unflatten, input-
+    mutation copy-back, output-alias regen, grad disabling). Those belong to the AOT
+    layer -- a companion change in ``torch._functorch.aot_autograd`` wraps this and
+    composes AOTAutograd's codegen'd runtime wrappers around the result.
+    Callers must run ``call`` under ``torch.no_grad()`` (the kernels use out= ops).
+
+    Caller preconditions (this layer does not re-derive them; passing a graph that
+    violates them yields wrong/unrunnable output rather than a clean error):
+
+    - ``gm`` is a post-AOTAutograd dense, functionalized inner graph (the dense
+      forward/backward AOTAutograd hands to its inductor backend), NOT a raw Dynamo
+      or pre-dispatch graph still carrying subclasses or autograd.
+    - ``gm`` lowers to a runnable inductor output module. A graph with no compute
+      raises ``NoRunnableInductorModuleError``.
+
+    ``dynamic_shapes`` defaults to ``"from_example_inputs"`` here, which DIFFERS from
+    the sibling ``torch._inductor.standalone_compile`` default of ``"from_graph"``.
+    The reason: this entry point is fed the post-AOTAutograd inner graph, whose
+    example-value metadata is the source of truth AOTAutograd already resolved, so
+    specializing on ``example_inputs`` matches what the AOT layer expects; the public
+    ``standalone_compile`` instead trusts the dynamic shapes baked into the passed-in
+    graph. See ``DynamicShapesType`` for the full set of modes.
+
+    ``options`` is an optional inductor config-override dict (``None`` means no
+    overrides), the same shape as ``torch._inductor.compile``'s ``options``. The
+    keys are inductor config names: they are merged into the ``config.patch``
+    block this function already wraps the compile in, so they take effect as
+    config rather than being forwarded as ``compile_fx`` kwargs. The two
+    capture-critical pins below (``benchmark_harness``, ``cpp_wrapper``) always win
+    over a conflicting user option, since the source-capture contract depends on
+    them and a caller cannot be allowed to break the emitted module.
+
+    The kernels JIT-compile from the inlined source on first call, so ``inner_python``
+    needs no cache. ``cache`` is an opaque acceleration (or ``None`` when the graph
+    is not serializable, e.g. some input-mutating graphs, or when caches are disabled --
+    the bytes come from the AOTAutograd cache, so any of ``force_disable_caches``,
+    ``fx_graph_cache=False``, or ``enable_autograd_cache=False`` yields ``None``).
+
+    ``inner_python`` is read off the compiled artifact -- Inductor stashes the final
+    wrapper-module source on the returned callable as ``source_code`` -- so it reflects
+    the FINAL selected module and is valid on a cold compile, a warm in-process or
+    out-of-process cache restore, or with caches disabled. No process-global codegen
+    hook is involved, and the throwaway max_autotune benchmark lowerings (which compile
+    to their own modules during autotuning) never reach the artifact, so nothing needs
+    to be filtered out.
+    """
+    if not isinstance(gm, torch.fx.GraphModule):
+        raise TypeError(
+            f"compile_to_python expects a post-AOTAutograd torch.fx.GraphModule, "
+            f"got {type(gm)}. This is an internal entry point wrapped by a higher AOT "
+            f"layer and is not meant to be called directly."
+        )
+    # Treat ``options`` as inductor config overrides and fold them into the same
+    # ``config.patch`` we wrap the compile in. The two output pins are applied AFTER the
+    # user options so they override any conflicting key: benchmark_harness=False keeps
+    # the emitted module runnable (no get_args()/benchmark_compiled_module()/__main__),
+    # and cpp_wrapper=False keeps it a python wrapper (the C++ backend emits a C++
+    # ``call`` we cannot inline). A caller must not be able to break either.
+    config_patches: dict[str, Any] = dict(options or {})
+    config_patches.update(
+        {
+            "benchmark_harness": False,
+            "cpp_wrapper": False,
+        }
+    )
+    # Compile under no_grad so AOTAutograd takes the inference (forward-only) path.
+    # compile_fx re-enters AOTAutograd, and with grad-requiring inputs it would otherwise
+    # build a JOINT graph and emit BOTH a forward and a backward output module, leaving
+    # "the" runnable module ambiguous. The contract feeds one dense post-AOTAutograd inner
+    # graph at a time (the AOT layer drives forward and backward as separate calls), so
+    # pinning inference is the explicit choice: it yields exactly one module whose outputs
+    # are this graph's own, and we never have to second-guess the strides or tensor
+    # subclasses of a backward AOTAutograd would otherwise synthesize.
+    with torch.no_grad(), config.patch(config_patches):
+        # ``options`` are already applied above as config, so pass none down to
+        # ``standalone_compile`` (it forwards options as ``compile_fx`` kwargs, which a
+        # config key like ``max_autotune`` is not).
+        artifact = standalone_compile(
+            gm,
+            example_inputs,
+            dynamic_shapes=dynamic_shapes,
+            options={},
+        )
+    inner_python = _runnable_source(artifact)
+    cache = _binary_cache_bytes(artifact)
+    return inner_python, cache
+
+
 def autograd_cache_key(
     graph,
     example_inputs,
