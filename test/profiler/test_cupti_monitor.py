@@ -1336,7 +1336,7 @@ _cupti_monitor.enable_hes_early()
                 # (start/end/queued), backend-specific ids (correlation/graph), and
                 # the occupancy fields kineto derives; the rest must match exactly.
                 META = ("grid", "block", "registers per thread", "shared memory",
-                        "device", "context", "priority", "channel", "channel_type")
+                        "device", "context", "channel", "channel_type")
                 meta = {}
                 for e in ev:
                     if e.get("cat") == "kernel" and e.get("ph") == "X":
