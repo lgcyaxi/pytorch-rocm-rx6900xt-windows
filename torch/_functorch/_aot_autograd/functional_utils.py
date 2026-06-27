@@ -479,6 +479,18 @@ class ViewMetaSequence:
 
         return self.metadata == other.metadata
 
+    @classmethod
+    def _from_parts(
+        cls, sequence: list[object], metadata: MetadataKey
+    ) -> ViewMetaSequence:
+        # Rebuild a ViewMetaSequence directly from its parts, bypassing the
+        # FunctionalTensor-based __init__. This lets the recipe be reconstructed from
+        # plain values rather than from a live FunctionalTensor or an embedded pickle.
+        self = cls.__new__(cls)
+        self.sequence = sequence  # type: ignore[assignment]
+        self.metadata = metadata
+        return self
+
 
 # new_arg and arg here are either:
 # (1) both a FakeTensor
