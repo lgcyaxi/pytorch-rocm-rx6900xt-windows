@@ -17,7 +17,7 @@ If the repo is already cloned:
 git submodule update --init --recursive external/TheRock
 ```
 
-## 2. Install Windows Build Tools
+## 2. Prepare Visual Studio
 
 Install:
 
@@ -30,15 +30,23 @@ Install:
 - Python 3.12
 - Git
 
-Validate the machine:
+Load the Visual Studio x64 build environment:
+
+```powershell
+$vs = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1"
+& $vs -Arch amd64 -HostArch amd64
+```
+
+Validate from the repository root:
 
 ```powershell
 cd external\TheRock
-.\build_tools\validate_windows_install.ps1
+powershell -ExecutionPolicy Bypass -File .\build_tools\validate_windows_install.ps1
 cd ..\..
 ```
 
-If ATL is missing, add the Visual Studio component:
+The validator should end with `0 FAIL`. If ATL is missing, add this Visual
+Studio component:
 
 ```powershell
 Microsoft.VisualStudio.Component.VC.ATL
@@ -52,31 +60,36 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python .\build_tools\fetch_sources.py
+cd ..\..
 ```
 
-## 4. Checkout Build Sources
+`fetch_sources.py` is only needed when building ROCm itself from TheRock source.
+For PyTorch wheels using `--install-rocm`, the TheRock Python requirements are
+the required preparation step.
 
-Run from `external\TheRock\external-builds\pytorch`:
+## 4. Checkout PyTorch Sources
 
 ```powershell
-cd external-builds\pytorch
+cd external\TheRock\external-builds\pytorch
+$buildRoot = "..\..\..\..\build"
+New-Item -ItemType Directory -Force $buildRoot | Out-Null
 
 python .\pytorch_torch_repo.py checkout `
   --gitrepo-origin ..\..\..\.. `
   --repo-hashtag main `
-  --checkout-dir ..\..\..\..\build\pytorch-src
-
-python .\pytorch_audio_repo.py checkout `
-  --checkout-dir ..\..\..\..\build\audio-src
-
-python .\pytorch_vision_repo.py checkout `
-  --checkout-dir ..\..\..\..\build\vision-src
+  --checkout-dir "$buildRoot\pytorch-src"
 ```
 
-## 5. Build The Wheel
+This checkout uses this fork as the PyTorch source, so it includes the RX 6900 XT
+Windows ROCm kernel fix.
+
+## 5. Build The Torch Wheel
+
+Keep the first build torch-only. It is the shortest path to a working wheel and
+avoids optional Windows failures in triton, audio, vision, or flash attention.
 
 ```powershell
+$buildRoot = "..\..\..\..\build"
 $env:PYTORCH_ROCM_ARCH = "gfx1030"
 $env:MAX_JOBS = "1"
 $env:CMAKE_BUILD_PARALLEL_LEVEL = "1"
@@ -85,10 +98,14 @@ python .\build_prod_wheels.py build `
   --install-rocm `
   --index-url https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/ `
   --pytorch-rocm-arch gfx1030 `
-  --pytorch-dir ..\..\..\..\build\pytorch-src `
-  --pytorch-audio-dir ..\..\..\..\build\audio-src `
-  --pytorch-vision-dir ..\..\..\..\build\vision-src `
-  --output-dir ..\..\..\..\build\wheels
+  --pytorch-dir "$buildRoot\pytorch-src" `
+  --output-dir "$buildRoot\wheels" `
+  --no-build-pytorch-audio `
+  --no-build-pytorch-vision `
+  --no-build-apex `
+  --no-build-triton `
+  --no-enable-pytorch-flash-attention-windows `
+  --clean
 ```
 
 If the `gfx103X-dgpu` package index is unavailable, use a ROCm/TheRock index
