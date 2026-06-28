@@ -132,3 +132,6 @@
 [submodule "third_party/mslk"]
 	path = third_party/mslk
 	url = https://github.com/meta-pytorch/MSLK.git
+[submodule "external/TheRock"]
+	path = external/TheRock
+	url = https://github.com/lgcyaxi/therock-rocm-rx6900xt-windows.git

@@ -4627,6 +4627,18 @@ class TestBinaryUfuncsDevice(TestCase):
 
 
 class TestBinaryUfuncsCUDA(TestCase):
+    @dtypes(torch.float32)
+    def test_eq_ne_cpu_scalar(self, device, dtype):
+        x = torch.tensor([[0.0], [1.0], [-1.0], [0.0]], device=device, dtype=dtype)
+        x = x.repeat(1024, 1)
+        expected = torch.tensor(
+            [[True], [False], [False], [True]], device=device
+        ).repeat(1024, 1)
+
+        self.assertEqual(x == 0, expected)
+        self.assertEqual(x != 0, expected.logical_not())
+        torch.cuda.synchronize()
+
     @dtypes(torch.float16, torch.bfloat16)
     def test_copysign_nan_sign(self, device, dtype):
         # Regression test for https://github.com/pytorch/pytorch/issues/181804
