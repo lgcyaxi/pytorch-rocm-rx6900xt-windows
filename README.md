@@ -29,20 +29,21 @@ Install:
 - Ninja
 - Python 3.12
 - Git
+- Pixi
 
-Load the Visual Studio x64 build environment:
+Pixi manages the Python/build helper environment for this repo. Visual Studio,
+the Windows SDK, and ATL still need to be installed system-wide.
+
+Create the pixi environment:
 
 ```powershell
-$vs = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1"
-& $vs -Arch amd64 -HostArch amd64
+pixi install
 ```
 
 Validate from the repository root:
 
 ```powershell
-cd external\TheRock
-powershell -ExecutionPolicy Bypass -File .\build_tools\validate_windows_install.ps1
-cd ..\..
+pixi run validate-windows
 ```
 
 The validator should end with `0 FAIL`. If ATL is missing, add this Visual
@@ -55,29 +56,17 @@ Microsoft.VisualStudio.Component.VC.ATL
 ## 3. Prepare TheRock
 
 ```powershell
-cd external\TheRock
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-cd ..\..
+pixi run check-therock-reqs
 ```
 
-`fetch_sources.py` is only needed when building ROCm itself from TheRock source.
-For PyTorch wheels using `--install-rocm`, the TheRock Python requirements are
-the required preparation step.
+TheRock's Python requirements are locked in `pixi.lock`. Do not run
+`fetch_sources.py` for the normal PyTorch wheel path; it is only needed when
+building ROCm itself from TheRock source.
 
 ## 4. Checkout PyTorch Sources
 
 ```powershell
-cd external\TheRock\external-builds\pytorch
-$buildRoot = "..\..\..\..\build"
-New-Item -ItemType Directory -Force $buildRoot | Out-Null
-
-python .\pytorch_torch_repo.py checkout `
-  --gitrepo-origin ..\..\..\.. `
-  --repo-hashtag main `
-  --checkout-dir "$buildRoot\pytorch-src"
+pixi run checkout-pytorch
 ```
 
 This checkout uses this fork as the PyTorch source, so it includes the RX 6900 XT
@@ -89,56 +78,36 @@ Keep the first build torch-only. It is the shortest path to a working wheel and
 avoids optional Windows failures in triton, audio, vision, or flash attention.
 
 ```powershell
-$buildRoot = "..\..\..\..\build"
-$env:PYTORCH_ROCM_ARCH = "gfx1030"
-$env:MAX_JOBS = "1"
-$env:CMAKE_BUILD_PARALLEL_LEVEL = "1"
-
-python .\build_prod_wheels.py build `
-  --install-rocm `
-  --index-url https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/ `
-  --pytorch-rocm-arch gfx1030 `
-  --pytorch-dir "$buildRoot\pytorch-src" `
-  --output-dir "$buildRoot\wheels" `
-  --no-build-pytorch-audio `
-  --no-build-pytorch-vision `
-  --no-build-apex `
-  --no-build-triton `
-  --no-enable-pytorch-flash-attention-windows `
-  --clean
+pixi run build-torch-wheel
 ```
 
 If the `gfx103X-dgpu` package index is unavailable, use a ROCm/TheRock index
 that contains `gfx1030` packages and keep `--pytorch-rocm-arch gfx1030`.
 
-## 6. Use With Pixi
-
-Create or edit a pixi environment and point `torch` at the built wheel:
-
-```toml
-[pypi-dependencies]
-torch = { path = "build/wheels/<torch-wheel-file>.whl" }
-```
-
-Then lock and run your environment:
+## 6. Install And Smoke Test
 
 ```powershell
-pixi lock
-pixi run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-```
-
-## 7. Smoke Test
-
-```powershell
-pixi run python -c "import torch; x=torch.tensor([0.,1.],device='cuda'); print(torch.cuda.get_device_name(0)); print((x==0).tolist(), (x!=0).tolist()); torch.cuda.synchronize(); print('sync ok')"
+pixi run install-built-wheel
+pixi run smoke-test
 ```
 
 Expected on RX 6900 XT:
 
 ```text
+<torch version>
 AMD Radeon RX 6900 XT
 [True, False] [False, True]
 sync ok
+```
+
+## 7. Use The Wheel Elsewhere
+
+Point another pixi environment at the built wheel if you do not want to install
+it into this build environment:
+
+```toml
+[pypi-dependencies]
+torch = { path = "build/wheels/<torch-wheel-file>.whl" }
 ```
 
 ## Sync From Upstream
