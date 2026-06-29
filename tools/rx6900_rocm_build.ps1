@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("validate", "checkout", "build", "install-wheel", "smoke", "probe")]
+    [ValidateSet("validate", "checkout", "checkout-vision", "build", "build-vision", "install-wheel", "install-vision-wheel", "smoke", "smoke-vision", "probe")]
     [string]$Action
 )
 
@@ -12,6 +12,7 @@ $TheRockPyTorch = Join-Path $TheRockRoot "external-builds\pytorch"
 $DefaultBuildRoot = Join-Path ([System.IO.Path]::GetPathRoot($RepoRoot)) "b\rx6900"
 $BuildRoot = if ($env:RX6900_BUILD_ROOT) { $env:RX6900_BUILD_ROOT } else { $DefaultBuildRoot }
 $PyTorchSource = Join-Path $BuildRoot "pytorch-src"
+$VisionSource = Join-Path $BuildRoot "pytorch_vision"
 $WheelOutput = Join-Path $BuildRoot "wheels"
 $RocmIndexUrl = "https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/"
 $BuildJobs = if ($env:RX6900_BUILD_JOBS) { $env:RX6900_BUILD_JOBS } else { "1" }
@@ -43,6 +44,54 @@ function Clear-ConflictingRocmEnvironment {
             Remove-Item "Env:$name"
         }
     }
+}
+
+function Join-EnvironmentPathList {
+    param(
+        [string[]]$Paths
+    )
+
+    ($Paths | Where-Object { $_ } | Select-Object -Unique) -join [System.IO.Path]::PathSeparator
+}
+
+function Set-TorchVisionCodecEnvironment {
+    $pythonPrefix = (& python -c "import sys; print(sys.prefix)").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $pythonPrefix) {
+        throw "Failed to resolve the active Python prefix."
+    }
+
+    $libraryRoot = Join-Path $pythonPrefix "Library"
+    $libraryBin = Join-Path $libraryRoot "bin"
+    $libraryInclude = Join-Path $libraryRoot "include"
+    $libraryLib = Join-Path $libraryRoot "lib"
+
+    Test-RequiredPath -Path (Join-Path $libraryBin "pngfix.exe") -Message "pngfix.exe not found. Run: pixi install"
+    Test-RequiredPath -Path (Join-Path $libraryInclude "jpeglib.h") -Message "jpeglib.h not found. Run: pixi install"
+    Test-RequiredPath -Path (Join-Path $libraryInclude "webp\decode.h") -Message "webp/decode.h not found. Run: pixi install"
+    Test-RequiredPath -Path (Join-Path $libraryLib "jpeg.lib") -Message "jpeg.lib not found. Run: pixi install"
+    Test-RequiredPath -Path (Join-Path $libraryLib "libwebp.lib") -Message "libwebp.lib not found. Run: pixi install"
+
+    $env:PATH = Join-EnvironmentPathList @($libraryBin, $env:PATH)
+    $env:TORCHVISION_INCLUDE = Join-EnvironmentPathList @($libraryInclude, $env:TORCHVISION_INCLUDE)
+    $env:TORCHVISION_LIBRARY = Join-EnvironmentPathList @($libraryLib, $env:TORCHVISION_LIBRARY)
+    $env:TORCHVISION_USE_PNG = "1"
+    $env:TORCHVISION_USE_JPEG = "1"
+    $env:TORCHVISION_USE_WEBP = "1"
+}
+
+function Remove-VisionBuildDirectory {
+    $visionBuildDir = Join-Path $VisionSource "build"
+    if (-not (Test-Path -LiteralPath $visionBuildDir)) {
+        return
+    }
+
+    $resolvedVision = (Resolve-Path -LiteralPath $VisionSource).Path
+    $resolvedBuildDir = (Resolve-Path -LiteralPath $visionBuildDir).Path
+    if (-not $resolvedBuildDir.StartsWith($resolvedVision + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove unexpected build directory: $resolvedBuildDir"
+    }
+
+    Remove-Item -LiteralPath $resolvedBuildDir -Recurse -Force
 }
 
 function Invoke-RepoPython {
@@ -217,6 +266,12 @@ function Test-RequiredPath {
     }
 }
 
+function Get-PinnedVisionCommit {
+    $pinFile = Join-Path $PyTorchSource ".github\ci_commit_pins\vision.txt"
+    Test-RequiredPath -Path $pinFile -Message "PyTorch vision pin not found: $pinFile. Run: pixi run checkout-pytorch"
+    return (Get-Content -LiteralPath $pinFile -Raw).Trim()
+}
+
 switch ($Action) {
     "validate" {
         Clear-ConflictingRocmEnvironment
@@ -255,6 +310,23 @@ switch ($Action) {
         )
     }
 
+    "checkout-vision" {
+        Test-RequiredPath -Path $PyTorchSource -Message "PyTorch source checkout not found. Run: pixi run checkout-pytorch"
+        New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+        $visionCommit = Get-PinnedVisionCommit
+
+        Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
+            ".\pytorch_vision_repo.py",
+            "checkout",
+            "--checkout-dir",
+            $VisionSource,
+            "--torch-dir",
+            $PyTorchSource,
+            "--repo-hashtag",
+            $visionCommit
+        )
+    }
+
     "build" {
         Test-RequiredPath -Path $PyTorchSource -Message "PyTorch source checkout not found. Run: pixi run checkout-pytorch"
         Clear-ConflictingRocmEnvironment
@@ -286,6 +358,39 @@ switch ($Action) {
         )
     }
 
+    "build-vision" {
+        Test-RequiredPath -Path $VisionSource -Message "PyTorch Vision source checkout not found. Run: pixi run checkout-vision"
+        Clear-ConflictingRocmEnvironment
+        Enter-VsDevShell
+        Set-TorchVisionCodecEnvironment
+        Remove-VisionBuildDirectory
+        New-Item -ItemType Directory -Force -Path $WheelOutput | Out-Null
+
+        $env:PYTORCH_ROCM_ARCH = "gfx1030"
+        $env:MAX_JOBS = $BuildJobs
+        $env:CMAKE_BUILD_PARALLEL_LEVEL = $BuildJobs
+
+        Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
+            ".\build_prod_wheels.py",
+            "build",
+            "--install-rocm",
+            "--index-url",
+            $RocmIndexUrl,
+            "--pytorch-rocm-arch",
+            "gfx1030",
+            "--pytorch-vision-dir",
+            $VisionSource,
+            "--output-dir",
+            $WheelOutput,
+            "--no-build-pytorch-audio",
+            "--build-pytorch-vision",
+            "--no-build-apex",
+            "--no-build-triton",
+            "--no-enable-pytorch-flash-attention-windows",
+            "--clean"
+        )
+    }
+
     "install-wheel" {
         $wheel = Get-ChildItem -LiteralPath $WheelOutput -Filter "torch-*.whl" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending |
@@ -293,6 +398,18 @@ switch ($Action) {
 
         if (-not $wheel) {
             throw "No torch wheel found under $WheelOutput. Run: pixi run build-torch-wheel"
+        }
+
+        & python -m pip install --force-reinstall --no-deps $wheel.FullName
+    }
+
+    "install-vision-wheel" {
+        $wheel = Get-ChildItem -LiteralPath $WheelOutput -Filter "torchvision-*.whl" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+        if (-not $wheel) {
+            throw "No torchvision wheel found under $WheelOutput. Run: pixi run build-vision-wheel"
         }
 
         & python -m pip install --force-reinstall --no-deps $wheel.FullName
@@ -318,6 +435,53 @@ x = torch.tensor([0.0, 1.0], device="cuda")
 print((x == 0).tolist(), (x != 0).tolist())
 torch.cuda.synchronize()
 print("sync ok")
+'@
+    }
+
+    "smoke-vision" {
+        Invoke-PythonOutsideSource -Code @'
+import os
+import pathlib
+import tempfile
+
+import torch
+import torchvision
+from torchvision import ops, transforms
+from torchvision.io import read_image
+from PIL import Image
+
+source_torch = pathlib.Path(os.environ["RX6900_SOURCE_TORCH"]).resolve()
+torch_file = pathlib.Path(torch.__file__).resolve()
+if torch_file == source_torch or source_torch in torch_file.parents:
+    raise SystemExit(f"Imported torch from source checkout instead of installed wheel: {torch_file}")
+
+print(torch.__version__)
+print(torchvision.__version__)
+print(torch_file)
+print(pathlib.Path(torchvision.__file__).resolve())
+assert torch.cuda.is_available(), "torch.cuda is not available"
+print(torch.cuda.get_device_name(0))
+
+boxes = torch.tensor(
+    [[0.0, 0.0, 10.0, 10.0], [1.0, 1.0, 11.0, 11.0], [20.0, 20.0, 30.0, 30.0]],
+    device="cuda",
+)
+scores = torch.tensor([0.9, 0.8, 0.7], device="cuda")
+keep = ops.nms(boxes, scores, 0.5)
+torch.cuda.synchronize()
+print("nms", keep.tolist())
+
+image = torch.randint(0, 256, (3, 8, 8), dtype=torch.uint8)
+converted = transforms.functional.convert_image_dtype(image, torch.float32)
+print("transform", str(converted.dtype), tuple(converted.shape))
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    png_path = pathlib.Path(tmpdir) / "smoke.png"
+    Image.new("RGB", (4, 4), color=(3, 7, 11)).save(png_path)
+    decoded = read_image(str(png_path))
+    print("read_image", str(decoded.dtype), tuple(decoded.shape), int(decoded.sum().item()))
+
+print("torchvision ok")
 '@
     }
 

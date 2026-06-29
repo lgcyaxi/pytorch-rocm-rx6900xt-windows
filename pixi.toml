@@ -10,6 +10,10 @@ cmake = ">=3.30"
 ninja = ">=1.12"
 git = "*"
 ccache = "*"
+pillow = ">=12,<13"
+libpng = ">=1.6,<2"
+libjpeg-turbo = ">=3,<4"
+libwebp-base = ">=1.6,<2"
 
 [pypi-dependencies]
 cppheaderparser = ">=2.7.4"
@@ -41,7 +45,11 @@ check-therock-reqs = { cmd = ["python", "-c", "import CppHeaderParser, boto3, ya
 install-therock-reqs = { depends-on = ["check-therock-reqs"], description = "Compatibility alias for checking TheRock Python requirements." }
 validate-windows = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "validate"], description = "Validate the Windows build machine and Visual Studio toolchain." }
 checkout-pytorch = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "checkout"], depends-on = ["check-therock-reqs"], description = "Checkout this fork as the PyTorch source used by TheRock." }
+checkout-vision = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "checkout-vision"], depends-on = ["check-therock-reqs"], description = "Checkout and HIPIFY the PyTorch-pinned torchvision source." }
 build-torch-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build"], depends-on = ["check-therock-reqs"], description = "Build a torch-only ROCm wheel for RX 6900 XT / gfx1030." }
+build-vision-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build-vision"], depends-on = ["check-therock-reqs"], description = "Build a matching torchvision ROCm wheel for RX 6900 XT / gfx1030." }
 install-built-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "install-wheel"], description = "Install the newest built torch wheel into this pixi environment." }
+install-vision-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "install-vision-wheel"], description = "Install the newest built torchvision wheel into this pixi environment." }
 smoke-test = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "smoke"], description = "Run the RX 6900 XT ROCm torch smoke test." }
+smoke-vision = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "smoke-vision"], description = "Run torchvision import, transform, and CUDA NMS smoke tests." }
 probe-built-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "probe"], description = "Run functional and CPU/GPU performance probes for the installed RX 6900 XT ROCm torch wheel." }

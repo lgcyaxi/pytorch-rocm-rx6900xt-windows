@@ -128,14 +128,31 @@ backward, and a small CPU/GPU matmul-backward timing gate from outside the
 source checkout. Do not publish the wheel or point downstream projects at it if
 this probe fails.
 
-## 7. Use The Wheel Elsewhere
+## 7. Build Torchvision
+
+Build torchvision only after the torch wheel passes the smoke/probe step:
+
+```powershell
+pixi run checkout-vision
+pixi run build-vision-wheel
+pixi run install-vision-wheel
+pixi run smoke-vision
+```
+
+`checkout-vision` uses PyTorch's pinned torchvision commit from the build
+checkout. `smoke-vision` verifies import, CUDA NMS, tensor transforms, and PNG
+image IO from outside the source checkout.
+
+## 8. Use The Wheels Elsewhere
 
 Point another pixi environment at the built wheel if you do not want to install
-it into this build environment:
+it into this build environment. Include torchvision only after `smoke-vision`
+passes:
 
 ```toml
 [pypi-dependencies]
 torch = { path = "<RX6900_BUILD_ROOT>/wheels/<torch-wheel-file>.whl" }
+torchvision = { path = "<RX6900_BUILD_ROOT>/wheels/<torchvision-wheel-file>.whl" }
 ```
 
 ## Sync From Upstream
