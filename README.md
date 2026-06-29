@@ -7,15 +7,20 @@ this target.
 ## 1. Clone
 
 ```powershell
-git clone --recurse-submodules https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows.git
+git clone https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows.git
 cd pytorch-rocm-rx6900xt-windows
+git submodule update --init external/TheRock
 ```
 
 If the repo is already cloned:
 
 ```powershell
-git submodule update --init --recursive external/TheRock
+git submodule update --init external/TheRock
 ```
+
+Do not use `--recursive` for `external/TheRock` unless you are building ROCm
+itself from TheRock sources. The torch-only wheel path installs ROCm packages
+with `--install-rocm` and does not need the large nested ROCm/LLVM submodules.
 
 ## 2. Prepare Visual Studio
 
@@ -40,6 +45,14 @@ Create the pixi environment:
 pixi install
 ```
 
+Build outputs default to a short path on the same drive, such as
+`<repo-drive>\b\rx6900`, to avoid Windows filename-length failures in PyTorch
+third-party submodules. Override it when needed:
+
+```powershell
+$env:RX6900_BUILD_ROOT = "D:\b\rx6900"
+```
+
 Validate from the repository root:
 
 ```powershell
@@ -52,6 +65,9 @@ Studio component:
 ```powershell
 Microsoft.VisualStudio.Component.VC.ATL
 ```
+
+Developer Mode is optional. When symlink creation is unavailable, the checkout
+task falls back to `core.symlinks=false` for PyTorch submodules.
 
 ## 3. Prepare TheRock
 
@@ -70,7 +86,9 @@ pixi run checkout-pytorch
 ```
 
 This checkout uses this fork as the PyTorch source, so it includes the RX 6900 XT
-Windows ROCm kernel fix.
+Windows ROCm kernel fix. The task initializes PyTorch's required third-party
+submodules and initializes the build checkout's `external/TheRock` root
+submodule without recursing into its ROCm/LLVM source submodules.
 
 ## 5. Build The Torch Wheel
 
@@ -81,6 +99,9 @@ avoids optional Windows failures in triton, audio, vision, or flash attention.
 pixi run build-torch-wheel
 ```
 
+The build defaults to one job for stability. Set `RX6900_BUILD_JOBS` only if the
+machine is stable under parallel C++/HIP compilation.
+
 If the `gfx103X-dgpu` package index is unavailable, use a ROCm/TheRock index
 that contains `gfx1030` packages and keep `--pytorch-rocm-arch gfx1030`.
 
@@ -89,16 +110,23 @@ that contains `gfx1030` packages and keep `--pytorch-rocm-arch gfx1030`.
 ```powershell
 pixi run install-built-wheel
 pixi run smoke-test
+pixi run probe-built-wheel
 ```
 
 Expected on RX 6900 XT:
 
 ```text
 <torch version>
+<installed torch path>
 AMD Radeon RX 6900 XT
 [True, False] [False, True]
 sync ok
 ```
+
+`probe-built-wheel` runs the equality-mask fix, `torch.nn.functional.normalize`
+backward, and a small CPU/GPU matmul-backward timing gate from outside the
+source checkout. Do not publish the wheel or point downstream projects at it if
+this probe fails.
 
 ## 7. Use The Wheel Elsewhere
 
@@ -107,7 +135,7 @@ it into this build environment:
 
 ```toml
 [pypi-dependencies]
-torch = { path = "build/wheels/<torch-wheel-file>.whl" }
+torch = { path = "<RX6900_BUILD_ROOT>/wheels/<torch-wheel-file>.whl" }
 ```
 
 ## Sync From Upstream
@@ -118,5 +146,5 @@ git rebase upstream/main
 git push --force-with-lease origin main
 ```
 
-Keep build outputs under `build\` or another ignored local directory. Do not
-commit wheels or local package archives.
+Keep build outputs in the local build root. Do not commit wheels or local
+package archives.
