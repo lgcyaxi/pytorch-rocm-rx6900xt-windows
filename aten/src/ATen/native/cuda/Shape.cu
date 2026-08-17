@@ -11,6 +11,9 @@
 #include <ATen/Dispatch.h>
 #include <ATen/Dispatch_v2.h>
 #include <c10/core/MemoryFormat.h>
+#ifdef USE_ROCM
+#include <ATen/native/hip/knn_gather.h>
+#endif
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -563,6 +566,13 @@ TORCH_IMPL_FUNC(cat_out_cuda)
   }
 
   auto materialized = tensors.materialize();
+#ifdef USE_ROCM
+  if (materialized.size() == 2 &&
+      rocm_try_cat2_last(
+          result, materialized[0].get(), materialized[1].get(), dim)) {
+    return;
+  }
+#endif
 
   // We parallelize the copy if all 6 conditions pass:
   //

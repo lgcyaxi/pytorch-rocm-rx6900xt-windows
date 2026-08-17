@@ -928,6 +928,45 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math(
   auto attn_mask = attn_mask_;
   // Naive, composite implementation defined here.
 
+#ifdef USE_ROCM
+  // gfx1030: scaling Q and K by sqrt(scale) materializes two extra GEMM-sized
+  // tensors. For FP32 the algebra is the same as scaling the scores once.
+  if (query_acc.scalar_type() == at::kFloat && query_acc.is_cuda() &&
+      dropout_p == 0.0 && !dropout_mask.has_value() && !query_acc.is_nested() &&
+      !(scale.has_value() && scale.value() < 0.0)) {
+    if (is_causal) {
+      TORCH_CHECK(
+          !attn_mask.has_value(),
+          "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True");
+      TORCH_CHECK(
+          !query_acc.is_nested() && !key_acc.is_nested(),
+          "_scaled_dot_product_attention: Nested tensors for query / key are not supported when is_causal=True");
+      const auto L = query_acc.sym_size(-2), S = key_acc.sym_size(-2);
+      attn_mask =
+          at::ones_symint({L, S}, query_acc.options().dtype(at::kBool)).tril();
+      attn_mask = convert_boolean_attn_mask(attn_mask, query_acc.dtype());
+    }
+    auto [key_expanded, value_expanded] = pre_process_group_query_attention_input(
+        query_acc, key_acc, value_acc, enable_gqa);
+    auto attn = at::matmul(query_acc, key_expanded.transpose(-2, -1));
+    attn.mul_(sdp::calculate_scale(query_acc, scale).as_float_unchecked());
+    if (attn_mask.has_value()) {
+      if (at::areAnyTensorSubclassLike({attn, *attn_mask})) {
+        attn = attn.add(*attn_mask);
+      } else {
+        attn.add_(*attn_mask);
+      }
+    }
+    attn = at::softmax(attn, -1);
+    auto out = at::matmul(attn, value_expanded);
+    if (out.scalar_type() != origin_dtype) {
+      out = out.to(origin_dtype);
+      attn = attn.to(origin_dtype);
+    }
+    return std::make_tuple(std::move(out), std::move(attn));
+  }
+#endif
+
   // Scale q, k before matmul for stability see https://tinyurl.com/sudb9s96 for
   // math
   bool is_negative_scaling = scale.has_value() && scale.value() < 0.0;

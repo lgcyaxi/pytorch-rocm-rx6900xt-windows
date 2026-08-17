@@ -19,8 +19,10 @@ git submodule update --init external/TheRock
 ```
 
 Do not use `--recursive` for `external/TheRock` unless you are building ROCm
-itself from TheRock sources. The torch-only wheel path installs ROCm packages
-with `--install-rocm` and does not need the large nested ROCm/LLVM submodules.
+itself from TheRock sources. The torch-only wheel path uses the pinned TheRock
+ROCm 7.13.0 `gfx103X-all` wheels from pixi and does not need the large nested
+ROCm/LLVM submodules. Do not install the official Windows HIP SDK and do not
+set `HIP_PATH` or `ROCM_PATH`.
 
 ## 2. Prepare Visual Studio
 
@@ -44,6 +46,11 @@ Create the pixi environment:
 ```powershell
 pixi install
 ```
+
+This also downloads the pinned TheRock ROCm 7.13.0 SDK for `gfx103X-all`
+(`rocm`, `rocm-sdk-core`, `rocm-sdk-devel`, `rocm-sdk-libraries-gfx103x-all`)
+from `https://repo.amd.com/rocm/whl/gfx103X-all/`. Expect about 4.7 GiB of
+wheels; `rocm-sdk-devel` is most of that.
 
 Build outputs default to a short path on the same drive, such as
 `<repo-drive>\b\rx6900`, to avoid Windows filename-length failures in PyTorch
@@ -73,11 +80,12 @@ task falls back to `core.symlinks=false` for PyTorch submodules.
 
 ```powershell
 pixi run check-therock-reqs
+pixi run check-rocm-sdk
 ```
 
-TheRock's Python requirements are locked in `pixi.lock`. Do not run
-`fetch_sources.py` for the normal PyTorch wheel path; it is only needed when
-building ROCm itself from TheRock source.
+TheRock's Python requirements and the ROCm 7.13.0 SDK are locked in
+`pixi.lock`. Do not run `fetch_sources.py` for the normal PyTorch wheel path;
+it is only needed when building ROCm itself from TheRock source.
 
 ## 4. Checkout PyTorch Sources
 
@@ -99,11 +107,12 @@ avoids optional Windows failures in triton, audio, vision, or flash attention.
 pixi run build-torch-wheel
 ```
 
-The build defaults to one job for stability. Set `RX6900_BUILD_JOBS` only if the
-machine is stable under parallel C++/HIP compilation.
-
-If the `gfx103X-dgpu` package index is unavailable, use a ROCm/TheRock index
-that contains `gfx1030` packages and keep `--pytorch-rocm-arch gfx1030`.
+The build uses the pixi-locked ROCm 7.13.0 SDK already in this environment. It
+does not call TheRock `--install-rocm` and does not float on nightly indexes.
+The build defaults to 12 jobs, which fits this i9-12900K (24 threads) and 96 GB
+RAM without filling the machine during HIP compiles. Override with
+`RX6900_BUILD_JOBS` if a run OOMs or you want to leave more headroom. Set
+`RX6900_BUILD_CLEAN=0` to resume an interrupted ninja tree without `--clean`.
 
 ## 6. Install And Smoke Test
 
@@ -128,6 +137,57 @@ backward, and a small CPU/GPU matmul-backward timing gate from outside the
 source checkout. Do not publish the wheel or point downstream projects at it if
 this probe fails.
 
+After the probe passes, run the reusable CPU vs GPU baseline:
+
+```powershell
+pixi run bench
+pixi run bench -- --quick
+pixi run bench -- --json-out agent_space/bench.json
+```
+
+`bench` times FP32/FP16 GEMM, a 3x3 conv, a short ViT-like SDPA+MLP block,
+ViT `F.linear` shapes, and a DRAM copy. JSON rows include `pct_paper_peak`
+against 23.04 TFLOPS FP32 / 46.08 TFLOPS FP16 / 512 GB/s. CPU comparisons use
+FP32 only. GEMM 4096 is GPU-only. It is a scoreboard, not a publish gate.
+
+Measured on this RX 6900 XT with `2.15.0a0+rocm7.13.0` (rocBLAS Tensile, NCHW):
+
+| Op | GPU FP32 | % peak | GPU FP16 | % peak |
+|---|---|---|---|---|
+| GEMM 4096 burst | 22.9 TFLOPS | 99% | 37.9 TFLOPS | 82% |
+| GEMM 4096 sustained | 19.5 TFLOPS | 85% | 33.9 TFLOPS | 74% |
+| GEMM 2048 | 20.9 TFLOPS | 91% | 30.3 TFLOPS | 66% |
+| Conv 3x3 NCHW | 19.3-21.9 TFLOPS | 84-95% | 22-28 TFLOPS | 49-61% |
+| DRAM copy | 431 GB/s | 84% | 432 GB/s | 84% |
+| ViT linear 8x49x768->3072 | 7.5 TFLOPS | 32% | 11.9 TFLOPS | 26% |
+| ViT-like seq 49, batch 8 | 0.58 ms | launch | 0.43 ms | launch |
+
+What is already at the wall:
+
+1. Large FP32 GEMM and 3x3 NCHW conv hit paper peak on a short burst. Longer
+   runs drop with clocks/power, not with a worse kernel.
+2. hipBLASLt has no gfx1030 images in `gfx103X-all` (only gfx1100). Forcing it
+   crashes TunableOp. Keep `PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0` if you tune.
+3. rocBLAS TunableOp, `cudnn.benchmark`, `channels_last`, FP16 accumulate, and
+   a bigger `HIPBLAS_WORKSPACE_CONFIG` did not beat the defaults. `channels_last`
+   is about half speed. Do not enable them.
+4. `torch.compile` / Inductor cannot autotune GEMM here: no Triton on this
+   Windows ROCm wheel, and the GPU arch is rejected for `max_autotune_gemm`.
+5. Flash Attention / AOTriton / CK SDPA are not built for gfx1030. Math SDPA
+   is the path. Seq 49 is launch-bound; FA can wait.
+
+What can still move:
+
+1. FP16 large GEMM/conv sits at about 80% / 60% of the 2x packed peak. The
+   shipped rocBLAS library for gfx1030 is almost all `fallback_*` Tensile
+   images, and PyTorch's ROCm GEMM always uses FP32 accumulate. Closing that
+   needs better gfx1030 Tensile/hipBLASLt images or a custom packed-FMA kernel,
+   not another runtime switch.
+2. Batch up ViT work. `32x256x768->3072` FP16 reached about 37 TFLOPS; `8x49`
+   cannot. HIP graphs did not help the short block.
+3. Keep the GPU in a high-performance power limit if you care about sustained
+   4096+ GEMM. Burst already shows the kernel is at the FP32 ceiling.
+
 ## 7. Build Torchvision
 
 Build torchvision only after the torch wheel passes the smoke/probe step:
@@ -143,17 +203,29 @@ pixi run smoke-vision
 checkout. `smoke-vision` verifies import, CUDA NMS, tensor transforms, and PNG
 image IO from outside the source checkout.
 
-## 8. Use The Wheels Elsewhere
+## 8. Export The Runtime Bundle
 
-Point another pixi environment at the built wheel if you do not want to install
-it into this build environment. Include torchvision only after `smoke-vision`
-passes:
+After a good probe, export the wheels to a destination directory. That
+directory **is** the runtime home. Do not export and then copy again unless
+you want a second, edited pixi project.
 
-```toml
-[pypi-dependencies]
-torch = { path = "<RX6900_BUILD_ROOT>/wheels/<torch-wheel-file>.whl" }
-torchvision = { path = "<RX6900_BUILD_ROOT>/wheels/<torchvision-wheel-file>.whl" }
+```powershell
+pixi run export-runtime-bundle
+pixi run export-runtime-bundle -- D:\rocm-runtime
 ```
+
+Default destination is `F:\rocm-build\packages`. Override with the argument
+above or `$env:RX6900_RUNTIME_BUNDLE`. Then either:
+
+1. Use it as a pixi project: `cd <dest>; pixi install`
+2. Point another repo at `<dest>\dependencies\*.whl` (Ware-care AMD does this)
+3. Optionally copy `<dest>` and edit that copy's `pixi.toml`
+
+The bundle is runtime-only: `torch-2.15.0a0+rocm7.13.0` plus TheRock ROCm
+7.13.0 `rocm`, `rocm-sdk-core`, and `rocm-sdk-libraries-gfx103x-all`. No
+`rocm-sdk-devel`. No torchvision until a matching wheel exists.
+
+The `pixi.toml` / README templates live in `runtime-bundle/`.
 
 ## Sync From Upstream
 

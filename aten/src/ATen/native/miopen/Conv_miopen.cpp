@@ -10,6 +10,8 @@
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/empty_native.h>
+#include <ATen/ops/linear.h>
+#include <ATen/ops/mm.h>
 #include <ATen/ops/miopen_convolution_add_relu_native.h>
 #include <ATen/ops/miopen_convolution_native.h>
 #include <ATen/ops/miopen_convolution_relu_native.h>
@@ -955,6 +957,96 @@ void miopen_convolution_forward_out(
       depthwise);
 }
 
+// Pointwise conv is a channel GEMM. MIOpen's conv backward on gfx1030 (no CK
+// grouped-conv images) is far slower than rocBLAS. Keep this inside the MIOpen
+// entry points so nn.ConvNd(k=1) is unchanged and CUDA/cuDNN never sees it.
+static bool miopen_is_pointwise_gemm(
+    const Tensor& weight,
+    IntArrayRef padding,
+    IntArrayRef stride,
+    IntArrayRef dilation,
+    int64_t groups) {
+  if (groups != 1) {
+    return false;
+  }
+  const int64_t spatial_ndim = weight.dim() - 2;
+  if (spatial_ndim < 1) {
+    return false;
+  }
+  if (padding.size() < static_cast<size_t>(spatial_ndim) ||
+      stride.size() < static_cast<size_t>(spatial_ndim) ||
+      dilation.size() < static_cast<size_t>(spatial_ndim)) {
+    return false;
+  }
+  for (const auto i : c10::irange(spatial_ndim)) {
+    if (weight.size(i + 2) != 1 || padding[i] != 0 || stride[i] != 1 ||
+        dilation[i] != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// [N, C, *spatial] -> [N * spatial, C] so one GEMM covers the whole batch.
+static Tensor miopen_nchw_to_matrix(const Tensor& t) {
+  const int64_t n = t.size(0);
+  const int64_t c = t.size(1);
+  const int64_t spatial = c10::multiply_integers(t.sizes().slice(2));
+  return t.contiguous()
+      .reshape({n, c, spatial})
+      .transpose(1, 2)
+      .reshape({n * spatial, c});
+}
+
+static Tensor miopen_matrix_to_nchw(
+    const Tensor& matrix,
+    IntArrayRef nchw_sizes,
+    int64_t channels) {
+  auto sizes = nchw_sizes.vec();
+  sizes[1] = channels;
+  const int64_t n = sizes[0];
+  const int64_t spatial = c10::multiply_integers(IntArrayRef(sizes).slice(2));
+  return matrix.reshape({n, spatial, channels}).transpose(1, 2).reshape(sizes).contiguous();
+}
+
+static Tensor miopen_pointwise_gemm_forward(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& bias) {
+  const int64_t c_out = weight.size(0);
+  const int64_t c_in = weight.size(1);
+  auto x = miopen_nchw_to_matrix(input);
+  auto w = weight.contiguous().reshape({c_out, c_in});
+  Tensor y = bias.defined() ? at::linear(x, w, bias) : at::linear(x, w);
+  return miopen_matrix_to_nchw(y, input.sizes(), c_out);
+}
+
+static std::tuple<Tensor, Tensor, Tensor> miopen_pointwise_gemm_backward(
+    const Tensor& input,
+    const Tensor& grad_output,
+    const Tensor& weight,
+    std::array<bool, 3> output_mask) {
+  const int64_t c_out = weight.size(0);
+  const int64_t c_in = weight.size(1);
+  auto w = weight.contiguous().reshape({c_out, c_in});
+  Tensor grad_input, grad_weight, grad_bias;
+  Tensor gy;
+  if (output_mask[0] || output_mask[1]) {
+    gy = miopen_nchw_to_matrix(grad_output);
+  }
+  if (output_mask[0]) {
+    grad_input = miopen_matrix_to_nchw(at::mm(gy, w), input.sizes(), c_in);
+  }
+  if (output_mask[1]) {
+    auto x = miopen_nchw_to_matrix(input);
+    grad_weight = at::mm(gy.t(), x).reshape_as(weight);
+  }
+  if (output_mask[2]) {
+    grad_bias = miopen_convolution_backward_bias(grad_output);
+  }
+  return {std::move(grad_input), std::move(grad_weight), std::move(grad_bias)};
+}
+
 Tensor miopen_convolution(
     const Tensor& input_t,
     const Tensor& weight_t,
@@ -968,6 +1060,15 @@ Tensor miopen_convolution(
   // See [Note: hacky wrapper removal for optional tensor]
   c10::MaybeOwned<Tensor> bias_t_maybe_owned = at::borrow_from_optional_tensor(bias_t_opt);
   const Tensor& bias_t = *bias_t_maybe_owned;
+
+  if (miopen_is_pointwise_gemm(weight_t, padding, stride, dilation, groups)) {
+    auto out_sizes = conv_output_size(
+        input_t.sizes(), weight_t.sizes(), padding, stride, dilation);
+    if (c10::multiply_integers(out_sizes) == 0) {
+      return at::detail::empty_cuda(out_sizes, input_t.options());
+    }
+    return miopen_pointwise_gemm_forward(input_t, weight_t, bias_t);
+  }
 
   TensorArg input{input_t, "input",  1 }, weight{weight_t, "weight", 2}, bias{bias_t, "bias", 3};
   CheckedFrom c = "miopen_convolution";
@@ -1557,6 +1658,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> miopen_convolution_backward(
     if (output_mask[2]) {
       grad_bias = at::zeros_like(grad_output_t, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
     }
+  } else if (miopen_is_pointwise_gemm(weight, padding, stride, dilation, groups)) {
+    return miopen_pointwise_gemm_backward(input, grad_output, weight, output_mask);
   } else {
     if (output_mask[0]) {
       grad_input = miopen_convolution_backward_input(

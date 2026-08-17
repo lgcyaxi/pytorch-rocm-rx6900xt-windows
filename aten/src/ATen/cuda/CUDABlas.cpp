@@ -23,6 +23,10 @@
 #include <rocblas/rocblas.h>
 #include <ATen/native/hip/ck_gemm.h>
 #include <ATen/native/hip/ck_bgemm.h>
+#include <ATen/native/hip/small_mn_huge_k_gemm.h>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 #define PYTORCH_ROCBLAS_VERSION_DECIMAL (ROCBLAS_VERSION_MAJOR * 100 + ROCBLAS_VERSION_MINOR)
 #define USE_GEMM_FLAGS_FP16_ALT_IMPL (PYTORCH_ROCBLAS_VERSION_DECIMAL >= 242)
 // needed to work around calling rocblas API instead of hipblas API
@@ -1417,8 +1421,119 @@ void gemm<double>(CUDABLAS_GEMM_ARGTYPES(double)) {
   }
 }
 
+#ifdef USE_ROCM
+// gfx1030: pin rocBLAS 5.4 Tensile IDs from TunableOp. NT is Linear/1x1 dW.
+// BLAS m/n are swapped vs PyTorch row-major, so Linear(64,192) dW is 64x192.
+static bool rocm_try_tensile_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
+  if (m <= 0 || n <= 0 || m > 192 || n > 192 || m * n > 16384 || k < 4096) {
+    return false;
+  }
+  if (alpha != 1.0f || beta != 0.0f) {
+    return false;
+  }
+  const char* arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  if (arch == nullptr || std::strstr(arch, "gfx1030") == nullptr) {
+    return false;
+  }
+  const char* env = std::getenv("PYTORCH_ROCM_SMALL_MN_GEMM");
+  if (env != nullptr && std::strcmp(env, "0") == 0) {
+    return false;
+  }
+  const bool ta = std::tolower(static_cast<unsigned char>(transa)) != 'n';
+  const bool tb = std::tolower(static_cast<unsigned char>(transb)) != 'n';
+  int32_t sols[4];
+  int nsol = 0;
+  auto push = [&](int32_t id) {
+    if (nsol < 4) {
+      sols[nsol++] = id;
+    }
+  };
+  if (!ta && tb) {
+    // 64x64 K~24k: default hipblasSgemm is faster than these IDs.
+    if (m == n && m <= 64 && k < 49152) {
+      return false;
+    }
+    if ((m == 64 && n == 192) || (m == 192 && n == 64)) {
+      push(k >= 49152 ? -1086325573 : -1086325576);
+    } else if (m == 64 && n == 64) {
+      if (k >= 131072) {
+        push(-1086325576);
+      } else {
+        push(-1086325581);
+      }
+      push(-1086325573);
+    } else if (m == 128 && n == 128) {
+      push(-1086325570);
+    } else {
+      push(-1086325576);
+    }
+    push(-1086325576);
+    push(-1086325581);
+  } else if (ta && !tb) {
+    push(-1086328914);
+    push(-1086329101);
+  } else if (!ta && !tb) {
+    push(-1086326917);
+    push(-1086326969);
+  } else {
+    return false;
+  }
+  int64_t lda_ = lda;
+  int64_t ldb_ = ldb;
+  int64_t ldc_ = ldc;
+  detail::cublasAdjustLdLevel3(transa, transb, m, n, k, &lda_, &ldb_, &ldc_);
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  CUBLAS_SM_CARVEOUT_GUARD(handle);
+  cublasOperation_t opa = detail::cublasOpFromChar(transa);
+  cublasOperation_t opb = detail::cublasOpFromChar(transb);
+  float alpha_f = alpha;
+  float beta_f = beta;
+  for (int i = 0; i < nsol; ++i) {
+    rocblas_status st = rocblas_gemm_ex(
+        (rocblas_handle)handle,
+        hipOperationToRocOperation(opa),
+        hipOperationToRocOperation(opb),
+        static_cast<int>(m),
+        static_cast<int>(n),
+        static_cast<int>(k),
+        &alpha_f,
+        a,
+        rocblas_datatype_f32_r,
+        static_cast<int>(lda_),
+        b,
+        rocblas_datatype_f32_r,
+        static_cast<int>(ldb_),
+        &beta_f,
+        c,
+        rocblas_datatype_f32_r,
+        static_cast<int>(ldc_),
+        c,
+        rocblas_datatype_f32_r,
+        static_cast<int>(ldc_),
+        rocblas_datatype_f32_r,
+        rocblas_gemm_algo_solution_index,
+        sols[i],
+        rocblas_gemm_flags_none);
+    if (st == rocblas_status_success) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 template <>
 void gemm<float>(CUDABLAS_GEMM_ARGTYPES(float)) {
+#ifdef USE_ROCM
+  // gfx1030 rocBLAS default is slow for tiny C and huge K (Linear/1x1 conv dW).
+  if (at::native::rocm_small_mn_huge_k_sgemm(
+          transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
+    return;
+  }
+  if (rocm_try_tensile_sgemm(CUDABLAS_GEMM_ARGS(float))) {
+    return;
+  }
+#endif
   auto tuning_ctx = at::cuda::tunable::getTuningContext();
   if (tuning_ctx->IsTunableOpEnabled()) {
     gemm_tunable<float>(CUDABLAS_GEMM_ARGS(float));

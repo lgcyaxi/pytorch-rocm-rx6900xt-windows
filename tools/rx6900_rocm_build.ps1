@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("validate", "checkout", "checkout-vision", "build", "build-vision", "install-wheel", "install-vision-wheel", "smoke", "smoke-vision", "probe")]
-    [string]$Action
+    [ValidateSet("validate", "check-rocm", "checkout", "checkout-vision", "build", "build-vision", "install-wheel", "install-vision-wheel", "smoke", "smoke-vision", "probe", "bench", "export-bundle")]
+    [string]$Action,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ActionArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,8 +16,10 @@ $BuildRoot = if ($env:RX6900_BUILD_ROOT) { $env:RX6900_BUILD_ROOT } else { $Defa
 $PyTorchSource = Join-Path $BuildRoot "pytorch-src"
 $VisionSource = Join-Path $BuildRoot "pytorch_vision"
 $WheelOutput = Join-Path $BuildRoot "wheels"
-$RocmIndexUrl = "https://rocm.nightlies.amd.com/v2/gfx103X-dgpu/"
-$BuildJobs = if ($env:RX6900_BUILD_JOBS) { $env:RX6900_BUILD_JOBS } else { "1" }
+$RocmIndexUrl = "https://repo.amd.com/rocm/whl/gfx103X-all/"
+$RocmSdkVersion = "7.13.0"
+$BuildJobs = if ($env:RX6900_BUILD_JOBS) { $env:RX6900_BUILD_JOBS } else { "12" }
+$CleanFlag = if ($env:RX6900_BUILD_CLEAN -eq "0") { "--no-clean" } else { "--clean" }
 
 function Enter-VsDevShell {
     $vcvars = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
@@ -104,6 +108,9 @@ function Invoke-RepoPython {
     Push-Location $WorkingDirectory
     try {
         & python @Arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "python $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+        }
     }
     finally {
         Pop-Location
@@ -266,6 +273,42 @@ function Test-RequiredPath {
     }
 }
 
+function Get-RocmSdkOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $output = & python -m rocm_sdk @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned ROCm SDK $RocmSdkVersion from $RocmIndexUrl is missing or broken. Run: pixi install"
+    }
+    return ([string]$output).Trim()
+}
+
+function Test-PinnedRocmSdk {
+    $version = Get-RocmSdkOutput -Arguments @("version")
+    if ($version -ne $RocmSdkVersion) {
+        throw "ROCm SDK version is '$version', expected '$RocmSdkVersion' from $RocmIndexUrl. Run: pixi install"
+    }
+
+    $targets = Get-RocmSdkOutput -Arguments @("targets")
+    if ($targets -notmatch "gfx1030") {
+        throw "ROCm SDK targets '$targets' do not include gfx1030."
+    }
+
+    $cmakePrefix = Get-RocmSdkOutput -Arguments @("path", "--cmake")
+    Test-RequiredPath -Path $cmakePrefix -Message "ROCm cmake prefix does not exist: $cmakePrefix"
+
+    return [pscustomobject]@{
+        Version = $version
+        Targets = $targets
+        CmakePrefix = $cmakePrefix
+        Root = (Get-RocmSdkOutput -Arguments @("path", "--root"))
+        Bin = (Get-RocmSdkOutput -Arguments @("path", "--bin"))
+    }
+}
+
 function Get-PinnedVisionCommit {
     $pinFile = Join-Path $PyTorchSource ".github\ci_commit_pins\vision.txt"
     Test-RequiredPath -Path $pinFile -Message "PyTorch vision pin not found: $pinFile. Run: pixi run checkout-pytorch"
@@ -285,8 +328,40 @@ switch ($Action) {
         }
     }
 
+    "check-rocm" {
+        Clear-ConflictingRocmEnvironment
+        $sdk = Test-PinnedRocmSdk
+        Write-Host "ROCm SDK $($sdk.Version)"
+        Write-Host "targets $($sdk.Targets)"
+        Write-Host "root $($sdk.Root)"
+        Write-Host "cmake $($sdk.CmakePrefix)"
+        Write-Host "bin $($sdk.Bin)"
+    }
+
     "checkout" {
         New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
+        if (Test-Path -LiteralPath (Join-Path $PyTorchSource ".git")) {
+            $coreSymlinks = if (Test-SymbolicLinkCreation) { "true" } else { "false" }
+            Write-Host "Resetting existing PyTorch checkout at $PyTorchSource (core.symlinks=$coreSymlinks)"
+            Invoke-Git -WorkingDirectory $PyTorchSource -Arguments @("config", "core.symlinks", $coreSymlinks) -CoreSymlinks $coreSymlinks
+            Invoke-Git -WorkingDirectory $PyTorchSource -Arguments @("config", "core.longpaths", "true") -CoreSymlinks $coreSymlinks
+            Invoke-Git -WorkingDirectory $PyTorchSource -Arguments @("reset", "--hard") -CoreSymlinks $coreSymlinks
+            Invoke-Git -WorkingDirectory $PyTorchSource -Arguments @("clean", "-fdx") -CoreSymlinks $coreSymlinks
+            if (Test-Path -LiteralPath (Join-Path $PyTorchSource ".gitmodules")) {
+                Write-Host "Resetting existing PyTorch submodules"
+                try {
+                    Invoke-Git -WorkingDirectory $PyTorchSource -Arguments @(
+                        "submodule",
+                        "foreach",
+                        "--recursive",
+                        "git -c core.longpaths=true -c core.symlinks=$coreSymlinks reset --hard && git -c core.longpaths=true -c core.symlinks=$coreSymlinks clean -fdx"
+                    ) -CoreSymlinks $coreSymlinks
+                }
+                catch {
+                    Write-Host "Existing submodule reset was partial; checkout will reinitialize them."
+                }
+            }
+        }
         Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
             ".\pytorch_torch_repo.py",
             "checkout",
@@ -330,6 +405,8 @@ switch ($Action) {
     "build" {
         Test-RequiredPath -Path $PyTorchSource -Message "PyTorch source checkout not found. Run: pixi run checkout-pytorch"
         Clear-ConflictingRocmEnvironment
+        $sdk = Test-PinnedRocmSdk
+        Write-Host "Using pinned ROCm SDK $($sdk.Version) (cmake: $($sdk.CmakePrefix))"
         Enter-VsDevShell
         New-Item -ItemType Directory -Force -Path $WheelOutput | Out-Null
 
@@ -340,9 +417,6 @@ switch ($Action) {
         Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
             ".\build_prod_wheels.py",
             "build",
-            "--install-rocm",
-            "--index-url",
-            $RocmIndexUrl,
             "--pytorch-rocm-arch",
             "gfx1030",
             "--pytorch-dir",
@@ -353,14 +427,16 @@ switch ($Action) {
             "--no-build-pytorch-vision",
             "--no-build-apex",
             "--no-build-triton",
-            "--no-enable-pytorch-flash-attention-windows",
-            "--clean"
+            "--no-enable-pytorch-flash-attention",
+            $CleanFlag
         )
     }
 
     "build-vision" {
         Test-RequiredPath -Path $VisionSource -Message "PyTorch Vision source checkout not found. Run: pixi run checkout-vision"
         Clear-ConflictingRocmEnvironment
+        $sdk = Test-PinnedRocmSdk
+        Write-Host "Using pinned ROCm SDK $($sdk.Version) (cmake: $($sdk.CmakePrefix))"
         Enter-VsDevShell
         Set-TorchVisionCodecEnvironment
         Remove-VisionBuildDirectory
@@ -373,9 +449,6 @@ switch ($Action) {
         Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
             ".\build_prod_wheels.py",
             "build",
-            "--install-rocm",
-            "--index-url",
-            $RocmIndexUrl,
             "--pytorch-rocm-arch",
             "gfx1030",
             "--pytorch-vision-dir",
@@ -386,7 +459,7 @@ switch ($Action) {
             "--build-pytorch-vision",
             "--no-build-apex",
             "--no-build-triton",
-            "--no-enable-pytorch-flash-attention-windows",
+            "--no-enable-pytorch-flash-attention",
             "--clean"
         )
     }
@@ -576,5 +649,39 @@ if ratio < min_ratio:
         "Do not publish this wheel or update downstream environments."
     )
 '@
+    }
+
+    "bench" {
+        $bench = Join-Path $RepoRoot "tools\rx6900_bench.py"
+        Test-RequiredPath -Path $bench -Message "Missing $bench"
+        $probeCwd = Join-Path $BuildRoot "probe-cwd"
+        New-Item -ItemType Directory -Force -Path $probeCwd | Out-Null
+        $previousSourceTorch = $env:RX6900_SOURCE_TORCH
+        $env:RX6900_SOURCE_TORCH = Join-Path $RepoRoot "torch"
+        Push-Location $probeCwd
+        try {
+            & python $bench @ActionArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "python bench failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+            Pop-Location
+            if ($null -eq $previousSourceTorch) {
+                Remove-Item Env:RX6900_SOURCE_TORCH -ErrorAction SilentlyContinue
+            }
+            else {
+                $env:RX6900_SOURCE_TORCH = $previousSourceTorch
+            }
+        }
+    }
+
+    "export-bundle" {
+        $exporter = Join-Path $PSScriptRoot "rx6900_export_runtime_bundle.ps1"
+        Test-RequiredPath -Path $exporter -Message "Missing $exporter"
+        & $exporter @ActionArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "export-runtime-bundle failed with exit code $LASTEXITCODE"
+        }
     }
 }

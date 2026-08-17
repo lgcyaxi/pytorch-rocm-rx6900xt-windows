@@ -14,6 +14,9 @@
 #include <ATen/cuda/detail/OffsetCalculator.cuh>
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#ifdef USE_ROCM
+#include <ATen/native/hip/knn_gather.h>
+#endif
 
 namespace at::native {
 
@@ -557,6 +560,11 @@ struct cuda_scatter_fill_base_kernel {
 }; // struct cuda_scatter_fill_base_kernel
 
 void gather_cuda_kernel(const Tensor& result, const Tensor& self, int64_t dim, const Tensor& index) {
+#ifdef USE_ROCM
+  if (rocm_try_knn_gather(result, self, dim, index)) {
+    return;
+  }
+#endif
   cuda_scatter_gather_base_kernel</*is_scatter_like=*/false>()(
     result, dim, index, self,
     "gather_out_cuda", tensor_assign);

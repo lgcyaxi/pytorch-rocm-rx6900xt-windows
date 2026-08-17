@@ -34,22 +34,31 @@ zstandard = ">=0.19.0"
 lit = "==18.1.8"
 psutil = "==7.1.3"
 dvc = ">=3.0"
+# TheRock ROCm 7.13.0 for RX 6900 XT / gfx1030. Per-package index keeps AMD's
+# vendored setuptools/numpy/pillow from replacing the PyPI pins above.
+rocm = { version = "==7.13.0", extras = ["libraries", "devel"], index = "https://repo.amd.com/rocm/whl/gfx103X-all/" }
+rocm-sdk-core = { version = "==7.13.0", index = "https://repo.amd.com/rocm/whl/gfx103X-all/" }
+rocm-sdk-devel = { version = "==7.13.0", index = "https://repo.amd.com/rocm/whl/gfx103X-all/" }
+rocm-sdk-libraries-gfx103x-all = { version = "==7.13.0", index = "https://repo.amd.com/rocm/whl/gfx103X-all/" }
 
 [activation.env]
 PYTORCH_ROCM_ARCH = "gfx1030"
-MAX_JOBS = "1"
-CMAKE_BUILD_PARALLEL_LEVEL = "1"
+MAX_JOBS = "12"
+CMAKE_BUILD_PARALLEL_LEVEL = "12"
 
 [tasks]
 check-therock-reqs = { cmd = ["python", "-c", "import CppHeaderParser, boto3, yaml, psutil; print('TheRock Python requirements are available')"], description = "Verify TheRock Python requirements in the pixi environment." }
+check-rocm-sdk = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "check-rocm"], description = "Verify the pinned TheRock ROCm 7.13.0 gfx103X-all SDK in this pixi environment." }
 install-therock-reqs = { depends-on = ["check-therock-reqs"], description = "Compatibility alias for checking TheRock Python requirements." }
 validate-windows = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "validate"], description = "Validate the Windows build machine and Visual Studio toolchain." }
 checkout-pytorch = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "checkout"], depends-on = ["check-therock-reqs"], description = "Checkout this fork as the PyTorch source used by TheRock." }
 checkout-vision = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "checkout-vision"], depends-on = ["check-therock-reqs"], description = "Checkout and HIPIFY the PyTorch-pinned torchvision source." }
-build-torch-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build"], depends-on = ["check-therock-reqs"], description = "Build a torch-only ROCm wheel for RX 6900 XT / gfx1030." }
-build-vision-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build-vision"], depends-on = ["check-therock-reqs"], description = "Build a matching torchvision ROCm wheel for RX 6900 XT / gfx1030." }
+build-torch-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build"], depends-on = ["check-therock-reqs", "check-rocm-sdk"], description = "Build a torch-only ROCm wheel for RX 6900 XT / gfx1030." }
+build-vision-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "build-vision"], depends-on = ["check-therock-reqs", "check-rocm-sdk"], description = "Build a matching torchvision ROCm wheel for RX 6900 XT / gfx1030." }
 install-built-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "install-wheel"], description = "Install the newest built torch wheel into this pixi environment." }
 install-vision-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "install-vision-wheel"], description = "Install the newest built torchvision wheel into this pixi environment." }
 smoke-test = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "smoke"], description = "Run the RX 6900 XT ROCm torch smoke test." }
 smoke-vision = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "smoke-vision"], description = "Run torchvision import, transform, and CUDA NMS smoke tests." }
 probe-built-wheel = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "probe"], description = "Run functional and CPU/GPU performance probes for the installed RX 6900 XT ROCm torch wheel." }
+bench = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "bench"], description = "Run reusable GPU vs CPU baselines for GEMM, conv, and a short ViT-like block." }
+export-runtime-bundle = { cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "tools/rx6900_rocm_build.ps1", "export-bundle"], description = "Export the torch+ROCm runtime bundle to a destination directory (default F:\\rocm-build\\packages, or pass -- <dir> / RX6900_RUNTIME_BUNDLE)." }

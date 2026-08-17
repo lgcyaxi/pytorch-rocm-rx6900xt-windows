@@ -552,6 +552,27 @@ BatchNormBackend _select_batch_norm_backend(
   return BatchNormBackend::Native;
 }
 
+// Older MIOpen NaN'd or crashed when a channel had one value in train
+// (N=1 and no spatial, or N=1 and L=1). Keep this inside the ROCm
+// batch-norm entry so nn.BatchNorm* is unchanged and CUDA/cuDNN never
+// sees it. Fat-N 1d still uses MIOpen.
+static bool miopen_batch_norm_singleton_channel(const Tensor& input) {
+  if (!input.is_cuda() || input.dim() < 2) {
+    return false;
+  }
+  if (!detail::getCUDAHooks().compiledWithMIOpen()) {
+    return false;
+  }
+  int64_t count = input.size(0);
+  for (const auto d : c10::irange(2, input.dim())) {
+    count *= input.size(d);
+    if (count > 1) {
+      return false;
+    }
+  }
+  return count <= 1;
+}
+
 
 // _batch_norm_impl_index(_backward) are used in the JIT be able to keep the run-time selection
 // of backends, while enabling it to keep the information about the used backend, so that it can
@@ -606,7 +627,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, int64_t> _batch_norm_impl_index(
     check_dims_match_num_input_features("bias", std::move(num_features), bias.sym_numel());
   }
 
+  if (training && miopen_batch_norm_singleton_channel(input)) {
+    if (running_mean.defined() && running_var.defined()) {
+      training = false;
+    }
+  }
+
   BatchNormBackend backend = _select_batch_norm_backend(input, weight, bias, running_mean, running_var, training, eps);
+  if (training && miopen_batch_norm_singleton_channel(input) &&
+      backend == BatchNormBackend::Miopen) {
+    backend = BatchNormBackend::Native;
+  }
 
   if (backend == BatchNormBackend::Cudnn) {
     auto input_c = input.contiguous(input.suggest_memory_format());

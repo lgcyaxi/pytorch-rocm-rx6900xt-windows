@@ -2891,8 +2891,23 @@ def batch_norm(
             eps=eps,
         )
     if training:
-        # pyrefly: ignore [bad-argument-type]
-        _verify_batch_size(input.size())
+        # ROCm/MIOpen used to NaN or crash when a channel had one value in
+        # train (N=1 and no spatial, or N=1 and L=1). Use running stats
+        # instead of raising so nn.BatchNorm* stays the same writing as
+        # CUDA. The CUDA path keeps the stock ValueError.
+        size_prods = input.size(0)
+        for i in range(input.dim() - 2):
+            size_prods *= input.size(i + 2)
+        if (
+            size_prods == 1
+            and getattr(torch.version, "hip", None)
+            and input.is_cuda
+        ):
+            if running_mean is not None and running_var is not None:
+                training = False
+        else:
+            # pyrefly: ignore [bad-argument-type]
+            _verify_batch_size(input.size())
 
     if training and eps <= 0.0:
         raise ValueError(
