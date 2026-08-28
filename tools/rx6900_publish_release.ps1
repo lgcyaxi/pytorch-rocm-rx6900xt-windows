@@ -42,8 +42,11 @@ Do not install ``rocm-sdk-devel``. That package is build-only.
 Torchvision is attached when a wheel matching this torch exists.
 "@
 
-$existing = gh release view $Tag --repo $Repo 2>$null
-if ($LASTEXITCODE -eq 0) {
+$ErrorActionPreference = "Continue"
+gh release view $Tag --repo $Repo 2>$null | Out-Null
+$viewCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($viewCode -eq 0) {
     Write-Host "Updating existing release $Tag"
     gh release upload $Tag @assets --repo $Repo --clobber
 } else {
