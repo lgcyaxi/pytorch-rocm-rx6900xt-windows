@@ -4,6 +4,23 @@ This fork builds PyTorch ROCm wheels for AMD RX 6900 XT / `gfx1030` on Windows.
 It tracks upstream PyTorch `main` and carries the Windows ROCm fixes needed for
 this target.
 
+## Install from GitHub Releases
+
+If you only need to run torch (or torchvision) on this card, download the
+wheels from [Releases](https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases).
+You do not need Visual Studio, pixi, or a source build.
+
+```powershell
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2.15.0a0-rocm7.13.0-gfx1030/torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
+pip install --index-url https://repo.amd.com/rocm/whl/gfx103X-all/ `
+    "rocm[libraries]==7.13.0" rocm-sdk-core==7.13.0 rocm-sdk-libraries-gfx103x-all==7.13.0
+```
+
+Python 3.12 on 64-bit Windows. Do not install `rocm-sdk-devel`. After a local
+wheel build, maintainers publish with `pixi run publish-release`.
+
+The rest of this README is the source-build path used to produce those wheels.
+
 ## 1. Clone
 
 ```powershell
@@ -229,11 +246,17 @@ The `pixi.toml` / README templates live in `runtime-bundle/`.
 
 ## Sync From Upstream
 
+Merge, do not rebase. The overlay and pixi/TheRock files live on this branch;
+rebasing only the overlay commit onto upstream drops them.
+
 ```powershell
 git fetch upstream main
-git rebase upstream/main
-git push --force-with-lease origin main
+git merge --no-ff upstream/main
+git push origin main
 ```
 
+TheRock is a separate fork (`lgcyaxi/therock-rocm-rx6900xt-windows`). Fast-forward
+it from `ROCm/TheRock` `main`, then bump `external/TheRock` here.
+
 Keep build outputs in the local build root. Do not commit wheels or local
-package archives.
+package archives. Publish them with `pixi run publish-release`.
