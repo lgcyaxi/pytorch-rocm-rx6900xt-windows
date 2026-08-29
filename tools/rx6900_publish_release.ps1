@@ -1,7 +1,8 @@
 param(
-    [string]$Tag = "v2.15.0a0-rocm7.13.0-gfx1030",
-    [string]$Target = "0b0b07ae21318fd45b4525662373b5df5dc7ae46",
-    [string]$Repo = "lgcyaxi/pytorch-rocm-rx6900xt-windows"
+    [string]$Tag,
+    [string]$Target,
+    [string]$Repo = "lgcyaxi/pytorch-rocm-rx6900xt-windows",
+    [switch]$RequireVision
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,36 +11,57 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $DefaultBuildRoot = Join-Path ([System.IO.Path]::GetPathRoot($RepoRoot)) "b\rx6900"
 $BuildRoot = if ($env:RX6900_BUILD_ROOT) { $env:RX6900_BUILD_ROOT } else { $DefaultBuildRoot }
 $WheelOutput = Join-Path $BuildRoot "wheels"
+$Git = Join-Path $RepoRoot ".pixi\envs\default\Library\mingw64\bin\git.exe"
+if (-not (Test-Path -LiteralPath $Git)) {
+    $Git = "git"
+}
 
-$torch = Get-ChildItem -LiteralPath $WheelOutput -Filter "torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl" -ErrorAction SilentlyContinue |
+if (-not $Target) {
+    $Target = (& $Git -C $RepoRoot rev-parse HEAD).Trim()
+}
+if (-not $Tag) {
+    $Tag = "v{0}-rocm7.13.0-gfx1030" -f (Get-Date -Format "yyyy.MM.dd")
+}
+
+$torch = Get-ChildItem -LiteralPath $WheelOutput -Filter "torch-*.whl" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike "torchvision-*" } |
+    Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if (-not $torch) {
-    throw "Missing torch 2.15 wheel under $WheelOutput. Run: pixi run build-torch-wheel"
+    throw "No torch wheel under $WheelOutput. Run: pixi run build-torch-wheel"
 }
 
 $assets = @($torch.FullName)
-$vision = Get-ChildItem -LiteralPath $WheelOutput -Filter "torchvision-*-cp312-cp312-win_amd64.whl" -ErrorAction SilentlyContinue |
+$vision = Get-ChildItem -LiteralPath $WheelOutput -Filter "torchvision-*.whl" -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notlike "*0.29.0a0+rocm7.13.0a20260421*" } |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if ($vision) {
     $assets += $vision.FullName
+} elseif ($RequireVision) {
+    throw "No matching torchvision wheel under $WheelOutput. Run: pixi run build-vision-wheel"
+}
+
+$visionInstall = ""
+if ($vision) {
+    $visionInstall = @"
+
+pip install https://github.com/$Repo/releases/download/$Tag/$($vision.Name)
+"@
 }
 
 $notes = @"
 Prebuilt RX 6900 XT / gfx1030 Windows wheels. Source: ``$Target``.
 
-Install with Python 3.12 (ROCm runtime from AMD, not this release):
+Python 3.12. ROCm runtime comes from AMD, not this release:
 
 ``````powershell
-pip install https://github.com/$Repo/releases/download/$Tag/$($torch.Name)
+pip install https://github.com/$Repo/releases/download/$Tag/$($torch.Name)$visionInstall
 pip install --index-url https://repo.amd.com/rocm/whl/gfx103X-all/ ``
     "rocm[libraries]==7.13.0" rocm-sdk-core==7.13.0 rocm-sdk-libraries-gfx103x-all==7.13.0
 ``````
 
-Do not install ``rocm-sdk-devel``. That package is build-only.
-
-Torchvision is attached when a wheel matching this torch exists.
+Do not install ``rocm-sdk-devel``.
 "@
 
 $ErrorActionPreference = "Continue"

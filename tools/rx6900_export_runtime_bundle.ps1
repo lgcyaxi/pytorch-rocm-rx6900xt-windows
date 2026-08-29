@@ -39,6 +39,19 @@ if (-not $torchWheel) {
 Copy-Item -LiteralPath $torchWheel.FullName -Destination (Join-Path $Dependencies $torchWheel.Name) -Force
 Write-Host "Copied $($torchWheel.Name)"
 
+$visionWheel = Get-ChildItem -LiteralPath $WheelOutput -Filter "torchvision-0.30.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if (-not $visionWheel) {
+    $visionWheel = Get-ChildItem -LiteralPath $WheelOutput -Filter "torchvision-*.whl" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike "*0.29.0a0+rocm7.13.0a20260421*" } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+}
+if ($visionWheel) {
+    Copy-Item -LiteralPath $visionWheel.FullName -Destination (Join-Path $Dependencies $visionWheel.Name) -Force
+    Write-Host "Copied $($visionWheel.Name)"
+}
+
 & python -m pip download --dest $Dependencies --no-deps --only-binary :all: --index-url $RocmIndexUrl "rocm-sdk-core==7.13.0" "rocm-sdk-libraries-gfx103x-all==7.13.0"
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to download ROCm 7.13.0 library wheels from $RocmIndexUrl"

@@ -26,12 +26,11 @@ Then pick one:
 The bundle is runtime-only:
 
 - `torch-2.15.0a0+rocm7.13.0`
+- `torchvision-0.30.0a0+rocm7.13.0`
 - TheRock ROCm `7.13.0` (`rocm`, `rocm-sdk-core`, `rocm-sdk-libraries-gfx103x-all`)
 - The usual torch Python deps as local wheels
 
-It does **not** include `rocm-sdk-devel` or torchvision. Devel is only for
-building the fork. Torchvision stays out until a wheel is built against this
-exact torch.
+It does **not** include `rocm-sdk-devel`. Devel is only for building the fork.
 
 ## Peak settings
 

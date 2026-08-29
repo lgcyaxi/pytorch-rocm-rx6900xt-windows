@@ -18,10 +18,10 @@ libwebp-base = ">=1.6,<2"
 # this folder is a ready pixi project: `cd <dir>; pixi install`. Other repos
 # can pin the same wheels by path from <dir>/dependencies/. Copying this
 # folder and editing pixi.toml is optional. Do not add rocm-sdk-devel.
-# Torchvision is omitted until a wheel matching this exact torch exists.
 [pypi-dependencies]
 numpy = { path = "dependencies/numpy-2.1.2-cp312-cp312-win_amd64.whl" }
 torch = { path = "dependencies/torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl" }
+torchvision = { path = "dependencies/torchvision-0.30.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl" }
 filelock = { path = "dependencies/filelock-3.20.0-py3-none-any.whl" }
 "typing-extensions" = { path = "dependencies/typing_extensions-4.15.0-py3-none-any.whl" }
 sympy = { path = "dependencies/sympy-1.13.3-py3-none-any.whl" }

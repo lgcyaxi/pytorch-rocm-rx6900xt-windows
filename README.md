@@ -1,8 +1,9 @@
 # PyTorch ROCm RX 6900 XT Windows
 
 This fork builds PyTorch ROCm wheels for AMD RX 6900 XT / `gfx1030` on Windows.
-It tracks upstream PyTorch `main` and carries the Windows ROCm fixes needed for
-this target.
+The overlay `main` branch and the latest GitHub Release are the stable runtime
+line. Upstream PyTorch is merged periodically when we rebuild torch+vision and
+publish a new date-tagged release, not on every upstream commit.
 
 ## Install from GitHub Releases
 
@@ -11,7 +12,8 @@ wheels from [Releases](https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/
 You do not need Visual Studio, pixi, or a source build.
 
 ```powershell
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2.15.0a0-rocm7.13.0-gfx1030/torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.08.28-rocm7.13.0-gfx1030/torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.08.28-rocm7.13.0-gfx1030/torchvision-0.30.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
 pip install --index-url https://repo.amd.com/rocm/whl/gfx103X-all/ `
     "rocm[libraries]==7.13.0" rocm-sdk-core==7.13.0 rocm-sdk-libraries-gfx103x-all==7.13.0
 ```
@@ -238,16 +240,18 @@ above or `$env:RX6900_RUNTIME_BUNDLE`. Then either:
 2. Point another repo at `<dest>\dependencies\*.whl` (Ware-care AMD does this)
 3. Optionally copy `<dest>` and edit that copy's `pixi.toml`
 
-The bundle is runtime-only: `torch-2.15.0a0+rocm7.13.0` plus TheRock ROCm
-7.13.0 `rocm`, `rocm-sdk-core`, and `rocm-sdk-libraries-gfx103x-all`. No
-`rocm-sdk-devel`. No torchvision until a matching wheel exists.
+The bundle is runtime-only: `torch-2.15.0a0+rocm7.13.0`, matching
+`torchvision-0.30.0a0+rocm7.13.0`, plus TheRock ROCm 7.13.0 `rocm`,
+`rocm-sdk-core`, and `rocm-sdk-libraries-gfx103x-all`. No `rocm-sdk-devel`.
 
 The `pixi.toml` / README templates live in `runtime-bundle/`.
 
 ## Sync From Upstream
 
-Merge, do not rebase. The overlay and pixi/TheRock files live on this branch;
-rebasing only the overlay commit onto upstream drops them.
+Stay on this overlay `main` between releases. Merge upstream only when you
+intend to rebuild both wheels and publish a new `vYYYY.MM.DD-rocm7.13.0-gfx1030`
+tag. Merge, do not rebase: the overlay and pixi/TheRock files live on this
+branch; rebasing only the overlay commit onto upstream drops them.
 
 ```powershell
 git fetch upstream main

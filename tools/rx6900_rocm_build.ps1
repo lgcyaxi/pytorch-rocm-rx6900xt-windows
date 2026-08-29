@@ -98,6 +98,56 @@ function Remove-VisionBuildDirectory {
     Remove-Item -LiteralPath $resolvedBuildDir -Recurse -Force
 }
 
+function Install-SleefWindowsMkalias {
+    $libm = Join-Path $PyTorchSource "third_party\sleef\src\libm"
+    $script = Join-Path $RepoRoot "tools\rx6900_sleef_mkalias.py"
+    $cmake = Join-Path $libm "CMakeLists.txt"
+    Test-RequiredPath -Path $script -Message "SLEEF mkalias Python helper not found: $script"
+    Test-RequiredPath -Path $cmake -Message "SLEEF libm CMakeLists.txt not found under $PyTorchSource"
+    Copy-Item -LiteralPath $script -Destination (Join-Path $libm "mkalias.py") -Force
+
+    $text = [System.IO.File]::ReadAllText($cmake)
+    if ($text.Contains("mkalias.py")) {
+        return
+    }
+
+    $old = "COMMAND `$<TARGET_FILE:`${TARGET_MKALIAS}> `${ALIAS_PARAMS_`${SIMD}_DP}"
+    $old = $old.Replace('`${', '${').Replace('`$', '$')
+    if (-not $text.Contains($old)) {
+        throw "Could not patch SLEEF mkalias custom command in $cmake"
+    }
+
+    $new = @"
+      if(WIN32)
+        set(_sleef_mkalias `${Python_EXECUTABLE} `${CMAKE_CURRENT_SOURCE_DIR}/mkalias.py)
+        set(_sleef_mkalias_dep `${CMAKE_CURRENT_SOURCE_DIR}/mkalias.py)
+      else()
+        set(_sleef_mkalias `$<TARGET_FILE:`${TARGET_MKALIAS}>)
+        set(_sleef_mkalias_dep `${TARGET_MKALIAS})
+      endif()
+      add_custom_command(
+	OUTPUT `${CMAKE_CURRENT_BINARY_DIR}/alias_`${SIMD}_dp.h.tmp
+	COMMAND `${_sleef_mkalias} `${ALIAS_PARAMS_`${SIMD}_DP} > `${CMAKE_CURRENT_BINARY_DIR}/alias_`${SIMD}_dp.h.tmp
+	DEPENDS `${_sleef_mkalias_dep}
+	COMMAND_EXPAND_LISTS
+	)
+      add_custom_command(
+	OUTPUT `${CMAKE_CURRENT_BINARY_DIR}/alias_`${SIMD}_sp.h.tmp
+	COMMAND `${_sleef_mkalias} `${ALIAS_PARAMS_`${SIMD}_SP} > `${CMAKE_CURRENT_BINARY_DIR}/alias_`${SIMD}_sp.h.tmp
+	DEPENDS `${_sleef_mkalias_dep}
+	COMMAND_EXPAND_LISTS
+	)
+"@
+    $new = $new.Replace('`${', '${').Replace('`$', '$')
+    $pattern = '(?s)add_custom_command\(\s*OUTPUT \$\{CMAKE_CURRENT_BINARY_DIR\}/alias_\$\{SIMD\}_dp\.h\.tmp.*?DEPENDS \$\{TARGET_MKALIAS\}\s*\)\s*add_custom_command\(\s*OUTPUT \$\{CMAKE_CURRENT_BINARY_DIR\}/alias_\$\{SIMD\}_sp\.h\.tmp.*?DEPENDS \$\{TARGET_MKALIAS\}\s*\)'
+    $updated = [regex]::Replace($text, $pattern, $new.Trim(), 1)
+    if ($updated -eq $text) {
+        throw "Could not patch SLEEF mkalias custom command in $cmake"
+    }
+    [System.IO.File]::WriteAllText($cmake, $updated)
+    Write-Host "Patched SLEEF mkalias generation to use Python (WDAC blocks mkalias.exe)"
+}
+
 function Invoke-RepoPython {
     param(
         [Parameter(Mandatory = $true)]
@@ -389,6 +439,13 @@ switch ($Action) {
         Test-RequiredPath -Path $PyTorchSource -Message "PyTorch source checkout not found. Run: pixi run checkout-pytorch"
         New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
         $visionCommit = Get-PinnedVisionCommit
+        if (Test-Path -LiteralPath (Join-Path $VisionSource ".git")) {
+            $coreSymlinks = if (Test-SymbolicLinkCreation) { "true" } else { "false" }
+            Write-Host "Resetting existing Vision checkout at $VisionSource (core.symlinks=$coreSymlinks)"
+            Invoke-Git -WorkingDirectory $VisionSource -Arguments @("config", "core.symlinks", $coreSymlinks) -CoreSymlinks $coreSymlinks
+            Invoke-Git -WorkingDirectory $VisionSource -Arguments @("reset", "--hard") -CoreSymlinks $coreSymlinks
+            Invoke-Git -WorkingDirectory $VisionSource -Arguments @("clean", "-fdx") -CoreSymlinks $coreSymlinks
+        }
 
         Invoke-RepoPython -WorkingDirectory $TheRockPyTorch -Arguments @(
             ".\pytorch_vision_repo.py",
@@ -408,6 +465,7 @@ switch ($Action) {
         $sdk = Test-PinnedRocmSdk
         Write-Host "Using pinned ROCm SDK $($sdk.Version) (cmake: $($sdk.CmakePrefix))"
         Enter-VsDevShell
+        Install-SleefWindowsMkalias
         New-Item -ItemType Directory -Force -Path $WheelOutput | Out-Null
 
         $env:PYTORCH_ROCM_ARCH = "gfx1030"
