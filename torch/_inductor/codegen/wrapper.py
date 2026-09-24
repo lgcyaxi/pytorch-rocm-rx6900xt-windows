@@ -14,7 +14,7 @@ import re
 import secrets
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from enum import Enum
 from itertools import chain, count
 from typing import Any, Literal, Protocol, TYPE_CHECKING
@@ -55,7 +55,6 @@ from .. import async_compile, config, debug as inductor_debug, ir
 from ..codecache import output_code_log
 from ..ir import IRNode, ReinterpretView
 from ..runtime import triton_heuristics
-from ..runtime.hints import DeviceProperties, TritonMeta
 from ..stream_constants import DEFAULT_STREAM, DEFAULT_STREAM_IDX, STREAM_NAME_TEMPLATE
 from ..stream_utils import (
     COOR_DEVICE_IDX_VAR,
@@ -68,9 +67,13 @@ from ..utils import (
     DeferredLineBase,
     DelayReplaceLine,
     get_benchmark_name,
+    get_constexpr_repr_children,
     get_dtype_size,
+    get_importable_constexpr_types,
+    GPU_ALIGN_BYTES,
     IndentedBuffer,
     is_codegen_graph_partition_subgraph,
+    is_gpu,
     is_using_cudagraph_partition,
     LineContext,
     make_codegen_buffer,
@@ -90,7 +93,12 @@ from .common import (
 )
 from .cpp_utils import cexpr
 from .custom_extern_kernel_codegen import CUSTOM_EXTERN_KERNEL_CODEGEN
-from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
+from .triton_utils import (
+    config_of,
+    should_unwrap_unspec_arg,
+    signature_to_meta,
+    triton_meta_device_props,
+)
 
 
 if TYPE_CHECKING:
@@ -100,6 +108,7 @@ if TYPE_CHECKING:
 
     from ..graph import GraphLowering
     from ..ir import ExternKernel
+    from ..runtime.hints import TritonMeta
     from ..scheduler import BaseSchedulerNode
     from .wrapper_fxir import FxConverter
 
@@ -107,6 +116,186 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 pexpr = PythonPrinter().doprint
+
+
+def _constant_offload_targets(
+    device: torch.device,
+) -> tuple[list[tuple[Any, int]], int]:
+    """Unique storages backing the graph constants on `device`.
+
+    Deduped by data pointer: constants are deduplicated by value, so several
+    names can share one storage and offloading per name would copy the same
+    bytes repeatedly. Constants can span devices (see
+    GraphLowering.constant_name), so only one device's are taken.
+
+    Non-resizable storages are excluded. resize_ raises on them even for a
+    zero-size resize, and discovering that mid-free would leave earlier
+    constants already freed.
+    """
+    targets: list[tuple[Any, int]] = []
+    seen: OrderedSet[int] = OrderedSet()
+    for tensor in V.graph.constants.values():
+        if not isinstance(tensor, torch.Tensor) or tensor.device != device:
+            continue
+        storage = tensor.untyped_storage()
+        ptr, nbytes = storage.data_ptr(), storage.nbytes()
+        if ptr == 0 or nbytes == 0 or ptr in seen or not storage.resizable():
+            continue
+        seen.add(ptr)
+        targets.append((storage, nbytes))
+    return targets, sum(nbytes for _, nbytes in targets)
+
+
+@contextlib.contextmanager
+def _constants_offloaded_to_disk() -> Iterator[None]:
+    """Free the graph constants from device memory across the autotune block.
+
+    The block benchmarks kernels against freshly generated random tensors and
+    reads only size/stride/dtype/device off the constants, so their bytes are
+    not needed while it runs. They are parked in an mmap'd file rather than
+    anonymous host memory: file-backed pages are clean page cache the kernel can
+    evict and re-read, where anonymous pages are reclaimable only to swap and
+    have been observed to drive an OOM kill on an already memory-heavy lowering.
+    """
+    state = None
+
+    # autotune_at_compile_time is reachable from plain JIT compile too, but the
+    # reasoning here -- that constant values are only needed until AOTI
+    # serialization reads them back -- is specific to AOT, as is the config this
+    # is gated on. Constants can span devices; spill only the one being lowered
+    # for, so the capacity the fraction is measured against matches what is freed.
+    # Read `current_device` rather than get_current_device_or_throw(): it is set
+    # only while codegen'ing a device-specific kernel, so a graph can reach here
+    # with none set -- the cpp_wrapper path does. That means there is nothing to
+    # offload, not that something is wrong.
+    device = V.graph.current_device
+    if (
+        device is not None
+        and device.type != "cpu"
+        and V.graph.aot_mode
+        # The constant-folding subgraph has no kernels to autotune and no
+        # allocator growth to relieve, so spilling it is pure wall clock.
+        and not V.graph.is_const_graph
+    ):
+        targets, total = _constant_offload_targets(device)
+        fraction = config.aot_inductor.autotune_offload_constants_min_device_fraction
+        if targets and total >= fraction * torch.accelerator.get_memory_info(device)[1]:
+            state = _spill_constants(targets, total)
+
+    try:
+        yield
+    finally:
+        # Captured before the restore's own handler, which would otherwise
+        # overwrite what sys.exc_info() reports.
+        block_failed = sys.exc_info()[0] is not None
+        if state is not None:
+            try:
+                _restore_constants(*state)
+            except Exception as exc:
+                # The spill file is the only copy of these bytes, and a partial
+                # restore leaves some constants at size zero -- codegen would then
+                # emit silently wrong results rather than fail. Nothing can
+                # recover that, so surface it as a clear fatal error instead of
+                # letting a bare exception escape the finally block.
+                log.exception(
+                    "Failed to restore %d offloaded constant storages to device",
+                    len(state[0]),
+                )
+                # Raising here when the block itself already failed would
+                # bury the original cause. A partial restore is still fatal, but
+                # the in-flight exception is the one worth surfacing.
+                if not block_failed:
+                    raise RuntimeError(
+                        "Graph constants could not be restored to device after "
+                        "the autotune offload; the graph is no longer usable"
+                    ) from exc
+
+
+def _spill_constants(
+    targets: list[tuple[Any, int]], total: int
+) -> tuple[list[tuple[Any, int]], list[int], Any] | None:
+    """Copy constants into an mmap'd file and free their device storage.
+
+    Returns None if the copy could not be completed, in which case no device
+    storage has been freed and lowering proceeds unchanged.
+
+    The free loop is deliberately outside that handler. Once a storage has been
+    resized away the spill file is the only copy, so a failure there has to
+    restore rather than report -- returning None would leave the caller with no
+    state to restore from.
+    """
+    # Not tempfile.gettempdir(): /tmp is tmpfs on many hosts, which would make
+    # the mapping anonymous RAM and defeat the point of spilling to disk.
+    path = os.path.join(
+        cache_dir(), f"inductor_const_spill_{os.getpid()}_{id(V.graph)}"
+    )
+    backing = None
+    offsets = []
+    try:
+        with dynamo_timed("offload_constants_spill", log_pt2_compile_event=True):
+            backing = torch.UntypedStorage.from_file(path, shared=True, nbytes=total)
+            # Unlink while the mapping holds the inode. The bytes stay readable
+            # and the space is reclaimed on process exit by any route, including
+            # the SIGKILL under which cleanup code would never run.
+            os.unlink(path)
+            offset = 0
+            # Copy everything before freeing anything, so a failure here leaves
+            # every constant intact on device.
+            for storage, nbytes in targets:
+                backing[offset : offset + nbytes].copy_(storage)
+                offsets.append(offset)
+                offset += nbytes
+    except (OSError, RuntimeError):
+        log.warning(
+            "Could not spill %.1f GiB of constants to %s; "
+            "continuing without the autotune offload",
+            total / 2**30,
+            path,
+            exc_info=True,
+        )
+        backing = None
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
+    freed = 0
+    try:
+        for storage, _ in targets:
+            storage.resize_(0)
+            freed += 1
+        torch.accelerator.empty_cache()
+    except Exception:
+        log.exception(
+            "Failed to free constant %d of %d after spilling; restoring",
+            freed,
+            len(targets),
+        )
+        _restore_constants(targets[:freed], offsets[:freed], backing)
+        raise
+
+    # Warning rather than info: this is an automatic, default-on behaviour that
+    # materially changes peak memory and adds wall clock, and the inductor logger
+    # sits at WARNING in the lowering harness, so info would be invisible to
+    # anyone debugging a run. Fires at most once per graph, and only for models
+    # large enough to clear the threshold.
+    log.warning(
+        "Offloaded %d constant storages (%.1f GiB) to disk for autotuning",
+        len(targets),
+        total / 2**30,
+    )
+    return (targets, offsets, backing)
+
+
+def _restore_constants(
+    targets: list[tuple[Any, int]], offsets: list[int], backing: Any
+) -> None:
+    with dynamo_timed("offload_constants_restore", log_pt2_compile_event=True):
+        for (storage, nbytes), offset in zip(targets, offsets):
+            storage.resize_(nbytes)
+            storage.copy_(backing[offset : offset + nbytes])
+    del backing
 
 
 def _rewrite_symbol_solution_for_int_codegen(expr: sympy.Expr) -> sympy.Expr:
@@ -117,21 +306,20 @@ def _rewrite_symbol_solution_for_int_codegen(expr: sympy.Expr) -> sympy.Expr:
     return CleanDiv(numerator, denominator)
 
 
-def _sanitize_for_repr(obj: Any) -> Any:
+def _sanitize_for_repr(obj: object) -> object:
     """Convert Enum values to their underlying value for valid Python repr in code generation."""
-    if isinstance(obj, dict):
-        return {_sanitize_for_repr(k): _sanitize_for_repr(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_for_repr(v) for v in obj]
-    # For namedtuples (have _fields), reconstruct to preserve the type
-    if isinstance(obj, tuple) and hasattr(obj, "_fields"):
-        return getattr(type(obj), "_make")(  # noqa: B009
-            _sanitize_for_repr(getattr(obj, field)) for field in obj._fields
-        )
-    if isinstance(obj, tuple):
-        return tuple(_sanitize_for_repr(v) for v in obj)
     if isinstance(obj, Enum):
         return _sanitize_for_repr(obj.value)
+    repr_children = get_constexpr_repr_children(obj)
+    if repr_children is not None:
+        children = tuple(_sanitize_for_repr(child) for child in repr_children.values)
+        # Rebuilding arbitrary attrs, pydantic, and container subclasses can
+        # invoke user code, so preserve the original when sanitization is a no-op.
+        if all(
+            child is original for child, original in zip(children, repr_children.values)
+        ):
+            return obj
+        return repr_children.rebuild(children)
     return obj
 
 
@@ -1139,6 +1327,10 @@ class AllocateLine(MemoryPlanningLine):
     def __post_init__(self):
         if V.graph.scheduler.current_node is None:
             raise AssertionError("expected scheduler.current_node to be set")
+        # The index is only meaningful within this scheduler's node list: an inlined
+        # subgraph emits its lines into the parent's list while V.graph is the
+        # SUBGRAPH. See should_reuse_buffer.
+        self.scheduler = V.graph.scheduler
         self.scheduler_node_index = V.graph.scheduler.nodes.index(
             V.graph.scheduler.current_node
         )
@@ -1146,6 +1338,21 @@ class AllocateLine(MemoryPlanningLine):
     def should_reuse_buffer(self, free_line: FreeIfNotReusedLine, size: int) -> bool:
         if self.comm_buffer:
             return True
+        if free_line.scheduler is not self.scheduler:
+            # A parent free paired with an allocation from an inlined invoke_subgraph
+            # region. codegen_invoke_subgraph inlines without the EnterSubgraphLine /
+            # ExitSubgraphLine bracket codegen_switch and codegen_while_loop wrap their
+            # branches in, and only that bracket makes memory_plan_reuse push a fresh
+            # MemoryPlanningState and swap estimate_peak. So the region's lines land in
+            # the parent's pool, scored against the parent's tree, and the two
+            # scheduler_node_index values index different node lists: the adjacency
+            # test below is meaningless and summarize_range raises on the inverted
+            # range. Bailing out costs regions the cross-boundary reuse that cond and
+            # while_loop keep.
+            # TODO: bracket the region instead. EnterSubgraphLine.codegen calls
+            # code.do_indent(), which needs an enclosing Python block statement -- an
+            # if/while branch emits one, a region does not.
+            return False
         if free_line.scheduler_node_index + 1 == self.scheduler_node_index:
             return True
         overall_peak_memory = self.wrapper.estimate_peak.overall_peak_memory
@@ -1209,7 +1416,7 @@ class AllocateLine(MemoryPlanningLine):
         device = self.node.get_device()
         if not (device is not None and device.index is not None):
             raise AssertionError(
-                f"Comm buffer requires a valid CUDA device with index, got {device}"
+                f"Comm buffer requires a valid accelerator device with index, got {device}"
             )
         dtype = self.node.get_dtype()
         shape = tuple(self.node.get_size())
@@ -1224,9 +1431,12 @@ class AllocateLine(MemoryPlanningLine):
             # [device-as-parameter] under compile-on-one-rank the comm buffer must follow
             # the running rank's device, not the compile-time index.
             if _coor_enabled():
-                device_arg = f'torch.device("cuda", {V.graph.device_ops.current_device_idx_expr()})'
+                device_arg = (
+                    f'torch.device("{device.type}", '
+                    f"{V.graph.device_ops.current_device_idx_expr()})"
+                )
             else:
-                device_arg = f'torch.device("cuda:{device.index}")'
+                device_arg = f'torch.device("{device.type}:{device.index}")'
             line = (
                 f"{name} = empty_strided_p2p("
                 f"{self.wrapper.codegen_shape_tuple(shape)}, "
@@ -1263,6 +1473,9 @@ class FreeIfNotReusedLine(MemoryPlanningLine):
     def __post_init__(self):
         if V.graph.scheduler.current_node is None:
             raise AssertionError("expected scheduler.current_node to be set")
+        # See AllocateLine.__post_init__ -- the index is only meaningful
+        # relative to this scheduler's node list.
+        self.scheduler = V.graph.scheduler
         self.scheduler_node_index = V.graph.scheduler.nodes.index(
             V.graph.scheduler.current_node
         )
@@ -1478,9 +1691,12 @@ class SymbolicCallArgLine(WrapperLine):
     wrapper: PythonWrapperCodegen
     arg: SymbolicCallArg
     graph: GraphLowering
+    in_profile_scope: bool = False
 
     def codegen(self, code: IndentedBuffer) -> None:
-        self.wrapper._generate_symbolic_call_arg_helper(self.arg, self.graph)
+        self.wrapper._generate_symbolic_call_arg_helper(
+            self.arg, self.graph, self.in_profile_scope
+        )
 
     def codegen_fx(self, converter: FxConverter) -> FxConversionFunc:
         return converter._generate_symbolic_call_arg
@@ -1535,6 +1751,23 @@ class GroupedAssertSizeStrideLine(WrapperLine):
     @staticmethod
     def codegen_fx(converter: FxConverter) -> FxConversionFunc:
         return converter._generate_assert_size_stride
+
+
+@dataclasses.dataclass
+class AssertAlignmentLine(WrapperLine):
+    wrapper: PythonWrapperCodegen
+    name: str
+    alignment: int
+    op_name: str
+
+    def codegen(self, code: IndentedBuffer) -> None:
+        self.wrapper._codegen_assert_alignment(
+            code, self.name, self.alignment, self.op_name
+        )
+
+    @staticmethod
+    def codegen_fx(converter: FxConverter) -> FxConversionFunc:
+        return converter._generate_assert_alignment
 
 
 @dataclasses.dataclass
@@ -1646,6 +1879,13 @@ class PythonWrapperCodegen(CodeGen):
         # pre-existing kernel for it
         self.src_to_kernel: dict[str, str] = {}
         self.kernel_numel_expr: OrderedSet[tuple[str, GraphLowering]] = OrderedSet()
+        # Nesting depth of the kernel-profiling {} scope blocks currently open.
+        # A symbolic numel emitted inside one is block-scoped, so it has to be
+        # redeclared rather than assigned. Only the guard begin/end pair keeps
+        # this up to date, so a block opened any other way -- the C shim writes
+        # its own braces -- does not register; anything emitting a numel inside
+        # one has to maintain the depth too.
+        self.kernel_profile_scope_depth: int = 0
         self.lines: list[Line] = []
         self.declare = ""
         self.declare_maybe_reference = ""
@@ -2073,8 +2313,27 @@ class PythonWrapperCodegen(CodeGen):
     def codegen_input_size_and_nan_asserts(self) -> None:
         if config.size_asserts:
             self.codegen_input_size_asserts()
+        if config.alignment_asserts_inputs:
+            self.codegen_input_alignment_asserts()
         if config.nan_asserts:
             self.codegen_input_nan_asserts()
+
+    def codegen_input_alignment_asserts(self) -> None:
+        # Partition prefixes are generated after their kernels.
+        body = self.lines
+        self.lines = []
+        inputs = self.get_graph_inputs()
+        for name, buf in V.graph.graph_inputs.items():
+            if (
+                name not in inputs
+                or name in V.graph.unaligned_buffers
+                or not isinstance(buf, ir.TensorBox)
+            ):
+                continue
+            device = buf.get_device()
+            if device is not None and is_gpu(device.type):
+                self.write_assert_alignment(name, GPU_ALIGN_BYTES, "input")
+        self.lines.extend(body)
 
     # Input size/stride assertions are deferred from the top of call() to just
     # before the first kernel that uses each input. This avoids a block of N
@@ -2162,6 +2421,16 @@ class PythonWrapperCodegen(CodeGen):
         code.writeline(
             f"assert_size_stride_grouped(({names}), ({sizes}), ({strides}), {op_name!r})"
         )
+
+    def write_assert_alignment(self, name: str, alignment: int, op_name: str) -> None:
+        """Queue an assert_alignment for emission during replay."""
+        self.writeline(AssertAlignmentLine(self, name, alignment, op_name))
+
+    def _codegen_assert_alignment(
+        self, code: IndentedBuffer, name: str, alignment: int, op_name: str
+    ) -> None:
+        """Emit one assert_alignment line to `code` (replay-phase target)."""
+        code.writeline(f"assert_alignment({name}, {alignment}, {op_name!r})")
 
     def register_alignment_check_inputs(self) -> None:
         """Populate pending alignment copies for non-mutated inputs.
@@ -2532,6 +2801,18 @@ class PythonWrapperCodegen(CodeGen):
                 wrapper_name = kernel
             self.writeline(f"{wrapper_name}({', '.join(args)})")
 
+    def _tma_descriptor_tensor_ref(self, desc, in_autotune_block):
+        """Reference to the descriptor's source tensor.
+
+        The compile-time autotune block is Python even when the wrapper emits C++,
+        and it already materializes an example tensor in the descriptor tensor's
+        own layout. Referring to that buffer by name keeps the block valid Python;
+        codegen_reference() would emit a C++ reinterpret (e.g. a `0L` literal).
+        """
+        if in_autotune_block:
+            return desc.get_tensor().get_name()
+        return desc.tensor.codegen_reference()
+
     def _generate_tma_descriptor_call_experimental(self, desc, apply_size_hints=False):
         dims = desc.dims
         block_dims = desc.block_dims
@@ -2539,7 +2820,7 @@ class PythonWrapperCodegen(CodeGen):
             dims = V.graph.sizevars.optimization_hint(dims)
             block_dims = V.graph.sizevars.optimization_hints(block_dims)
 
-        ptr = f"{desc.tensor.codegen_reference()}.data_ptr()"
+        ptr = f"{self._tma_descriptor_tensor_ref(desc, apply_size_hints)}.data_ptr()"
         # Explicitly call the Python version of val_to_arg_str
         dims = ", ".join(PythonWrapperCodegen.val_to_arg_str(self, dim) for dim in dims)
         block_dims = ", ".join(
@@ -2559,7 +2840,8 @@ class PythonWrapperCodegen(CodeGen):
 
         prefix = "triton.tools.tensor_descriptor.TensorDescriptor"
         fn = f"{prefix}.from_tensor"
-        args = f"{desc.tensor.codegen_reference()}, {block_shape}"
+        tensor_ref = self._tma_descriptor_tensor_ref(desc, apply_size_hints)
+        args = f"{tensor_ref}, {block_shape}"
         call = f"{fn}({args})"
         return call
 
@@ -2830,10 +3112,11 @@ class PythonWrapperCodegen(CodeGen):
             payload_fn=lambda: tuning_code,
         )
         # Execute the code to autotune kernels
-        try:
-            exec(tuning_code, scope)
-        except Exception as e:
-            raise RuntimeError(f"Failed to run autotuning code block: {e}") from e
+        with _constants_offloaded_to_disk():
+            try:
+                exec(tuning_code, scope)
+            except Exception as e:
+                raise RuntimeError(f"Failed to run autotuning code block: {e}") from e
 
     def memory_plan(self):
         from .memory_planning import MemoryPlanner
@@ -3779,7 +4062,7 @@ class PythonWrapperCodegen(CodeGen):
             use_fp64_for_python_float=False,
         )
         device = V.graph.get_current_device_or_throw()
-        device_props = DeviceProperties.create(device)
+        device_props = triton_meta_device_props(device)
         triton_meta: TritonMeta = {
             "signature": triton_signature,
             "device": device_props,
@@ -3930,6 +4213,13 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta.update(triton_info_kernel_cls.inductor_meta_common())
 
         compile_wrapper.splice(triton_info_kernel_cls.gen_common_triton_imports())
+        for type_spec in get_importable_constexpr_types(
+            triton_meta.get("constants", {}).values()
+        ):
+            compile_wrapper.writeline(
+                f"from {type_spec.module} import "
+                f"{type_spec.root_name} as {type_spec.root_name}"
+            )
         if config.triton.proton_profiling:
             compile_wrapper.writeline('pl.enable_semantic("triton")')
 
@@ -3987,12 +4277,19 @@ class PythonWrapperCodegen(CodeGen):
 
         is_benchmark_kernel = kernel_name == ""
         if not is_benchmark_kernel:
-            self.writeline(SymbolicCallArgLine(self, arg, V.graph))
+            self.writeline(
+                SymbolicCallArgLine(
+                    self,
+                    arg,
+                    V.graph,
+                    in_profile_scope=self.kernel_profile_scope_depth > 0,
+                )
+            )
 
         return arg
 
     def _generate_symbolic_call_arg_helper(
-        self, arg: SymbolicCallArg, graph: GraphLowering
+        self, arg: SymbolicCallArg, graph: GraphLowering, in_profile_scope: bool = False
     ) -> None:
         self.writeline(f"{arg.inner} = {pexpr(arg.inner_expr)}")
 
@@ -5230,28 +5527,19 @@ class PythonWrapperCodegen(CodeGen):
     def can_prove_buffer_has_static_shape(buffer):
         return PythonWrapperCodegen.static_shape_for_buffer_or_none(buffer) is not None
 
-    def write_kernel_context_guard(
+    @contextlib.contextmanager
+    def kernel_profile_scope(
         self,
         kernel_name: str,
         node_schedule: Sequence[BaseSchedulerNode] | ExternKernel,
+        enabled: bool | None = None,
     ):
-        return
+        """Emit a kernel call inside a profiling {} scope block.
 
-    def write_kernel_context_guard_begin(
-        self,
-    ):
+        A profiling block is a C++ construct, so this does nothing for the
+        Python wrapper; CppWrapperCpu overrides it to emit the real block.
         """
-        Mark the beginning of kernel context guard
-        """
-        return
-
-    def write_kernel_context_guard_end(
-        self,
-    ):
-        """
-        Mark the end of kernel context guard
-        """
-        return
+        yield
 
 
 class SubgraphPythonWrapperCodegen(PythonWrapperCodegen):
