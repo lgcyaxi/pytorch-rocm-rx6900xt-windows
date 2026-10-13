@@ -25,7 +25,7 @@ Then pick one:
 
 The bundle is runtime-only:
 
-- `torch-2.15.0a0+rocm7.13.0`
+- `torch-2.16.0a0+rocm7.13.0`
 - `torchvision-0.30.0a0+rocm7.13.0`
 - TheRock ROCm `7.13.0` (`rocm`, `rocm-sdk-core`, `rocm-sdk-libraries-gfx103x-all`)
 - The usual torch Python deps as local wheels

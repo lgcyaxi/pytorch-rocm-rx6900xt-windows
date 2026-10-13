@@ -12,8 +12,8 @@ wheels from [Releases](https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/
 You do not need Visual Studio, pixi, or a source build.
 
 ```powershell
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.09.24-rocm7.13.0-gfx1030/torch-2.15.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.09.24-rocm7.13.0-gfx1030/torchvision-0.30.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm7.13.0-gfx1030/torch-2.16.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm7.13.0-gfx1030/torchvision-0.30.0a0+rocm7.13.0-cp312-cp312-win_amd64.whl
 pip install --index-url https://repo.amd.com/rocm/whl/gfx103X-all/ `
     "rocm[libraries]==7.13.0" rocm-sdk-core==7.13.0 rocm-sdk-libraries-gfx103x-all==7.13.0
 ```
@@ -240,7 +240,7 @@ above or `$env:RX6900_RUNTIME_BUNDLE`. Then either:
 2. Point another repo at `<dest>\dependencies\*.whl` (Ware-care AMD does this)
 3. Optionally copy `<dest>` and edit that copy's `pixi.toml`
 
-The bundle is runtime-only: `torch-2.15.0a0+rocm7.13.0`, matching
+The bundle is runtime-only: `torch-2.16.0a0+rocm7.13.0`, matching
 `torchvision-0.30.0a0+rocm7.13.0`, plus TheRock ROCm 7.13.0 `rocm`,
 `rocm-sdk-core`, and `rocm-sdk-libraries-gfx103x-all`. No `rocm-sdk-devel`.
 
