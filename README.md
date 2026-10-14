@@ -22,12 +22,20 @@ Python 3.12 on 64-bit Windows. Do not install `rocm-sdk-devel`. After a local
 wheel build, maintainers publish with `pixi run publish-release`.
 
 The two-card wheels run on both the RX 6900 XT (`gfx1030`) and the RX 5700 XT
-(`gfx1010`). This build also loads tuned gfx1010 GEMM kernels for large
-FP16 `mm` and `nn.Linear`, and for FP32 `mm` at 2048 and above.
+(`gfx1010`). On the 5700 XT, FP16 and FP32 `mm`, `addmm`, `bmm`, `baddbmm` and
+`nn.Linear` (forward and backward) run on Tensile assembly kernels from
+`external/rdna-kernels` instead of rocBLAS's untuned gfx1010 fallback; with
+TunableOp enabled they are its `Default` candidate. FP16 accumulates in FP32.
+`torch.backends.cuda.matmul.allow_fp16_accumulation` together with
+`PYTORCH_GFX1010_HGEMM_FP16_ACC=1` switches to FP16 accumulation, 1.4-1.8x
+faster but much less accurate, because gfx1010 rounds every FMA to FP16.
+`PYTORCH_GFX1010_HGEMM=0` / `PYTORCH_GFX1010_SGEMM=0` switch back to rocBLAS.
+On both cards `torch._int_mm` runs on rocBLAS, since hipBLASLt has no kernels
+for them.
 
 ```powershell
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14.2-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14.2-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
 pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ `
     "rocm[libraries,device-gfx1030,device-gfx1010]==10.1.0a20260822"
 ```
@@ -197,7 +205,9 @@ What is already at the wall:
 1. Large FP32 GEMM and 3x3 NCHW conv hit paper peak on a short burst. Longer
    runs drop with clocks/power, not with a worse kernel.
 2. hipBLASLt has no gfx1030 images in `gfx103X-all` (only gfx1100). Forcing it
-   crashes TunableOp. Keep `PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0` if you tune.
+   crashes TunableOp. The two-card wheel skips hipBLASLt candidates on archs it
+   does not support; with the single-card 7.13.0 wheel, keep
+   `PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED=0` if you tune.
 3. rocBLAS TunableOp, `cudnn.benchmark`, `channels_last`, FP16 accumulate, and
    a bigger `HIPBLAS_WORKSPACE_CONFIG` did not beat the defaults. `channels_last`
    is about half speed. Do not enable them.

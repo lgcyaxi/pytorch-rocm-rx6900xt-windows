@@ -147,7 +147,7 @@ programmatically since the settings become fixed. Use the C++ or Python APIs ins
 | PYTORCH_TUNABLEOP_FILENAME | Default is 'tunableop_results.csv'. |
 | PYTORCH_TUNABLEOP_NUMERICAL_CHECK | Default is off. Set 'atol_rtol' to enable, for example "1e-5_1e-5". |
 | PYTORCH_TUNABLEOP_ROCBLAS_ENABLED | Default is 1. Set to 0 to disable rocblas being considered during tuning. |
-| PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED | Default is 1. Set to 0 to disable hipblaslt being considered during tuning. |
+| PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED | Default is 1 on archs hipblaslt supports and 0 elsewhere. Set to 0 to disable hipblaslt being considered during tuning. |
 | PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS | Default is 30. Unit is milliseconds. |
 | PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS | Default is 100. |
 | PYTORCH_TUNABLEOP_CUBLASLT_REQUESTED_ALGO_COUNT | Default is 8. CUDA only. Number of cuBLASLt heuristic candidates to request. Values less than 1 are clamped to 1. |

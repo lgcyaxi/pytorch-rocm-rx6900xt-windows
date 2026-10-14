@@ -13,6 +13,7 @@
 #ifdef USE_ROCM
 #include <ATen/cuda/tunable/GemmHipblaslt.h>
 #include <ATen/cuda/tunable/GemmRocblas.h>
+#include <ATen/detail/CUDAHooksInterface.h>
 #else
 #include <ATen/cuda/tunable/GemmCublaslt.h>
 #endif
@@ -226,6 +227,23 @@ inline const char* TypeName(c10::complex<float> v) {
   return "c10::complex<float>";
 }
 
+#ifdef USE_ROCM
+// hipBLASLt throws while enumerating algorithms on archs it ships no kernels
+// for (e.g. RDNA1/2), so unless the env var says otherwise, only offer its
+// candidates where it is supported.
+inline bool IsHipBlasLtTuningEnabled() {
+  static const bool enabled = [] {
+    const auto env = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
+    if (env.has_value()) {
+      return env.value();
+    }
+    const auto& hooks = at::detail::getCUDAHooks();
+    return hooks.isGPUArch(hooks.getHipblasltSupportedArchs());
+  }();
+  return enabled;
+}
+#endif
+
 template <typename T, BlasOp ALayout, BlasOp BLayout>
 class GemmTunableOp
     : public
@@ -247,8 +265,7 @@ class GemmTunableOp
       }
     }
 
-    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
-    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
+    if (IsHipBlasLtTuningEnabled()) {
       // disallow tuning of hipblaslt with c10::complex
       if constexpr (
           !std::is_same_v<T, c10::complex<float>> &&
@@ -282,8 +299,7 @@ class GemmAndBiasTunableOp
     this->RegisterOp(std::string("Default"), std::make_unique<DefaultGemmAndBiasOp<T>>());
 
 #ifdef USE_ROCM
-    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
-    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
+    if (IsHipBlasLtTuningEnabled()) {
       // disallow tuning of hipblaslt with c10::complex
       if constexpr (
           !std::is_same_v<T, c10::complex<float>> &&
@@ -324,8 +340,7 @@ class GemmStridedBatchedTunableOp
       }
     }
 
-    static const auto env_hipblaslt = c10::utils::check_env("PYTORCH_TUNABLEOP_HIPBLASLT_ENABLED");
-    if (!env_hipblaslt.has_value() || env_hipblaslt.value()) {
+    if (IsHipBlasLtTuningEnabled()) {
       // disallow tuning of hipblaslt with c10::complex
       if constexpr (
           !std::is_same_v<T, c10::complex<float>> &&
