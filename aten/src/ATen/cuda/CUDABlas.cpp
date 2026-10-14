@@ -1527,9 +1527,10 @@ static bool rocm_try_gfx1010_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
   if (arch == nullptr || std::strstr(arch, "gfx1010") == nullptr) {
     return false;
   }
+  // 128x128 was faster in the Tensile client at 1024, but torch.mm there
+  // was slower than rocBLAS. Sizes below 2048 stay on rocBLAS.
   const bool use256 = m >= 2048 && (m % 256) == 0 && (n % 128) == 0;
-  const bool use128 = !use256 && m >= 128 && (m % 128) == 0 && (n % 128) == 0;
-  if (!use256 && !use128) {
+  if (!use256) {
     return false;
   }
   if (m > 0xffffffffLL || n > 0xffffffffLL || k > 0xffffffffLL) {
@@ -1583,7 +1584,7 @@ static bool rocm_try_gfx1010_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
   unsigned int size1 = static_cast<unsigned int>(n);
   unsigned int sizek = static_cast<unsigned int>(k);
   unsigned int stagger = 0;
-  const unsigned int mt0 = use256 ? 256u : 128u;
+  const unsigned int mt0 = 256u;
   const unsigned int mt1 = 128u;
   unsigned int tiles0 = size0 / mt0;
   unsigned int tiles1 = size1 / mt1;
@@ -1597,7 +1598,7 @@ static bool rocm_try_gfx1010_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
     return false;
   }
   const hipError_t launch = hipModuleLaunchKernel(
-      use256 ? loaded.tile256 : loaded.tile128,
+      loaded.tile256,
       tiles0, tiles1, 1,
       256, 1, 1,
       0, stream, args, nullptr);
