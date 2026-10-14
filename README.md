@@ -22,11 +22,12 @@ Python 3.12 on 64-bit Windows. Do not install `rocm-sdk-devel`. After a local
 wheel build, maintainers publish with `pixi run publish-release`.
 
 The two-card wheels run on both the RX 6900 XT (`gfx1030`) and the RX 5700 XT
-(`gfx1010`).
+(`gfx1010`). This build also loads tuned gfx1010 GEMM kernels for large
+FP16 `mm` and `nn.Linear`, and for FP32 `mm` at 2048 and above.
 
 ```powershell
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
 pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ `
     "rocm[libraries,device-gfx1030,device-gfx1010]==10.1.0a20260822"
 ```
@@ -38,13 +39,13 @@ The rest of this README is the source-build path used to produce those wheels.
 ```powershell
 git clone https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows.git
 cd pytorch-rocm-rx6900xt-windows
-git submodule update --init external/TheRock
+git submodule update --init external/TheRock external/rdna-kernels
 ```
 
 If the repo is already cloned:
 
 ```powershell
-git submodule update --init external/TheRock
+git submodule update --init external/TheRock external/rdna-kernels
 ```
 
 Do not use `--recursive` for `external/TheRock` unless you are building ROCm
