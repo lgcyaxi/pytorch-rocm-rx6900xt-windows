@@ -132,3 +132,6 @@
 [submodule "external/TheRock"]
 	path = external/TheRock
 	url = https://github.com/lgcyaxi/therock-rocm-rx6900xt-windows.git
+[submodule "external/rdna-kernels"]
+	path = external/rdna-kernels
+	url = https://github.com/lgcyaxi/rocm-rdna-kernels.git

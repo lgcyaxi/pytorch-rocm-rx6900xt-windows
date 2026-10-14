@@ -26,6 +26,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #define PYTORCH_ROCBLAS_VERSION_DECIMAL (ROCBLAS_VERSION_MAJOR * 100 + ROCBLAS_VERSION_MINOR)
 #define USE_GEMM_FLAGS_FP16_ALT_IMPL (PYTORCH_ROCBLAS_VERSION_DECIMAL >= 242)
 // needed to work around calling rocblas API instead of hipblas API
@@ -1497,6 +1498,113 @@ void gemm<double>(CUDABLAS_GEMM_ARGTYPES(double)) {
 }
 
 #ifdef USE_ROCM
+#if __has_include("../../../../external/rdna-kernels/gfx1010/fp32_sgemm_nn/hsaco.inc")
+#include "../../../../external/rdna-kernels/gfx1010/fp32_sgemm_nn/hsaco.inc"
+#define PYTORCH_HAS_GFX1010_SGEMM 1
+#else
+#define PYTORCH_HAS_GFX1010_SGEMM 0
+#endif
+
+// gfx1010 column-major NN SGEMM from external/rdna-kernels. Beta must be 0.
+// 256x128x16 is faster from M>=2048; 128x128x16 covers the smaller multiples.
+static bool rocm_try_gfx1010_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
+#if !PYTORCH_HAS_GFX1010_SGEMM
+  return false;
+#else
+  if (beta != 0.0f || m <= 0 || n <= 0 || k <= 0 || (k % 16) != 0) {
+    return false;
+  }
+  const char* disable = std::getenv("PYTORCH_GFX1010_SGEMM");
+  if (disable != nullptr && std::strcmp(disable, "0") == 0) {
+    return false;
+  }
+  const bool ta = std::tolower(static_cast<unsigned char>(transa)) != 'n';
+  const bool tb = std::tolower(static_cast<unsigned char>(transb)) != 'n';
+  if (ta || tb) {
+    return false;
+  }
+  const char* arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  if (arch == nullptr || std::strstr(arch, "gfx1010") == nullptr) {
+    return false;
+  }
+  const bool use256 = m >= 2048 && (m % 256) == 0 && (n % 128) == 0;
+  const bool use128 = !use256 && m >= 128 && (m % 128) == 0 && (n % 128) == 0;
+  if (!use256 && !use128) {
+    return false;
+  }
+  if (m > 0xffffffffLL || n > 0xffffffffLL || k > 0xffffffffLL) {
+    return false;
+  }
+  int64_t lda_ = lda;
+  int64_t ldb_ = ldb;
+  int64_t ldc_ = ldc;
+  detail::cublasAdjustLdLevel3(transa, transb, m, n, k, &lda_, &ldb_, &ldc_);
+  if (lda_ <= 0 || ldb_ <= 0 || ldc_ <= 0 ||
+      lda_ > 0xffffffffLL || ldb_ > 0xffffffffLL || ldc_ > 0xffffffffLL) {
+    return false;
+  }
+
+  struct Loaded {
+    hipModule_t module = nullptr;
+    hipFunction_t tile128 = nullptr;
+    hipFunction_t tile256 = nullptr;
+    bool ok = false;
+  };
+  static Loaded loaded;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (hipModuleLoadData(&loaded.module, kGfx1010Fp32NnHsaco) != hipSuccess) {
+      return;
+    }
+    const hipError_t e128 = hipModuleGetFunction(
+        &loaded.tile128,
+        loaded.module,
+        "Cij_Aik_Bkj_S_MT128x128x16_SN_K1_TT8_8_WG16_16_1");
+    const hipError_t e256 = hipModuleGetFunction(
+        &loaded.tile256,
+        loaded.module,
+        "Cij_Aik_Bkj_S_MT256x128x16_SN_K1_TT16_8_WG16_16_1");
+    loaded.ok = e128 == hipSuccess && e256 == hipSuccess;
+  });
+  if (!loaded.ok) {
+    return false;
+  }
+
+  float* dptr = c;
+  const float* cptr = c;
+  const float* aptr = a;
+  const float* bptr = b;
+  float alpha_v = alpha;
+  unsigned int stride_d = static_cast<unsigned int>(ldc_);
+  unsigned int stride_c = static_cast<unsigned int>(ldc_);
+  unsigned int stride_ak = static_cast<unsigned int>(lda_);
+  unsigned int stride_bj = static_cast<unsigned int>(ldb_);
+  unsigned int size0 = static_cast<unsigned int>(m);
+  unsigned int size1 = static_cast<unsigned int>(n);
+  unsigned int sizek = static_cast<unsigned int>(k);
+  unsigned int stagger = 0;
+  const unsigned int mt0 = use256 ? 256u : 128u;
+  const unsigned int mt1 = 128u;
+  unsigned int tiles0 = size0 / mt0;
+  unsigned int tiles1 = size1 / mt1;
+  void* args[] = {
+      &dptr, &cptr, &aptr, &bptr, &alpha_v,
+      &stride_d, &stride_c, &stride_ak, &stride_bj,
+      &size0, &size1, &sizek, &stagger, &tiles0, &tiles1};
+  rocblas_handle handle = (rocblas_handle)at::cuda::getCurrentCUDABlasHandle();
+  hipStream_t stream = nullptr;
+  if (rocblas_get_stream(handle, &stream) != rocblas_status_success) {
+    return false;
+  }
+  const hipError_t launch = hipModuleLaunchKernel(
+      use256 ? loaded.tile256 : loaded.tile128,
+      tiles0, tiles1, 1,
+      256, 1, 1,
+      0, stream, args, nullptr);
+  return launch == hipSuccess;
+#endif
+}
+
 // gfx1030: pin rocBLAS 5.4 Tensile IDs from TunableOp. NT is Linear/1x1 dW.
 // BLAS m/n are swapped vs PyTorch row-major, so Linear(64,192) dW is 64x192.
 static bool rocm_try_tensile_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
@@ -1600,6 +1708,9 @@ static bool rocm_try_tensile_sgemm(CUDABLAS_GEMM_ARGTYPES(float)) {
 template <>
 void gemm<float>(CUDABLAS_GEMM_ARGTYPES(float)) {
 #ifdef USE_ROCM
+  if (rocm_try_gfx1010_sgemm(CUDABLAS_GEMM_ARGS(float))) {
+    return;
+  }
   // gfx1030 rocBLAS default is slow for tiny C and huge K (Linear/1x1 conv dW).
   if (at::native::rocm_small_mn_huge_k_sgemm(
           transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)) {
