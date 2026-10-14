@@ -21,11 +21,12 @@ pip install --index-url https://repo.amd.com/rocm/whl/gfx103X-all/ `
 Python 3.12 on 64-bit Windows. Do not install `rocm-sdk-devel`. After a local
 wheel build, maintainers publish with `pixi run publish-release`.
 
-The two-card wheel is torch only. It runs on both the RX 6900 XT (`gfx1030`)
-and the RX 5700 XT (`gfx1010`). Torchvision is not in this release.
+The two-card wheels run on both the RX 6900 XT (`gfx1030`) and the RX 5700 XT
+(`gfx1010`).
 
 ```powershell
 pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.13-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
 pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ `
     "rocm[libraries,device-gfx1030,device-gfx1010]==10.1.0a20260822"
 ```
