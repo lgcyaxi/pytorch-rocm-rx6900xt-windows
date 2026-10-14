@@ -1510,6 +1510,12 @@ void gemm<double>(CUDABLAS_GEMM_ARGTYPES(double)) {
 #else
 #define PYTORCH_HAS_GFX1010_HGEMM 0
 #endif
+#if __has_include("../../../../external/rdna-kernels/gfx1010/fp16_hgemm_tn/hsaco.inc")
+#include "../../../../external/rdna-kernels/gfx1010/fp16_hgemm_tn/hsaco.inc"
+#define PYTORCH_HAS_GFX1010_HGEMM_TN 1
+#else
+#define PYTORCH_HAS_GFX1010_HGEMM_TN 0
+#endif
 
 // gfx1010 column-major NN SGEMM from external/rdna-kernels. Beta must be 0.
 // 256x128x16 is faster from M>=2048; 128x128x16 covers the smaller multiples.
@@ -1756,6 +1762,89 @@ void gemm<c10::complex<float>>(CUDABLAS_GEMM_ARGTYPES(c10::complex<float>)) {
 }
 
 #ifdef USE_ROCM
+// Column-major TN: C = A^T B. This is the nn.Linear path.
+static bool rocm_try_gfx1010_hgemm_tn(CUDABLAS_GEMM_ARGTYPES(at::Half)) {
+#if !PYTORCH_HAS_GFX1010_HGEMM_TN
+  return false;
+#else
+  if (beta != 0.0f || m <= 0 || n <= 0 || k <= 0 || (k % 32) != 0) {
+    return false;
+  }
+  const char* disable = std::getenv("PYTORCH_GFX1010_HGEMM");
+  if (disable != nullptr && std::strcmp(disable, "0") == 0) {
+    return false;
+  }
+  const bool ta = std::tolower(static_cast<unsigned char>(transa)) != 'n';
+  const bool tb = std::tolower(static_cast<unsigned char>(transb)) != 'n';
+  if (!ta || tb) {
+    return false;
+  }
+  const char* arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  if (arch == nullptr || std::strstr(arch, "gfx1010") == nullptr) {
+    return false;
+  }
+  if ((m % 256) != 0 || (n % 128) != 0) {
+    return false;
+  }
+  if (m > 0xffffffffLL || n > 0xffffffffLL || k > 0xffffffffLL) {
+    return false;
+  }
+  int64_t lda_ = lda;
+  int64_t ldb_ = ldb;
+  int64_t ldc_ = ldc;
+  detail::cublasAdjustLdLevel3(transa, transb, m, n, k, &lda_, &ldb_, &ldc_);
+  if (lda_ <= 0 || ldb_ <= 0 || ldc_ <= 0 ||
+      lda_ > 0xffffffffLL || ldb_ > 0xffffffffLL || ldc_ > 0xffffffffLL) {
+    return false;
+  }
+  struct Loaded {
+    hipModule_t module = nullptr;
+    hipFunction_t tile = nullptr;
+    bool ok = false;
+  };
+  static Loaded loaded;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (hipModuleLoadData(&loaded.module, kGfx1010Fp16TnHsaco) != hipSuccess) {
+      return;
+    }
+    loaded.ok = hipModuleGetFunction(
+        &loaded.tile,
+        loaded.module,
+        "Cij_Aki_Bkj_H_MT256x128x32_SN_K1_TT16_8") == hipSuccess;
+  });
+  if (!loaded.ok) {
+    return false;
+  }
+  at::Half* dptr = c;
+  const at::Half* cptr = c;
+  const at::Half* aptr = a;
+  const at::Half* bptr = b;
+  unsigned short alpha_bits = at::Half(static_cast<float>(alpha)).x;
+  unsigned int stride_d = static_cast<unsigned int>(ldc_);
+  unsigned int stride_c = static_cast<unsigned int>(ldc_);
+  unsigned int stride_ai = static_cast<unsigned int>(lda_);
+  unsigned int stride_bj = static_cast<unsigned int>(ldb_);
+  unsigned int size0 = static_cast<unsigned int>(m);
+  unsigned int size1 = static_cast<unsigned int>(n);
+  unsigned int sizek = static_cast<unsigned int>(k);
+  unsigned int stagger = 0;
+  unsigned int tiles0 = size0 / 256u;
+  unsigned int tiles1 = size1 / 128u;
+  void* args[] = {
+      &dptr, &cptr, &aptr, &bptr, &alpha_bits,
+      &stride_d, &stride_c, &stride_ai, &stride_bj,
+      &size0, &size1, &sizek, &stagger, &tiles0, &tiles1};
+  rocblas_handle handle = (rocblas_handle)at::cuda::getCurrentCUDABlasHandle();
+  hipStream_t stream = nullptr;
+  if (rocblas_get_stream(handle, &stream) != rocblas_status_success) {
+    return false;
+  }
+  return hipModuleLaunchKernel(
+      loaded.tile, tiles0, tiles1, 1, 256, 1, 1, 0, stream, args, nullptr) == hipSuccess;
+#endif
+}
+
 // gfx1010 column-major NN HGEMM. Alpha is fp16 inside the kernel.
 // 256x128x16 won at 1024, 2048, and 4096 against rocBLAS.
 static bool rocm_try_gfx1010_hgemm(CUDABLAS_GEMM_ARGTYPES(at::Half)) {
@@ -1850,6 +1939,9 @@ static bool rocm_try_gfx1010_hgemm(CUDABLAS_GEMM_ARGTYPES(at::Half)) {
 template <>
 void gemm<at::Half>(CUDABLAS_GEMM_ARGTYPES(at::Half)) {
 #ifdef USE_ROCM
+  if (rocm_try_gfx1010_hgemm_tn(CUDABLAS_GEMM_ARGS(at::Half))) {
+    return;
+  }
   if (rocm_try_gfx1010_hgemm(CUDABLAS_GEMM_ARGS(at::Half))) {
     return;
   }
