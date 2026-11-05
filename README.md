@@ -34,8 +34,8 @@ On both cards `torch._int_mm` runs on rocBLAS, since hipBLASLt has no kernels
 for them.
 
 ```powershell
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14.2-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
-pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.10.14.2-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.11.05-rocm10.1.0a20260822-gfx1030-gfx1010/torch-2.16.0a0+rocm10.1.0a20260822-cp312-cp312-win_amd64.whl
+pip install https://github.com/lgcyaxi/pytorch-rocm-rx6900xt-windows/releases/download/v2026.11.05-rocm10.1.0a20260822-gfx1030-gfx1010/torchvision-0.30.0a0+rocm10.1.0a20260822-py3-none-win_amd64.whl
 pip install --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ `
     "rocm[libraries,device-gfx1030,device-gfx1010]==10.1.0a20260822"
 ```
