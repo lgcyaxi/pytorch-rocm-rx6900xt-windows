@@ -70,6 +70,11 @@ if(NOT DEFINED USE_SYSTEM_LIBS OR NOT USE_SYSTEM_LIBS)
         break()
       endif()
     endforeach()
+    if(NOT _found AND _dir MATCHES "/external/rdna-kernels$" AND EXISTS "${_dir}/README.md")
+      # This fork's kernel submodule is not a CMake project. README.md means
+      # the checkout is populated.
+      set(_found TRUE)
+    endif()
     if(NOT _found)
       message(FATAL_ERROR
         "Submodule ${_dir} appears incomplete (none of "
